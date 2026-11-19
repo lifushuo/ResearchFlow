@@ -17,6 +17,8 @@ import {
   type TreeFolder,
 } from "@/lib/corpusTree";
 
+const actionLabels: Record<FolderAction, string> = { rename: "重命名", move: "移动", delete: "删除" };
+
 /**
  * The corpus as folders, with checkboxes for choosing what a research run may read
  * (RFC V3.1 §12). The selection lives in this component only — never in web storage — and
@@ -84,14 +86,14 @@ export function CorpusTree({ tree, projectId }: { tree: Tree; projectId: string 
           <button
             type="button"
             className="w-5 text-text-muted"
-            aria-label={`${expanded ? "Collapse" : "Expand"} ${node.folder.name}`}
+            aria-label={`${expanded ? "收起" : "展开"} ${node.folder.name}`}
             onClick={() => toggleOpen(node.folder.id)}
           >
             {expanded ? "▾" : "▸"}
           </button>
           <input
             type="checkbox"
-            aria-label={`Select every file in ${node.folder.name}`}
+            aria-label={`选择“${node.folder.name}”中的所有文件`}
             aria-checked={state === "mixed" ? "mixed" : state === "checked"}
             checked={state === "checked"}
             ref={(el) => {
@@ -106,10 +108,10 @@ export function CorpusTree({ tree, projectId }: { tree: Tree; projectId: string 
                 key={action}
                 type="button"
                 className="btn btn-ghost px-1.5 py-0.5 text-xs"
-                aria-label={`${action[0].toUpperCase()}${action.slice(1)} ${node.folder.name}`}
+                aria-label={`${actionLabels[action]} ${node.folder.name}`}
                 onClick={() => setActing({ folder: node.folder, action })}
               >
-                {action[0].toUpperCase() + action.slice(1)}
+                {actionLabels[action]}
               </button>
             ))}
           </span>
@@ -128,12 +130,12 @@ export function CorpusTree({ tree, projectId }: { tree: Tree; projectId: string 
     <section aria-labelledby="corpus-select" className="border border-border bg-bg-surface p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <h2 id="corpus-select" className="font-serif text-lg font-bold text-text-primary">
-          Choose files to research
+          选择研究文件
         </h2>
         <input
           type="search"
-          placeholder="Filter by name"
-          aria-label="Filter files and folders by name"
+          placeholder="按名称筛选"
+          aria-label="按名称筛选文件和文件夹"
           className="border border-border bg-bg-elevated px-2 py-1 text-sm"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -148,23 +150,23 @@ export function CorpusTree({ tree, projectId }: { tree: Tree; projectId: string 
           onClose={() => setActing(null)}
         />
       )}
-      <ul role="tree" aria-label="Corpus folders and files" aria-multiselectable="true">
+      <ul role="tree" aria-label="语料库文件夹和文件" aria-multiselectable="true">
         {shown.map((n) => renderFolder(n, 1))}
         {looseShown.map((d) => renderDoc(d, 1))}
       </ul>
       <div className="mt-4 flex items-center gap-3">
         {selected.size > 0 ? (
           <Link href={href} className="btn btn-primary">
-            Ask about these files ({selected.size})
+            研究所选文件（{selected.size}）
           </Link>
         ) : (
           <span className="text-sm text-text-muted">
-            Select files or folders, then ask a question that only they will answer.
+            选择文件或文件夹，再提出仅依据这些资料回答的问题。
           </span>
         )}
         {selected.size > 0 && (
           <button type="button" className="btn" onClick={() => setSelected(new Set())}>
-            Clear
+            清除选择
           </button>
         )}
       </div>

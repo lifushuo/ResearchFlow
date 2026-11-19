@@ -1,27 +1,9 @@
-"""
-Splitting an approved report into retrievable chunks (docs/14 §4).
+"""把已批准的报告分成可检索片段，见 docs/14 §4。
 
-Pure text in, pure text out — no host, no model, no I/O — so the server and the desktop
-build chunk identically and the behaviour is testable without a database or a key.
-
-Three choices worth stating, because each one shows up directly in retrieval quality:
-
-1. **Split on structure, not on a character count.** Reports are Markdown with headings
-   and paragraphs. Cutting mid-sentence every N characters produces chunks that begin
-   halfway through a claim, which embed poorly and read worse when quoted back with a
-   citation.
-
-2. **Carry the heading down.** A chunk lifted from under "## Limitations" loses its frame
-   the moment it is retrieved on its own. Prefixing the nearest heading costs a few
-   tokens and keeps the retrieved text self-describing.
-
-3. **Overlap by a sentence, not by a fixed slice.** A claim that straddles a boundary
-   should be wholly present in one of the two chunks; snapping the overlap to a sentence
-   start avoids beginning a chunk with a fragment.
-
-Citation markers (`[1]`, `[2]`) are deliberately preserved. They are what lets a chat
-answer resolve through the report to the original sources it cites (docs/14 §5).
-"""
+纯文本输入输出，不依赖宿主、模型或 I/O，让服务端与桌面切分一致。
+按标题和段落切分，避免固定字符截断句子；每块携带最近标题，保留上下文；
+重叠区域对齐句子边界，让跨边界 Claim 在至少一个块中完整出现。
+保留 [n] 引用标记，使聊天回答能追溯原报告来源，见 docs/14 §5。"""
 
 from __future__ import annotations
 
@@ -29,32 +11,23 @@ import re
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 
-# ~1200 characters is roughly 300 tokens: large enough to hold a complete claim with its
-# supporting sentence, small enough that eight of them (the retrieval default) stay a
-# cheap prompt. Both matter — the budget ceiling in docs/12 is the whole strategy.
+# 约 1200 字符粗略对应 300 Token，兼顾完整论述与一次检索多块时的提示词成本。
 TARGET_CHARS = 1200
 OVERLAP_CHARS = 180
-# Below this a chunk is a heading or a stray line; it gets merged rather than stored, so
-# retrieval never returns a hit that carries no information.
+# 过短片段通常只是标题或零散行，应合并，避免检索得到没有信息的结果。
 MIN_CHARS = 200
 
-# A heading is a natural chunk boundary, but only once the open chunk has enough in it to
-# stand alone. Flushing at every heading regardless would shard a report with many short
-# sections into many small chunks — and each chunk is an embedding, which is spend. This
-# keeps section-aligned boundaries where sections are substantial and merges them where
-# they are not.
+# 标题适合作为边界，但只有当前块足够独立时才切分；短章节合并以避免过多小块及嵌入费用。
 _HEADING_FLUSH_RATIO = 0.6
 
 _HEADING_RE = re.compile(r"^#{1,6}\s+\S")
-# Sentence end: a terminator, optionally followed by a closing quote or bracket, then
-# whitespace. Written as two fixed-width lookbehinds because Python's `re` rejects a
-# variable-width one. Abbreviations will occasionally fool this; the cost is a slightly
-# odd split, never a lost sentence.
+# 句末标点可跟引号或括号，再接空白。Python re 不支持变长后顾，因此写成两个定长匹配。
+# 缩写偶尔造成不理想切分，但不会丢失句子。
 _SENTENCE_END_RE = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][\"')\]]))\s+")
 
 
 def _normalise(text: str) -> str:
-    """Trim trailing whitespace and collapse runs of blank lines to one."""
+    """去掉行尾空白，并把连续空行压成一个。"""
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
     out: list[str] = []
     for line in lines:
@@ -65,18 +38,10 @@ def _normalise(text: str) -> str:
 
 
 def _blocks(text: str) -> list[str]:
-    """Paragraph-ish blocks: split on blank lines, then peel headings off their bodies.
+    """按空行分段，再把标题行与后续正文分开。
 
-    The second half is load-bearing and was missing. Markdown does not require a blank
-    line after a heading, and this product's own synthesizer does not emit one — so
-    `## Summary\nRetrieval-augmented generation…` arrived as a *single* block that
-    `_HEADING_RE.match` accepted, because the block merely *starts* with a heading. The
-    caller then kept `block.splitlines()[0]` as the heading and dropped everything after
-    it. A whole report of such sections chunked to nothing at all: the text was silently
-    discarded, project memory stayed empty, and no error was raised anywhere.
-
-    So a heading line is always its own block, and the prose under it is always another.
-    """
+    Markdown 标题后不一定有空行。若把整个区块当作标题，仅保留第一行，
+    就会静默丢掉正文，导致项目记忆没有内容。因此标题与正文必须分别成为区块。"""
     out: list[str] = []
     for block in re.split(r"\n\s*\n", text):
         block = block.strip()
@@ -97,7 +62,7 @@ def _blocks(text: str) -> list[str]:
 
 
 def _split_long(block: str, limit: int) -> list[str]:
-    """Break an oversized block on sentence boundaries, then on words as a last resort."""
+    """过长段落优先按句子切分，仍超长时再按词切分。"""
     pieces: list[str] = []
     current = ""
     for sentence in _SENTENCE_END_RE.split(block):
@@ -112,7 +77,7 @@ def _split_long(block: str, limit: int) -> list[str]:
     if current:
         pieces.append(current)
 
-    # A single sentence longer than the limit (a table row, a URL list) still has to fit.
+    # 单句也可能超长，例如表格行或 URL 列表，仍需遵守长度限制。
     out: list[str] = []
     for piece in pieces:
         while len(piece) > limit:
@@ -126,12 +91,12 @@ def _split_long(block: str, limit: int) -> list[str]:
 
 
 def _tail_overlap(text: str, overlap: int) -> str:
-    """The last whole sentence(s) of `text`, up to `overlap` characters."""
+    """取 text 末尾最多 overlap 字符的完整句子。"""
     if overlap <= 0 or not text:
         return ""
     window = text[-overlap:]
     parts = _SENTENCE_END_RE.split(window, maxsplit=1)
-    # Prefer starting at a sentence boundary; fall back to a word boundary.
+    # 优先从句子边界开始，找不到时退到词边界。
     if len(parts) > 1 and parts[1].strip():
         return parts[1].strip()
     space = window.find(" ")
@@ -145,11 +110,9 @@ def chunk_report(
     overlap_chars: int = OVERLAP_CHARS,
     min_chars: int = MIN_CHARS,
 ) -> list[str]:
-    """Split a report into overlapping, heading-aware chunks.
+    """把报告切成带标题和重叠内容的片段。
 
-    Deterministic: the same report always produces the same chunks, which is what makes
-    re-ingestion idempotent against the `(source_session_id, chunk_index)` unique key.
-    """
+    同一报告始终得到同样片段，配合 source_session_id、chunk_index 唯一键实现重复导入幂等。"""
     normalised = _normalise(text or "")
     if not normalised:
         return []
@@ -159,11 +122,7 @@ def chunk_report(
     current = ""
 
     def flush() -> None:
-        """Store the open chunk, unless it turned out to be headings and nothing else.
-
-        A chunk of pure headings is a retrieval hit that carries no information — it
-        would match a topical query and then contribute nothing to the answer.
-        """
+        """保存当前片段；如果只有标题则跳过，避免产生没有正文信息的检索命中。"""
         nonlocal current
         body = current.strip()
         if body and not all(_HEADING_RE.match(line) for line in body.splitlines() if line.strip()):
@@ -172,8 +131,7 @@ def chunk_report(
 
     for block in _blocks(normalised):
         if _HEADING_RE.match(block):
-            # A heading belongs with what follows it. Close the open chunk first, but
-            # only if it is substantial — see _HEADING_FLUSH_RATIO.
+            # 标题属于后续正文；仅当当前块足够长时才先结束它，见 _HEADING_FLUSH_RATIO。
             heading = block.splitlines()[0].strip()
             if len(current) >= target_chars * _HEADING_FLUSH_RATIO:
                 flush()
@@ -182,10 +140,7 @@ def chunk_report(
                 current = f"{current}\n\n{heading}" if current else heading
             continue
 
-        # An oversized block is split to leave room for the heading and overlap that a
-        # continuation chunk prepends; without that reservation the assembled chunk
-        # overshoots `target_chars` by exactly the carry, and "chunks are at most N" stops
-        # being true.
+        # 切分大块时为续块的标题和重叠区域预留空间，否则最终块会超出 target_chars。
         room = max(target_chars // 2, target_chars - overlap_chars - len(heading) - 4)
         for piece in [block] if len(block) <= target_chars else _split_long(block, room):
             candidate = f"{current}\n\n{piece}" if current else piece
@@ -194,16 +149,14 @@ def chunk_report(
                 continue
 
             flush()
-            # Re-open with the heading and a sentence of overlap so the next chunk still
-            # says what it is about and does not start mid-claim.
+            # 新块携带标题和一个句子的重叠内容，保留主题并避免从 Claim 中间开始。
             opener = heading if heading else ""
             carry = _tail_overlap(chunks[-1] if chunks else "", overlap_chars)
             current = "\n\n".join(part for part in (opener, carry, piece) if part)
 
     flush()
 
-    # Merge a runt tail into its predecessor rather than storing a chunk too small to
-    # carry a claim. A single short chunk is kept: a short report is still a report.
+    # 过短尾块并入前一块；若整篇报告只有一个短块则仍保留。
     if len(chunks) > 1 and len(chunks[-1]) < min_chars:
         tail = chunks.pop()
         chunks[-1] = f"{chunks[-1]}\n\n{tail}"
@@ -211,24 +164,18 @@ def chunk_report(
     return chunks
 
 
-# ── Corpus documents (internal/12 M10) ──────────────────────────────────────────────
+# ── 资料库文档，见 internal/12 M10 ──
 #
-# Reports are our own Markdown and get heading-aware chunks above. Ingested corpus
-# documents are arbitrary prose, and their requirement is different: every chunk must
-# cite an EXACT location in its source (internal/12 M10 DoD). So a corpus chunk is a
-# verbatim span [start, end) of the extracted text — no carried headings, no
-# reassembled openers — which makes "text[start:end] is the chunk" true by
-# construction rather than by convention.
+# 报告按标题重组；资料库文档则必须能定位原文，要求更严格。
+# 每块都是提取文本的原样区间 [start, end)，不能拼接标题或改写开头。
 
 
 @dataclass(frozen=True)
 class DocumentChunk:
-    """One chunk of an ingested document, with its exact location in the source.
+    """带精确原文位置的文档块。
 
-    `text == source[start:end]` holds verbatim. `page` is the 1-based page the chunk
-    starts on (PDFs), or None when the source has no page structure (MD/TXT) — the
-    offsets are the universal locator, the page is the human-readable one.
-    """
+    text 必须逐字等于 source[start:end]。PDF 页码从 1 开始，无分页文档为 None；
+    字符偏移适用于所有文档，页码用于方便人工定位。"""
 
     text: str
     start: int
@@ -236,19 +183,17 @@ class DocumentChunk:
     page: int | None
 
 
-# Where a new chunk may begin: the start of a paragraph, or the whitespace run after
-# a sentence terminator. Splitting only on these points keeps chunks starting at
-# sentence boundaries instead of mid-claim.
+# 新块只能从段落开头或句末空白后开始，尽量避免切断 Claim。
 _PIECE_BREAK_RE = re.compile(r"\n\s*\n|[.!?][\"')\]]*\s+")
 
 
 def _split_points(text: str) -> list[int]:
-    """Offsets at which a piece of text can legally start."""
+    """返回允许作为文本片段起点的偏移位置。"""
     return [m.end() for m in _PIECE_BREAK_RE.finditer(text)]
 
 
 def _page_for(page_starts: list[int], offset: int) -> int | None:
-    """1-based page number containing `offset`, or None without page structure."""
+    """返回 offset 所在页，页码从 1 开始；没有分页结构时返回 None。"""
     if len(page_starts) <= 1:
         return None
     return bisect_right(page_starts, offset)
@@ -262,13 +207,10 @@ def chunk_document(
     overlap_chars: int = OVERLAP_CHARS,
     min_chars: int = MIN_CHARS,
 ) -> list[DocumentChunk]:
-    """Split an ingested document into verbatim, overlapping, offset-tracked chunks.
+    """把文档切成保留原文、带重叠和偏移量的块。
 
-    Deterministic like `chunk_report`, and idempotency-friendly: the same extracted
-    text always yields the same spans. Overlap is implemented by starting the next
-    chunk at most `overlap_chars` before the previous end, snapped to a piece
-    boundary — so the overlap region belongs verbatim to BOTH chunks' spans.
-    """
+    同一文本产生同样区间；下一块起点落在前块末尾的重叠窗口内，并对齐合法边界。
+    重叠内容仍逐字属于两个块各自的原文区间。"""
     body = text or ""
     first_nonws = len(body) - len(body.lstrip())
     if first_nonws >= len(body):
@@ -283,15 +225,12 @@ def chunk_document(
         if start + target_chars >= len(body):
             raw_end = len(body)
         else:
-            # Snap to the last piece boundary inside the window. When there is none
-            # (one enormous sentence / table row) cut at the limit — a chunk that
-            # cannot fit whole beats a chunk that never ends.
+            # 优先选择窗口内最后一个合法边界；单句或表格行过长时按上限截断，保证能够推进。
             lo = bisect_right(points, start)
             hi = bisect_right(points, start + target_chars)
             raw_end = points[hi - 1] if hi > lo else start + target_chars
 
-        # Trim surrounding whitespace WITHOUT leaving the verbatim span: the chunk
-        # text is exactly body[start:end].
+        # 仅通过调整 start/end 去除两侧空白，保持块文本严格等于 body[start:end]。
         end = raw_end
         while start < end and body[start].isspace():
             start += 1
@@ -307,14 +246,13 @@ def chunk_document(
         if raw_end >= len(body):
             break
 
-        # Next chunk opens within the overlap window, at the first piece boundary —
-        # or right after this chunk when the window holds none (progress is mandatory).
+        # 从重叠窗口内第一个边界开始下一块；找不到时从当前块末尾继续，避免停滞。
         floor = max(raw_end - overlap_chars, start + 1)
         idx = bisect_left(points, floor)
         nxt = points[idx] if idx < len(points) else None
         start = nxt if nxt is not None and nxt < raw_end else raw_end
 
-    # A runt tail carries no claim of its own; fold its span into the predecessor.
+    # 过短尾块没有独立 Claim，将其原文区间合并到前块。
     if len(chunks) > 1 and (chunks[-1].end - chunks[-1].start) < min_chars:
         tail = chunks.pop()
         prev = chunks[-1]

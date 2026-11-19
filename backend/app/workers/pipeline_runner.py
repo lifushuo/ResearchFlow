@@ -1,18 +1,8 @@
-"""
-Server adapter for the research pipeline (docs/02 §2/§6, docs/13 §4–§5).
+"""研究流程的服务端适配器（docs/02 §2/§6，docs/13 §4—§5）。
 
-The orchestration itself lives in `research_engine.runner`, which knows nothing about
-Postgres, Redis, Celery, or ORM models. This module supplies the server's half:
-
-- the run lock (a Redis token lock — Celery can redeliver, so double execution is a real
-  risk here in a way it is not in a single-process desktop app),
-- one DB session scope for the whole run (no detached-object writes),
-- the Postgres checkpointer, so approval/rework resumes from the gate rather than
-  re-running research the user already paid for,
-- the `agent_logs` + Redis event sink and the Redis search cache (`app/adapters.py`),
-- persisting the outcome and *then* emitting the lifecycle event, so a client acting on
-  COMPLETED never re-reads a stale RUNNING status.
-"""
+实际流程由 research_engine.runner 编排；它不依赖 Postgres、Redis、Celery 或 ORM。
+本模块负责防重复执行的 Redis 令牌锁、整轮共用的数据库会话、Postgres 检查点、代理日志和 Redis 事件/搜索缓存。
+先持久化并提交结果，再发布生命周期事件，避免客户端收到 COMPLETED 后查到旧 RUNNING。人工批准和返工从关卡恢复，不重跑已经付费的研究。"""
 
 from __future__ import annotations
 
@@ -51,18 +41,14 @@ logger = structlog.get_logger()
 
 
 def _checkpointer_dsn() -> str:
-    # LangGraph's Postgres saver uses psycopg (sync-style DSN), not asyncpg.
+    # LangGraph 的 Postgres 保存器使用 psycopg 连接串，不使用 asyncpg 格式。
     return settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
 
 
 async def _user_provider_keys(db, user_id: str) -> dict[str, str]:
-    """This user's BYOK provider key, if they've set one and it still decrypts.
+    """获取用户自带的模型密钥。
 
-    Returns {provider: key} or {} to fall back to the server's key. `crypto.
-    user_provider_keys` treats "no key stored" and "stored but undecryptable" alike —
-    both degrade to `{}` — but only the latter is worth a log line: a rotated signing
-    secret is an operator's problem, and a user who never set a key is not.
-    """
+    返回供应商到密钥的映射；未设置或无法解密时返回空字典，回退部署密钥。只有解密失败值得记录警告，用户从未设置密钥不是错误。"""
     user = (
         await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     ).scalar_one_or_none()
@@ -75,13 +61,9 @@ async def _user_provider_keys(db, user_id: str) -> dict[str, str]:
 
 
 async def _run_config_for(db, session: Session, user_id: str) -> RunConfig:
-    """The engine config for this run, with model routing resolved and snapshotted.
+    """解析并冻结本轮模型路由，构建引擎配置。
 
-    Resolution order is session → user → deployment. The session's own snapshot wins so a
-    resumed run (approve or rework) keeps the models it started with — the alternative is
-    a report whose first half was written by one model and second half by another, which
-    would quietly undermine the per-report attribution the snapshot exists to provide.
-    """
+    优先级为会话记录、用户设置、部署默认值。恢复时沿用会话快照，防止同一份报告的前后两段在用户修改配置后改用不同模型。"""
     user = (
         await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     ).scalar_one_or_none()
@@ -97,26 +79,19 @@ async def _run_config_for(db, session: Session, user_id: str) -> RunConfig:
 
     base = run_config_from_settings()
     overrides = preference_overrides(user)
-    # The research design gate (internal/07 Phase 4), now that the whole resume path
-    # exists: SessionStatus.AWAITING_PLAN, `runner.resume(plan=…)`, the `resume_plan_gate`
-    # task, and `GET/POST /research/{id}/plan`. Sourced from the session row rather than
-    # the request because this is rebuilt on every resume, long after the request is gone.
-    # `RunConfig`'s own defaults stay the un-gated ones for callers with no opinion (the
-    # CLI, the eval harness); this is where a *hosted* run states its. Desktop
-    # counterpart: `sidecar._drive_session`.
+    # 计划关卡配置必须从会话记录读取，因为恢复时原请求已经结束。
+    # 对应 AWAITING_PLAN、runner.resume(plan=…)、resume_plan_gate 任务和计划接口（internal/07 Phase 4）。
+    # CLI 与评测仍沿用 RunConfig 的跳过关卡默认值；托管运行在这里明确自己的选择。桌面对应 sidecar._drive_session。
     overrides |= {
         "skip_plan_gate": bool(session.skip_plan_gate),
         "topic_seeds": tuple(session.topic_seeds or ()),
         "outline_template": session.outline_template,
-        # The airgap promise, and the same trap `run_execution.run_config_for_run` records:
-        # `_execute` installs the corpus port, which is not the same as telling the engine
-        # to use it. Both `retrievers.search` and `tools.read_webpage` read this field.
+        # 只安装语料库端口还不够，必须同时告诉引擎启用语料模式。
+        # 检索器与 read_webpage 都读取此字段；与 run_execution.run_config_for_run 保持一致。
         "corpus_mode": bool(session.corpus_mode),
     }
-    # Scripted models and fixture retrievers (docs/17 §6.2). The rule — a run that reached
-    # no provider is *recorded* as a demo, whichever way it got there — is one function, in
-    # `app/services/run_config.py`, called by both hosts. It used to be this branch plus
-    # three more, kept in step by a note in AGENTS.md.
+    # 没有调用真实供应商的脚本模型运行必须标记为演示。
+    # 两种主机共用 app/services/run_config.py 的规则，不能各写分支靠人工同步。
     config, needs_stamp = apply_demo_rule(
         base, row_demo=bool(session.demo), host_is_scripted=base.llm_mode == "fake"
     )
@@ -133,24 +108,10 @@ async def _execute(
     resume: tuple[bool, str | None] | None,
     plan: dict | None = None,
 ) -> None:
-    """Drive one session through the engine end to end: lock, wire ports, resume-or-run.
+    """取得会话锁、连接主机资源，并选择新执行或关卡恢复。
 
-    `resume`/`plan` select which of three engine entry points this call is (fresh start,
-    plan-gate resume, hitl-gate resume) — see the branch below. All three share the same
-    lock, the same Postgres checkpointer and the same corpus guard, because a session that
-    can start any of these three ways must not be able to start the other two
-    concurrently.
-
-    The session lock is acquired first and released last (the `finally` chain), because
-    Celery can redeliver a task — unlike the desktop's single in-process host, more than
-    one worker can legitimately pick up the same `session_id` here. A busy lock is not an
-    error: the caller that lost the race simply returns, trusting the caller that holds it
-    to finish and persist the outcome.
-
-    The corpus-mode guard (local embedder required, corpus database must already exist)
-    runs *before* the checkpointer is opened, so a run that cannot proceed fails with a
-    clear reason instead of spending a database round trip first.
-    """
+    首次运行、计划关卡恢复、报告关卡恢复共用同一把锁、同一 Postgres 检查点和语料检查，防止三种入口同时驱动同一会话。
+    锁最先取得、最后释放。消息重投导致锁忙时直接返回，让持锁调用完成保存。语料检查先于打开检查点执行，提前明确报告缺少本地向量模型或语料库的问题。"""
     lock_token = uuid.uuid4().hex
     await init_redis_pool()
     try:
@@ -169,17 +130,11 @@ async def _execute(
                     logger.error("session_not_found", session_id=session_id)
                     return
 
-                # RUNNING unless the user stopped it after the route handed it over —
-                # the condition is inside the UPDATE, see `app/session_lifecycle.py`. The
-                # pipeline still runs either way: cancellation is advisory, and the outcome
-                # writer below is what keeps the stop.
+                # 条件更新为 RUNNING；若分发后用户已取消，就不覆盖取消状态。规则在 app/session_lifecycle.py。
+                # 当前取消是协作标记，在途图仍可能继续，最终结果写入器负责保留取消决定。
                 await mark_running(db, session.id)
-                # Sessions do not apply prompt overrides and are not gaining that — runs
-                # are the product and this path stays readable rather than deepened. So a
-                # session whose owner configured one is *marked*, in the same transaction
-                # that starts it, instead of quietly producing a report under instructions
-                # its owner believes are in force. Start only: a resume inherits the
-                # disclosure its run began with. Desktop counterpart: `sidecar._drive_session`.
+                # 会话路径按设计不应用提示词覆盖。若用户配置了覆盖，要在启动事务中明确记录未应用，不能悄悄忽略。
+                # 只在首次开始时标记，恢复继承原披露状态。桌面对应 sidecar._drive_session。
                 if resume is None and plan is None:
                     owner = (
                         await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
@@ -190,15 +145,11 @@ async def _execute(
 
                 sink = adapters.agent_log_sink(db, session_id)
                 ports = {
-                    # BYOK: this user's own key, scoped to the run so concurrent runs in
-                    # one worker never see each other's key. Empty → the server key.
+                    # 用户自带密钥只在本次运行上下文生效，避免并发任务串用；空配置回退服务端密钥。
                     "provider_keys": await _user_provider_keys(db, user_id),
                     "event_sink": sink,
                     "cache": adapters.RedisCache(),
-                    # Per-run model routing (docs/12 M8). This is the per-run RunConfig
-                    # override from M6 step 3 doing the job it was built for: a session
-                    # runs on its own models without touching the process default, so
-                    # concurrent runs on different models stay isolated.
+                    # 每次运行独立设置模型路由（docs/12 M8），不修改进程默认配置，保证不同模型的并发运行相互隔离。
                     "run_config": await _run_config_for(db, session, user_id),
                 }
 
@@ -206,7 +157,7 @@ async def _execute(
 
                 if session.corpus_mode:
                     embedder = await adapters.embeddings_for(ports["provider_keys"])
-                    # Egress guard: corpus mode requires a local embedder
+                    # 防止语料外发：语料模式必须使用本地向量模型。
                     if not (
                         embedder.model_id.startswith("ollama:")
                         or embedder.model_id.startswith("local:")
@@ -220,10 +171,7 @@ async def _execute(
                         )
                         return
 
-                    # One locator, so the API and this worker — separate processes with
-                    # separate working directories — cannot resolve the same project to
-                    # different paths, which is what let an upload become invisible to the
-                    # run that needed it.
+                    # API 与 Worker 共用同一个语料路径定位器，避免不同进程和工作目录把同一项目解析到不同位置，导致上传后研究却找不到文件。
                     store = await adapters.ServerCorpusLocator().for_project(
                         session.project_id, keys=ports["provider_keys"]
                     )
@@ -242,7 +190,7 @@ async def _execute(
                 async with AsyncPostgresSaver.from_conn_string(_checkpointer_dsn()) as saver:
                     await saver.setup()
                     if plan is not None:
-                        # Resuming the design gate (internal/07 Phase 4).
+                        # 从计划审核关卡恢复（internal/07 Phase 4）。
                         outcome = await runner.resume(
                             checkpointer=saver, session_id=session_id, plan=plan, **ports
                         )
@@ -265,10 +213,8 @@ async def _execute(
                             **ports,
                         )
 
-                # `session` was loaded before the pipeline started and has been held since,
-                # with `expire_on_commit=False`: a stop made mid-run is in the row and not in
-                # the object. Without this re-read the outcome writer's guard saw "not
-                # cancelled" and moved a stopped session to the review gate (issue #54).
+                # session 是执行前加载的旧对象，expire_on_commit=False 会让它一直保留旧属性。
+                # 必须重读数据库才能看到执行中发生的取消，避免把已停止的会话改回待审核。
                 await db.refresh(session, ["cancelled_at"])
                 await _persist_outcome(
                     db, session, session_id, outcome, sink, ports["provider_keys"]
@@ -281,32 +227,16 @@ async def _execute(
 
 
 async def _ingest_into_project_memory(db, session: Session, provider_keys: dict[str, str]) -> None:
-    """Add this approved report to its project's memory (docs/14 §2).
+    """把获批报告写入项目记忆（docs/14 §2）。
 
-    The single ingestion point in the system, and it sits on the *approval* transition on
-    purpose: the human gate is the quality filter that keeps drafts and rejected work out
-    of retrieval, which is what makes memory here trustworthy in a way "remember
-    everything" features are not.
-
-    Runs after the COMPLETED event has been published, not before. Embedding costs a round
-    trip — a cold local model can take tens of seconds — and blocking the event the client
-    is waiting on would trade a visible delay for an invisible benefit. Memory being a
-    second behind the report is fine; the report appearing a second late is not.
-
-    Never raises. The run has already succeeded and been committed; failing it
-    retroactively because an embedding provider was down would destroy work in order to
-    report a gap. The gap is reported instead, by `memory/status`, which counts approved
-    reports against indexed ones and self-heals on the next re-index.
-    """
+    只在批准后写入，让未审核草稿和被拒绝报告不会进入检索。先发布 COMPLETED 再建立索引，避免向量化耗时延迟用户看到完成。
+    索引失败不向外抛出；报告已经成功提交，不能因向量服务故障倒退为失败。缺口由 memory/status 报告，并在重建索引时修复。"""
     try:
         from app import adapters
         from app.services import memory
 
-        # Ask first, the same way `run_lifecycle.delete_run` does. Without this the ingest
-        # is attempted on a host that has no `memory_chunks` table, fails, and the handler
-        # below rolls back — which expires every object in the identity map, including the
-        # caller's session. The swallow was meant to protect a completed run; rolling back
-        # underneath it does the opposite.
+        # 先检查主机是否支持记忆表，与 run_lifecycle.delete_run 一致。
+        # 不支持时贸然写入会失败并回滚，使调用方持有的会话对象也失效，反而影响已完成运行。
         if not memory.is_available(db):
             logger.info("memory_ingest_skipped", session_id=str(session.id), reason="unavailable")
             return
@@ -315,7 +245,7 @@ async def _ingest_into_project_memory(db, session: Session, provider_keys: dict[
         result = await memory.ingest_session(db, session, embedder)
         if result.skipped:
             logger.info("memory_ingest_skipped", session_id=str(session.id), reason=result.reason)
-    except Exception as e:  # noqa: BLE001 — see docstring: never fail a completed run
+    except Exception as e:  # noqa: BLE001 — 索引失败不能推翻已经完成的运行
         await db.rollback()
         logger.warning(
             "memory_ingest_failed",
@@ -326,20 +256,16 @@ async def _ingest_into_project_memory(db, session: Session, provider_keys: dict[
 
 
 async def _ingest_report_into_corpus(session: Session, provider_keys: dict[str, str]) -> None:
-    """Auto-save this approved report into its project's corpus (app/services/report_corpus.py).
+    """自动将获批报告存入项目语料库，规则见 app/services/report_corpus.py。
 
-    Same transition as `_ingest_into_project_memory` and the same reason: never fail an
-    already-committed run over it. Uses whatever embedder the deployment resolves to —
-    unlike corpus-mode *search*, ingestion is not required to be local (the upload route
-    ingests uploads the same way), so a hosted embedder here is not an egress violation.
-    """
+    与项目记忆使用相同触发时机，失败不影响已提交运行。写入使用部署配置的向量模型；与语料内搜索不同，摄取步骤允许远程向量化，与上传入口保持一致。"""
     try:
         from app import adapters
         from app.services.report_corpus import ingest_report
 
         store = await adapters.ServerCorpusLocator().ensure(session.project_id, keys=provider_keys)
         await ingest_report(store, report_id=str(session.id), report_markdown=session.final_report)
-    except Exception as e:  # noqa: BLE001 — see report_corpus.ingest_report's own docstring
+    except Exception as e:  # noqa: BLE001 — 失败处理规则见 report_corpus.ingest_report
         logger.warning(
             "report_corpus_ingest_setup_failed",
             session_id=str(session.id),
@@ -356,26 +282,19 @@ async def _persist_outcome(
     sink,
     provider_keys: dict[str, str] | None = None,
 ) -> None:
-    """Write the outcome, commit, then publish the lifecycle event — in that order."""
+    """严格按顺序执行：保存结果、提交事务、发布生命周期事件。"""
     session.total_cost_usd = outcome.cost_usd
     session.total_tokens_input = outcome.tokens_input
     session.total_tokens_output = outcome.tokens_output
     session.rework_count = outcome.rework_count
 
-    # A run the user stopped stays stopped (issue #54). Cancellation does not interrupt the
-    # pipeline — it keeps going to its next checkpoint — so without this guard the outcome
-    # arriving minutes later moved the session back to AWAITING_APPROVAL or COMPLETED. The
-    # user saw a stopped run, then a live one, and approving it put a report they had tried
-    # to abandon into project memory.
+    # 用户取消后必须保持取消。当前取消不会立即中断图，在途结果可能几分钟后才到达。
+    # 若不检查，就会把已取消会话改回待审核或完成，甚至把用户放弃的报告加入项目记忆。
     #
-    # The spend assigned above is committed regardless: tokens burned between the stop and
-    # the pipeline noticing are real money, and dropping them would make usage totals lie.
-    # Everything that describes the run's *conclusion* is withheld — status, the reports,
-    # `sources`, and the lifecycle event — because the conclusion is not the user's decision
-    # and the decision is the one that stands.
+    # 已消耗的 Token 和费用仍要提交，不能因取消而丢失真实账目。
+    # 状态、报告、来源与生命周期结论则不再覆盖，用户的取消决定优先。
     #
-    # Two more homes of this rule: `desktop/sidecar.py::_apply_outcome` for the desktop's
-    # session journey, and `run_execution.persist_outcome` for runs. Change all three.
+    # 此规则另有桌面 sidecar._apply_outcome 和运行 run_execution.persist_outcome 两处实现，修改时三处同步。
     if session.is_cancelled:
         await db.commit()
         logger.info(
@@ -389,11 +308,8 @@ async def _persist_outcome(
     session.sources = outcome.sources
 
     if outcome.status == "awaiting_plan":
-        # The research design gate (internal/07 Phase 4). Persisted before the event
-        # leaves, same ordering as every other branch here: a client that acts on
-        # PLAN_READY and immediately GETs /plan must not read a row that has not caught
-        # up yet. `plan_approved_at` stays null — this is the proposal, not a decision;
-        # `POST /{id}/plan` stamps it.
+        # 先保存计划提案再发布 PLAN_READY，保证客户端立即读取计划时能看到对应数据。
+        # 提案还未获批，plan_approved_at 保留空值，等计划审核接口填写。
         session.status = SessionStatus.AWAITING_PLAN
         session.plan_json = {"tasks": outcome.plan_tasks}
         session.outline_json = {"sections": outcome.plan_outline}
@@ -418,17 +334,15 @@ async def _persist_outcome(
     session.status = SessionStatus.COMPLETED
     session.final_report = outcome.final_report
     session.elapsed_seconds = outcome.elapsed_seconds
-    # Computed once, at the moment the report becomes final, rather than per list request
-    # — the same reason `model_routing` is snapshotted. Desktop counterpart:
-    # `sidecar._apply_outcome`.
+    # 报告定稿时计算一次，不在每次查询列表时重算；桌面对应 sidecar._apply_outcome。
     session.citation_resolution_rate = citation_rate.resolution_rate(
         outcome.final_report or "", outcome.sources
     )
     await db.commit()
     await sink(session_id, lifecycle_event(outcome))
-    # The one place approved research enters project memory (docs/14 §2).
+    # 已批准研究在这里进入项目记忆（docs/14 §2）。
     await _ingest_into_project_memory(db, session, provider_keys or {})
-    # And its project's corpus (docs/12 M10 follow-up) — see report_corpus.py.
+    # 同时加入项目语料库，规则见 report_corpus.py（docs/12 M10）。
     await _ingest_report_into_corpus(session, provider_keys or {})
 
 
@@ -443,5 +357,5 @@ async def resume_pipeline(
 
 
 async def resume_plan(session_id: str, user_id: str, plan: dict) -> None:
-    """Resume a session paused at the research design gate with the reviewer's edits."""
+    """用审核者的编辑内容，恢复暂停在研究计划关卡的会话。"""
     await _execute(session_id, user_id, resume=None, plan=plan)

@@ -1,22 +1,9 @@
-"""
-Keeping unsupported claims out of a selected-files report (internal/rfcs/V3.1-corpus-scope.md §9.4).
+"""防止指定文件报告展示无依据结论，见 RFC V3.1 §9.4。
 
-`grounding.validate` measures; this decides what the reader sees. A unit — paragraph, bullet,
-conclusion — holding a claim that is not supported is **rewritten** from its verified claims
-by the PROTECTED `synthesizer.selection_repair`, and the rewrite is validated again from
-scratch. Deleting sentences after the fact is what this replaces: it leaves dangling
-references and conclusions whose premises are gone.
-
-The loop is bounded. A unit still failing after `MAX_ATTEMPTS` rewrites is removed whole and
-the reader is told so in place — a whole unit, so no half-sentence or orphan `[n]` survives.
-A claim normalising to one already rejected is rejected again without a model call
-(`reintroduced`), so a rewrite cannot launder a claim by rephrasing it slightly.
-
-The outcome is one of three. `complete`: every remaining claim is supported and nothing went
-unmeasured — the only state allowed to reach the approval gate. `unmeasured`: something
-could not be judged, with its cause — the run fails rather than ship it. `no_evidence`: the
-selection supports nothing the question asked — the run fails and says so.
-"""
+grounding.validate 测量，本模块决定展示内容。含不支持 Claim 的单元由受保护提示词
+根据已验证内容重写，再从头核验，避免简单删句留下悬空引用或缺失前提的结论。
+达到 MAX_ATTEMPTS 仍失败则整单元移除并提示；重新引入已拒绝 Claim 不再调用模型放行。
+只有 complete 可以到审批关卡；unmeasured 或 no_evidence 均明确失败。"""
 
 from __future__ import annotations
 
@@ -46,8 +33,7 @@ MAX_ATTEMPTS = 2
 
 REMOVED_NOTICE = grounding.REMOVED_NOTICE
 
-#: Causes that a rewrite cannot fix — the checker itself could not run — so the loop stops
-#: instead of spending more of the budget asking it again.
+#: 这些原因表示检查器无法运行，改写不能解决，应停止循环以免继续浪费预算。
 _TERMINAL_CAUSES = {"budget_exhausted", "provider_outage", "rate_limited", "timeout"}
 
 _SOURCES_SPLIT_RE = re.compile(r"^#{1,6}\s*(sources|references|bibliography)\b", re.I | re.M)
@@ -75,8 +61,7 @@ class _Ledger:
     units_repaired: int = 0
     units_dropped: int = 0
     rejected: set[str] = field(default_factory=set)
-    #: When checking began, so its wall time is recorded beside its cost: gate G-5 weighs
-    #: §9's latency as well as its spend, from the same run (RFC V3.1 §14.1).
+    #: 记录核验开始时间，让 G-5 能在同一运行中同时评价核验延迟与费用，见 RFC §14.1。
     started: float = field(default_factory=time.monotonic)
 
     def absorb(self, v: Validation) -> None:
@@ -98,10 +83,10 @@ def _split(draft: str) -> tuple[str, str]:
 
 
 def _preflight(body: str, budget: Budget) -> tuple[float, str | None]:
-    """The estimated cost of validating `body`, and a refusal if it cannot fit (§9.9)."""
+    """估算 body 的核验费用，预算容纳不下时返回拒绝原因，见 §9.9。"""
     units, _ = grounding.parse_units(body)
     sentences = sum(len(grounding.sentences_of(u)) for u in units)
-    estimate = grounding._estimate(sentences)  # noqa: SLF001 — one estimator, one home
+    estimate = grounding._estimate(sentences)  # noqa: SLF001 — 复用唯一估算实现
     tokens = (sentences + 2 * max(1, -(-sentences // grounding.BATCH))) * 900
     if budget.cost_cap and estimate and budget.spent_usd + estimate > budget.cost_cap:
         return estimate, (
@@ -124,7 +109,7 @@ async def ground(
     admissible,
     budget: Budget,
 ) -> GroundingResult:
-    """Validate `draft`, repair what fails, and return the text the reader may see."""
+    """核验草稿并修复不合格内容，返回允许展示的正文。"""
     body, _sources_tail = _split(draft)
     ledger = _Ledger()
     estimate, refused = _preflight(body, budget)
@@ -133,9 +118,8 @@ async def ground(
         return _finish(body, sources, None, ledger, status=UNMEASURED, failure=refused)
 
     validation: Validation | None = None
-    # MAX_ATTEMPTS rewrites, each followed by a full re-validation; the final validation is
-    # never followed by a rewrite, so every word the reader sees was checked. What still
-    # fails after it is removed whole below — removal adds nothing that would need checking.
+    # 最多重写 MAX_ATTEMPTS 次，每次后完整重验。最后一次核验后不再改写，
+    # 确保用户看到的每个新词都经过检查；仍失败的单元整块移除，不加入新断言。
     for round_ in range(MAX_ATTEMPTS + 1):
         validation = await grounding.validate(
             body, sources, question=question, admissible=admissible, budget=budget
@@ -164,8 +148,7 @@ async def ground(
             try:
                 rewritten = await _rewrite(unit, validation, budget, ledger)
             except BudgetExhausted as exc:
-                # The same form as every other unmeasured ending, so a limit crossed in a
-                # repair still says which cause it was (§9.9, AC-43), not only the breach.
+                # 与其他未测量结局保持同一结构；修复中超限也必须说明具体原因，见 §9.9、AC-43。
                 return _finish(
                     body,
                     sources,
@@ -174,7 +157,7 @@ async def ground(
                     status=UNMEASURED,
                     failure=f"grounding_unmeasured: budget_exhausted ({exc.reason})",
                 )
-            except Exception as exc:  # noqa: BLE001 — a failed rewrite is an unmeasured cause
+            except Exception as exc:  # noqa: BLE001 — 重写失败记为未测量原因
                 return _finish(
                     body,
                     sources,
@@ -208,7 +191,7 @@ async def ground(
             failure=f"grounding_unmeasured: {', '.join(causes)}",
         )
     if any(c.state != SUPPORTED for c in validation.claims):
-        # The last round still had failing units and no rewrite left: drop them whole.
+        # 最后一轮仍有失败单元且没有剩余重写次数，整块移除。
         lines = body.splitlines()
         for index in sorted({c.unit for c in validation.claims if c.state != SUPPORTED}):
             unit = validation.units[index]
@@ -231,7 +214,7 @@ async def ground(
 
 
 async def _rewrite(unit, validation: Validation, budget: Budget, ledger: _Ledger) -> str | None:
-    """One unit rewritten from its verified claims, or None for "nothing left to say"."""
+    """根据已支持 Claim 重写一个单元；没有可写内容时返回 None。"""
     own = [c for c in validation.claims if c.unit == unit.index]
     verified = [c for c in own if c.state == SUPPORTED]
     rejected = [c for c in own if c.state != SUPPORTED]
@@ -258,7 +241,7 @@ async def _rewrite(unit, validation: Validation, budget: Budget, ledger: _Ledger
 
 
 def _drop_non_supporting(body: str, validation: Validation) -> str:
-    """Remove each citation the per-citation check found supporting nothing in its claim."""
+    """删除逐引用检查确认对该 Claim 毫无支持的标记。"""
     lines = body.splitlines()
     for claim in validation.claims:
         if claim.state != SUPPORTED or not claim.non_supporting_cites:

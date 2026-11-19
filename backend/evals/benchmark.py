@@ -5,10 +5,8 @@ M13 Benchmark Runner (docs/research/16-citation-fidelity-benchmark.md)
 import argparse
 import asyncio
 import json
-import os
 import re
 import time
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,14 +15,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 from evals import metrics, normalization
+from evals.judge_config import (
+    benchmark_judge_route,
+    judge_client_config,
+    judge_max_output_tokens,
+)
+from evals.judge_labels import claim_labels
 from research_engine.graph import build_graph
 from research_engine.llm_factory import get_llm
 from research_engine.local import load_env_file, run_config_from_env
 from research_engine.runconfig import (
-    get_run_config,
-    reset_run_config,
     set_process_default,
-    set_run_config,
 )
 from research_engine.runner import initial_state
 
@@ -41,18 +42,12 @@ DEFAULT_JUDGE_MODEL = "anthropic:claude-sonnet-4-6"
 
 
 def _build_judge(judge_model: str) -> tuple[Any, str]:
-    """Build the citation judge, returning it with the model id actually used.
+    """通过引擎工厂构建裁判，并返回实际选定的路由供结果记录。
 
-    `BENCHMARK_JUDGE_MODEL` wins over the caller's default so a run can be redirected at a
-    local judge (`ollama:qwen2.5:7b`) when a hosted quota is exhausted, which is the only
-    thing that kept this harness from running at all. Routing goes through the engine's
-    factory rather than a direct provider import, so every provider the product supports —
-    OpenRouter and Ollama included — is available here for free.
-
-    Returning the resolved id is the point: the previous version advertised one model in
-    the trace and instantiated another, which silently falsified the run's provenance.
+    BENCHMARK_JUDGE_MODEL 优先于 EVAL_JUDGE_MODEL，后者优先于调用方默认值。
+    独立端点只在构建裁判时生效，不影响随后运行的研究模型。
     """
-    resolved = os.environ.get("BENCHMARK_JUDGE_MODEL") or judge_model or DEFAULT_JUDGE_MODEL
+    resolved = benchmark_judge_route(judge_model or DEFAULT_JUDGE_MODEL)
     # Only the model half is validated here; the provider half is the factory's business,
     # and it already raises with the full list of known providers if it is wrong.
     name = resolved.partition(":")[2]
@@ -65,12 +60,8 @@ def _build_judge(judge_model: str) -> tuple[Any, str]:
     # `critic` is the zero-temperature role, which is what a binary judge wants. The
     # override is scoped to building the client: the returned model carries its own
     # provider and endpoint, so the pipeline's routing is restored immediately after.
-    base = get_run_config()
-    token = set_run_config(replace(base, models={**base.models, "critic": resolved}))
-    try:
+    with judge_client_config(resolved):
         return get_llm("critic"), resolved
-    finally:
-        reset_run_config(token)
 
 
 def sanitize_text(text: str) -> str:
@@ -149,6 +140,8 @@ async def score_system_claims(
                 "judge_verdict": None,
                 "judge_reasoning": None,
                 "judge_model": judge_model,
+                "judge_max_output_tokens": judge_max_output_tokens(),
+                "metrics_version": metrics.METRICS_VERSION,
                 # isoformat() on an aware datetime already carries "+00:00"; appending "Z"
                 # produced "…+00:00Z", which is not valid ISO 8601 and fails strict parsers.
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -189,18 +182,14 @@ async def score_system_claims(
                     trace["judge_model_served"] = served
 
             # Parse responses
-            for match in re.finditer(r"Claim\s+(\d+)\s*:\s*(YES|NO)", text, re.IGNORECASE):
-                idx = int(match.group(1)) - 1
-                if idx < len(batch_traces):
-                    batch_traces[idx]["judge_verdict"] = (
-                        "SUPPORTED" if match.group(2).upper() == "YES" else "UNSUPPORTED"
-                    )
+            for idx, supported in claim_labels(text, len(batch_traces)).items():
+                batch_traces[idx]["judge_verdict"] = "SUPPORTED" if supported else "UNSUPPORTED"
 
             for match in re.finditer(
                 r"Reasoning\s+(\d+)\s*:\s*(.*?)(?=\nClaim|\Z)", text, re.IGNORECASE | re.DOTALL
             ):
                 idx = int(match.group(1)) - 1
-                if idx < len(batch_traces):
+                if 0 <= idx < len(batch_traces):
                     batch_traces[idx]["judge_reasoning"] = match.group(2).strip()
 
         except Exception as e:
@@ -394,7 +383,7 @@ async def main():
         vals = [r[key] for r in metrics_list if isinstance(r.get(key), (int, float))]
         return round(sum(vals) / len(vals), 4) if vals else None
 
-    judge_used = os.environ.get("BENCHMARK_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL
+    judge_used = benchmark_judge_route(DEFAULT_JUDGE_MODEL)
     gpt_ran = GPTResearcher is not None
     summary_md = f"""# Benchmark Comparison
 
@@ -403,6 +392,7 @@ async def main():
 - Queries: {len(queries)} (`evals/queries.json`)
 - Our pipeline routing: {", ".join(f"{r}={RUN_CONFIG.model_for(r)}" for r in ("planner", "executor", "critic", "synthesizer"))}
 - Citation judge: `{judge_used}`
+- Metrics version: {metrics.METRICS_VERSION} (batch-local Judge labels)
 - GPT-Researcher: {"installed" if gpt_ran else "**NOT INSTALLED — its column is not a measurement**"}
 
 | Metric | Our Pipeline | GPT-Researcher |

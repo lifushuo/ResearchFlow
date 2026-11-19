@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "gold_sha256": "6673226a6c4d8d215f270813ad563151c927e3e8f87334f20e38b8b61beba56c",
+  "evidence_kind": "controlled_fixture",
+  "cases": [
+    {
+      "case_id": "search-read",
+      "stage": "proposed",
+      "calls": [
+        {
+          "name": "web_search",
+          "args": {
+            "query": "AI agent memory"
+          }
+        },
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/article"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "parallel-page-reads",
+      "stage": "proposed",
+      "calls": [
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/a"
+          }
+        },
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/b"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "permitted-extra",
+      "stage": "proposed",
+      "calls": [
+        {
+          "name": "web_search",
+          "args": {
+            "query": "VRP"
+          }
+        },
+        {
+          "name": "calculate",
+          "args": {
+            "expression": "2+2"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "no-tool-needed",
+      "stage": "proposed",
+      "calls": []
+    }
+  ]
+}

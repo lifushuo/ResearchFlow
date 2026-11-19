@@ -1,17 +1,8 @@
-"""
-Search retriever chain (docs/architecture/02-system-architecture.md, docs/04 §4).
+"""搜索检索链，见 docs/architecture/02-system-architecture.md、docs/04 §4。
 
-Ordered fallback: Tavily → Brave → DuckDuckGo. First success wins. DuckDuckGo is
-the keyless last resort (endemic rate-limiting — never the sole retriever).
-Results are normalized to {title, url, snippet} and cached in Redis (24h).
-
-In LLM_MODE=fake a deterministic fixture retriever is used so tests need no network.
-
-In corpus mode (internal/12 M10) the chain is replaced outright: the installed Corpus
-port answers every search, and nothing else runs — that exclusivity IS the airgap.
-The delegation sits before the fake-mode shortcut so a corpus is honoured even under
-scripted models (the egress test relies on that).
-"""
+按 Tavily → Brave → DuckDuckGo 回退，首个成功即返回；DuckDuckGo 仅作无密钥兜底。
+统一为 title、url、snippet，并缓存 24 小时；fake 模式使用固定检索结果。
+仅资料库模式直接替换整条链，不允许回退外网；此判断先于 fake，以便脚本也走真实资料库。"""
 
 from __future__ import annotations
 
@@ -88,11 +79,9 @@ _CHAIN = (("tavily", _tavily), ("brave", _brave), ("duckduckgo", _duckduckgo))
 
 
 async def search(query: str, max_results: int = 5) -> list[SearchResult]:
-    """Run the retriever chain with Redis caching. Raises on total exhaustion."""
+    """通过缓存端口运行检索链，所有检索器耗尽时抛错。"""
     if get_run_config().corpus_mode:
-        # Corpus-only: the port answers exclusively. NoCorpus raises, and the raise is
-        # deliberate — an airgapped run with no corpus must fail visibly, not fall
-        # through to the web chain (internal/12 M10 DoD: no retrieval egress).
+        # 仅资料库模式只能由端口回答；未安装资料库时明确失败，不能回退网页链路而泄露查询。
         return await get_corpus().search(query, max_results)
 
     cfg = get_run_config()
@@ -105,16 +94,14 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
 
         return fake_search(query, max_results)
 
-    # Cache lookup (best-effort; cache failures never break search). The backend is a
-    # host-supplied Cache port — Redis on the server, SQLite on the desktop, null by
-    # default (docs/13 §4).
+    # 尽力读取宿主缓存：服务端 Redis、桌面 SQLite，默认空缓存。缓存失败不能影响搜索。
     cache = get_cache()
     cache_key = f"search:{max_results}:{query.strip().lower()}"
     try:
         cached = await cache.get(cache_key)
         if cached:
             return json.loads(cached)
-    except Exception:  # noqa: BLE001 — an unavailable cache is not a search failure
+    except Exception:  # noqa: BLE001 — 缓存不可用不等于搜索失败
         pass
 
     errors: list[str] = []
@@ -124,11 +111,11 @@ async def search(query: str, max_results: int = 5) -> list[SearchResult]:
             if results:
                 try:
                     await cache.set(cache_key, json.dumps(results), _CACHE_TTL)
-                except Exception:  # noqa: BLE001 — see above
+                except Exception:  # noqa: BLE001 — 同上，缓存故障不影响搜索
                     pass
                 logger.info("retriever_hit", retriever=name, count=len(results))
                 return results
-        except Exception as e:  # noqa: BLE001 — try the next retriever
+        except Exception as e:  # noqa: BLE001 — 失败后尝试下一个检索器
             errors.append(f"{name}: {e}")
             logger.warning("retriever_failed", retriever=name, error=str(e))
 

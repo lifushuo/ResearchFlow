@@ -7,11 +7,7 @@ import type { PromptDefault } from "@/lib/types";
 
 import { RolePromptEditor } from "./RolePromptEditor";
 
-/**
- * One agent's instruction editor (scope freeze §12): it starts from what runs today, saves
- * real text, and never turns an emptied box into a save. Its reset is covered below; the
- * card's own reset, and the editor's reaching the API, in `AgentsSection.test.tsx`.
- */
+/** 单角色指令编辑器（范围约定 §12）从当前生效内容开始，只保存有效文本，不能把清空视为保存。此处覆盖编辑器重置；卡片重置及到 API 的交互由 AgentsSection.test.tsx 覆盖。 */
 
 type Save = (text: string) => Promise<void>;
 type Close = () => void;
@@ -45,7 +41,7 @@ function setUp({
 } = {}) {
   render(
     <RolePromptEditor
-      label="Planner"
+      label="规划器"
       shipped={shipped}
       maxChars={maxChars}
       saved={saved}
@@ -55,7 +51,7 @@ function setUp({
       onReset={onReset}
     />,
   );
-  const box = screen.getByRole("textbox", { name: "Instructions for Planner" });
+  const box = screen.getByRole("textbox", { name: "规划器的指令" });
   return { box, onSave, onClose, onReset };
 }
 
@@ -74,7 +70,7 @@ describe("what the editor starts from", () => {
 
   it("says the untrusted-content rule is added, for an agent that gets it", () => {
     setUp({ shipped: CRITIC });
-    expect(screen.getByRole("note")).toHaveTextContent(/cannot be removed/);
+    expect(screen.getByRole("note")).toHaveTextContent(/不能移除/);
   });
 
   it("says nothing about it for an agent that does not", () => {
@@ -86,14 +82,14 @@ describe("what the editor starts from", () => {
 describe("saving", () => {
   it("offers nothing to save until the text changes", () => {
     setUp();
-    expect(screen.getByRole("button", { name: "Save instructions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存指令" })).toBeDisabled();
   });
 
   it("saves the edited text, then closes", async () => {
     const { box, onSave, onClose } = setUp();
     await userEvent.clear(box);
     await userEvent.type(box, "Plan carefully.");
-    await userEvent.click(screen.getByRole("button", { name: "Save instructions" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存指令" }));
     expect(onSave).toHaveBeenCalledWith("Plan carefully.");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -102,9 +98,9 @@ describe("saving", () => {
     const { box, onSave } = setUp({ saved: "Plan in three steps." });
     await userEvent.clear(box);
     if (text) await userEvent.type(box, text);
-    expect(screen.getByRole("button", { name: "Save instructions" })).toBeDisabled();
-    expect(screen.getByText(/An empty prompt is not a reset/)).toHaveTextContent(
-      /Reset to default/,
+    expect(screen.getByRole("button", { name: "保存指令" })).toBeDisabled();
+    expect(screen.getByText(/清空提示词不代表重置/)).toHaveTextContent(
+      /恢复默认/,
     );
     expect(onSave).not.toHaveBeenCalled();
   });
@@ -112,8 +108,8 @@ describe("saving", () => {
   it("tells a shipped agent's editor to cancel rather than save an empty box", async () => {
     const { box } = setUp();
     await userEvent.clear(box);
-    expect(screen.getByText(/An empty prompt is not a reset/)).toHaveTextContent(
-      /Cancel to keep the shipped prompt/,
+    expect(screen.getByText(/清空提示词不代表重置/)).toHaveTextContent(
+      /点击“取消”保留内置提示词/,
     );
   });
 
@@ -121,8 +117,8 @@ describe("saving", () => {
     const { box } = setUp({ maxChars: 10 });
     await userEvent.clear(box);
     await userEvent.type(box, "x".repeat(11));
-    expect(screen.getByRole("button", { name: "Save instructions" })).toBeDisabled();
-    expect(screen.getByText(/11 \/ 10 characters — over the limit/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存指令" })).toBeDisabled();
+    expect(screen.getByText(/11 \/ 10 字符——超出长度限制/)).toBeInTheDocument();
   });
 
   it("shows an API refusal inline, in the API's words, and stays open", async () => {
@@ -136,7 +132,7 @@ describe("saving", () => {
       );
     const { box, onClose } = setUp({ onSave });
     await userEvent.type(box, " More.");
-    await userEvent.click(screen.getByRole("button", { name: "Save instructions" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存指令" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "prompt override for 'planner' is 61 characters; the maximum is 60",
     );
@@ -147,14 +143,14 @@ describe("saving", () => {
   it("cancels without saving", async () => {
     const { box, onSave, onClose } = setUp();
     await userEvent.type(box, " edited");
-    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await userEvent.click(screen.getByRole("button", { name: "取消" }));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onSave).not.toHaveBeenCalled();
   });
 });
 
 describe("resetting to the shipped prompt from inside the editor", () => {
-  const reset = () => screen.queryByRole("button", { name: "Reset to default" });
+  const reset = () => screen.queryByRole("button", { name: "恢复默认" });
 
   it("offers nothing while the shipped text is untouched — there is nothing to go back to", () => {
     setUp();
@@ -172,7 +168,7 @@ describe("resetting to the shipped prompt from inside the editor", () => {
   });
 
   it("on a customized agent, clears the override rather than saving a copy of the shipped text", async () => {
-    // A copy would still be an override — the run would record the agent as customized.
+    // 保存默认文本的副本仍属于覆盖，研究记录仍会标记角色已自定义。
     const { onSave, onReset } = setUp({ saved: "Plan in three steps." });
     await userEvent.click(reset()!);
     expect(onReset).toHaveBeenCalledOnce();

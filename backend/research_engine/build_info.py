@@ -1,30 +1,10 @@
-"""
-What this build is, and which commit it came from.
+"""记录构建版本及其对应提交。
 
-A desktop user with an installed `.dmg` and a maintainer reading a bug report need the same
-thing: the exact revision that produced the artifact in front of them. Nothing in this
-product recorded it — there was no git SHA anywhere, and five hand-maintained version
-constants, two of which had already drifted for a whole release line.
-
-**Absent means `"unknown"`, never a guess.** `scripts/stamp_build.py` writes `_build.py`
-at build time and it is git-ignored, so a source checkout legitimately has none. Reporting
-the working tree's HEAD instead would be a plausible answer that is wrong precisely when it
-matters — a bundle built from a dirty tree, or copied between machines. This repository's
-rule is that a measurement it could not take must say so; a version string is a
-measurement.
-
-**A stamp its own checkout contradicts is not reported either.** Being git-ignored, a
-`_build.py` left by an earlier build survives in a checkout and names another commit. Run
-from source, the checkout can see that, and when its version, HEAD or dirtiness disagrees
-with the stamp the answer is `unknown`. The tree only ever vetoes a stamp — it never
-supplies an answer, which would be the guess refused above. Not consulted when frozen (a
-bundle's stamp was checked when it was built, and where it runs from says nothing about it)
-or where there is no readable checkout (an image has no `.git` and no git). `stamp_build.py
---check` asks the same question through `checkout_identity` and `stamp_contradiction`.
-
-Lives in `research_engine/` rather than `app/` because the engine is what the desktop
-bundle actually contains, and this has to be readable from inside it with no configuration.
-"""
+构建时由 scripts/stamp_build.py 生成被 Git 忽略的 _build.py。
+没有构建戳就返回 unknown，不能拿当前工作区 HEAD 猜测产物的来源。
+源码运行时若版本、HEAD 或未提交状态与构建戳矛盾，也返回 unknown。
+工作区信息只用于否决旧戳，不用于猜测版本；打包程序或不可读的仓库不做此检查。
+本模块放在引擎层，保证桌面包无需服务端配置也能读取版本。"""
 
 from __future__ import annotations
 
@@ -40,24 +20,21 @@ import structlog
 logger = structlog.get_logger()
 
 UNKNOWN = "unknown"
-#: What a stamp claims about the checkout that produced it, and so all a checkout can refute.
+#: 构建戳声明的源码身份；工作区只能核验这些事实。
 IDENTITY_FIELDS = ("VERSION", "GIT_SHA", "DIRTY")
-#: The repository root, when this file sits where a source checkout puts it.
+#: 从源码目录运行时对应的仓库根目录。
 _CHECKOUT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
 class BuildInfo:
-    """The five facts a build can state about itself."""
+    """构建可以披露的五项身份信息。"""
 
     version: str
     git_sha: str
-    #: True when the working tree had uncommitted changes at build time. The one honest
-    #: answer to "which commit is this?" for a local build — a SHA alone would claim the
-    #: artifact matches that commit when it does not.
+    #: 构建时是否存在未提交修改。仅有提交 SHA 不能证明本地产物与该提交完全相同。
     dirty: bool
-    #: A hash of the canonical API surface. Two builds with the same value serve the same
-    #: contract, whatever their versions say.
+    #: 标准 API 契约的哈希；哈希相同表示接口契约相同。
     contract_version: str
     built_at: str
 
@@ -68,8 +45,7 @@ class BuildInfo:
 _UNSTAMPED = BuildInfo(
     version=UNKNOWN,
     git_sha=UNKNOWN,
-    # Not `False`: "we did not look" is not "the tree was clean". A build with no
-    # stamp cannot claim either.
+    # 没有检查过工作区就不能填 False，否则会把未知误报成干净。
     dirty=True,
     contract_version=UNKNOWN,
     built_at=UNKNOWN,
@@ -77,7 +53,7 @@ _UNSTAMPED = BuildInfo(
 
 
 def build_info() -> BuildInfo:
-    """This build's identity, or an honest `unknown` when it was never stamped."""
+    """返回构建身份；没有可靠构建戳时返回 unknown。"""
     try:
         from research_engine import _build  # type: ignore[attr-defined]
     except ImportError:
@@ -95,12 +71,9 @@ def build_info() -> BuildInfo:
 
 
 def checkout_identity(root: Path) -> dict | None:
-    """`root`'s VERSION, HEAD and whether its tree is dirty — or None when `root` is not the
-    top of a checkout git can read: no git, no repository, or `root` sits inside a larger one.
+    """读取 root 的 VERSION、HEAD 和未提交状态；不是可读仓库根目录时返回 None。
 
-    `DIRTY` counts untracked files, as `git status` does: a stamp is a claim about the
-    tree, and an added file is part of what would be built.
-    """
+    未跟踪文件也计入 DIRTY，因为新增文件同样可能进入构建产物。"""
 
     def git(*args: str) -> str:
         return subprocess.run(
@@ -122,7 +95,7 @@ def checkout_identity(root: Path) -> dict | None:
 def stamp_contradiction(
     claimed: Mapping[str, object], checkout: Mapping[str, object]
 ) -> str | None:
-    """Why this stamp does not describe this checkout, or None when it does."""
+    """返回构建戳与工作区不符的原因；一致时返回 None。"""
     for key in IDENTITY_FIELDS:
         if claimed.get(key) != checkout[key]:
             return f"stamp says {key}={claimed.get(key)!r}, checkout says {checkout[key]!r}"
@@ -131,7 +104,7 @@ def stamp_contradiction(
 
 @cache
 def _refuted_by_checkout(claimed: tuple[tuple[str, object], ...]) -> bool:
-    """Once per process and stamp: git is a subprocess, and `/version` is served per request."""
+    """按进程和构建戳缓存，避免每次请求 /version 都启动 Git 子进程。"""
     checkout = checkout_identity(_CHECKOUT)
     if checkout is None:
         return False

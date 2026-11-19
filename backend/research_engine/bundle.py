@@ -1,40 +1,16 @@
-"""
-Research bundle: the auditable export format (docs/12 M12).
+"""研究证据包：可离线审计的导出格式，见 docs/12 M12。
 
-"SBOM for research" — a self-contained JSON artifact that carries the report, every
-claim, every evidence snippet with a content hash, the source list, contradictions,
-model routing, costs, the full approval chain, and the agent trace. A standalone
-verifier (verify_bundle.py) can check the whole thing offline with no AI and no network.
+JSON 内包含报告、Claim、带哈希的完整证据片段、来源、矛盾、模型路由、费用、
+审批链和执行轨迹。verify_bundle.py 无需模型或网络即可核验。
+这里只做纯数据组装，不依赖数据库、ORM 或宿主，服务端和桌面端共用。
+Claim 提取来自 research_engine.claims，与图内引用校验和评测采用同一定义。
 
-This module is the pure assembler: no DB, no ORM, no host. Both the API server and
-the desktop sidecar produce bundles through it. Claim extraction comes from
-`research_engine.claims` — the same definition the graph's citation-fidelity pass and the
-eval judge use. It used to come from `evals.metrics`, which meant a desktop build could
-not ship the engine without also shipping the eval harness.
-
-Design decisions (docs/reference/15-bundle-format.md):
-
-- **Content hashes are SHA-256 of the snippet text, not the source page.** The live
-  page is non-reproducible (it changes); the snippet is exactly what the executor
-  extracted and the citation-support judge ruled on. The hash proves it wasn't tampered
-  with after research time.
-
-- **Snippet is the complete stored evidence text**, not a display truncation. The
-  executor caps it at 500 chars (EvidenceChunk.snippet max_length=500); that IS the
-  full evidence.
-
-- **bundle_hash covers ALL fields** (including trace and trace_available) except itself.
-  Stripping the trace from a bundle that had one breaks the hash — correct. An absent
-  trace (trace_available=false) is the truthful state and the hash covers that truth.
-
-- **trace_available distinguishes three states** that would otherwise all be `trace: []`:
-  host had logs and they're present, host had logs but nothing fired (edge), host does
-  not support durable logging. Both shipped hosts are in the first state: the desktop
-  sidecar's `PersistingSink` writes an `agent_logs` row per event exactly as the server
-  worker's sink does, so it reports `trace_available=True` and a populated trace. This
-  line named the sidecar as the no-durable-logging example until M0C, when adding its
-  bundle route made the claim testable and it turned out to be false.
-"""
+设计约定见 docs/reference/15-bundle-format.md：
+- 哈希计算的是存储的证据片段，而不是可能随时变化的网页。
+- 片段是完整存储文本，不是展示截断；EvidenceChunk 本身最多 500 字符。
+- bundle_hash 覆盖除自身以外的所有本版本字段，包含轨迹及其可用性。
+- trace_available 区分没有事件和宿主根本不支持持久化轨迹。
+  当前服务端和桌面端均会写入 agent_logs，不能把桌面端误报成不支持。"""
 
 from __future__ import annotations
 
@@ -47,11 +23,11 @@ from pydantic import BaseModel, Field
 
 from research_engine.claims import CITE_RE, claim_lines
 
-# ── Schema ────────────────────────────────────────────────────────────────────────
+# ── 数据结构 ──
 
 
 class SnippetRecord(BaseModel):
-    """One evidence chunk with its integrity hash."""
+    """一条带完整性哈希的证据片段。"""
 
     source_url: str
     source_title: str = ""
@@ -66,7 +42,7 @@ class SnippetRecord(BaseModel):
 
 
 class ClaimRecord(BaseModel):
-    """One assertable claim extracted from the report body."""
+    """从报告正文提取的一条可核验 Claim。"""
 
     sentence: str
     citation_indices: list[int] = Field(
@@ -76,7 +52,7 @@ class ClaimRecord(BaseModel):
 
 
 class ApprovalRecord(BaseModel):
-    """One HITL decision in the approval chain."""
+    """审批链中的一次人工决定。"""
 
     action: str = Field(
         description=(
@@ -91,18 +67,11 @@ class ApprovalRecord(BaseModel):
 
 
 class PromptProvenance(BaseModel):
-    """Which system prompt one purpose actually ran under (bundle v2, scope freeze §9).
+    """记录某个用途实际使用的系统提示词，见证据包 v2 与范围冻结 §9。
 
-    **Deliberately plain strings, and deliberately not validated against this build's
-    registry.** The verifier reads bundles it did not produce, including ones from later
-    versions whose shipped prompts differ from these. Checking `purpose` or `policy` against
-    the running code would make a bundle's validity depend on the verifier's build, which is
-    the opposite of what an offline, third-party artifact format is for — a v1 bundle
-    verifies forever, and a v2 bundle must too.
-
-    `effective_prompt` is the exact string the model received, so a reader can see what the
-    run was actually instructed to do rather than infer it from a role name.
-    """
+    用途和策略保留普通字符串，不根据当前代码的注册表限制取值，
+    否则新版本产物可能被旧版核验器错误拒绝。
+    effective_prompt 保存模型实际收到的文本，不能仅靠角色名推测。"""
 
     purpose: str = Field(description="`<role>.<purpose>`, e.g. `planner.main`")
     role: str
@@ -113,19 +82,15 @@ class PromptProvenance(BaseModel):
 
 
 class BundleManifest(BaseModel):
-    """The .bundle.json schema — versions 1 and 2."""
+    """.bundle.json 数据结构，兼容版本 1 和 2。"""
 
     bundle_version: int = 1
     session_id: str
     query: str
     research_depth: str = "balanced"
 
-    # True when this report came from scripted models and fixture retrievers rather than a
-    # real provider (docs/17 §6.2). Placed here, beside the identity of the run, rather
-    # than among the metrics: a reader deciding whether to trust this file must not have to
-    # scroll past cost and token counts to discover none of it was real. Covered by
-    # `bundle_hash`, so a demo bundle cannot be edited into a real-looking one without
-    # breaking verification.
+    # 标识报告是否由脚本模型与固定检索数据生成，见 docs/17 §6.2。
+    # 放在运行身份旁边，便于读者先判断结果性质；该字段受 bundle_hash 保护。
     demo: bool = False
 
     report: str
@@ -146,55 +111,41 @@ class BundleManifest(BaseModel):
     trace: list[dict] = Field(default_factory=list)
     trace_available: bool = True
 
-    # ── v2 (scope freeze §9) ──────────────────────────────────────────────────────
-    # Both default, so a v1 bundle and a `research_artifacts.payload` frozen before v2
-    # existed still parse unchanged — the compatibility §10 calls non-negotiable.
+    # ── v2 字段，见范围冻结 §9 ──
+    # 保留默认值，让 v1 证据包和旧 research_artifacts.payload 继续可读。
     #
-    # Covered by `bundle_hash` **on a v2 bundle** — `compute_bundle_hash` hashes the fields
-    # the declared version defines, so these enter it there and are excluded from a v1's.
-    # §9 requires that be *proved* rather than assumed, which is what the tampering tests do.
+    # 仅在 v2 证据包中参与哈希；v1 必须排除后来新增的字段，避免旧产物核验失效。
     prompt_provenance: list[PromptProvenance] = Field(default_factory=list)
 
-    # Copied from `research_runs.prompt_overrides_status`, never recomputed from the
-    # provenance above: "no override was configured" and "one was configured and could not
-    # be used" both produce shipped prompts, and only the row knows which happened.
+    # 直接复制运行记录的状态，不能由提示词来源反推：未配置覆盖与覆盖不可用可能产生相同默认提示词。
     prompt_overrides_status: str | None = None
 
     created_at: str = ""
     bundle_hash: str = ""
 
 
-# ── Hashing ───────────────────────────────────────────────────────────────────────
+# ── 哈希计算 ──
 
 
 def content_hash(text: str) -> str:
-    """SHA-256 hex digest of UTF-8 encoded text."""
+    """计算 UTF-8 文本的 SHA-256 十六进制摘要。"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-#: Fields that bundle v2 introduced. A v1 bundle is hashed without them.
+#: v2 新增字段，计算 v1 哈希时必须排除。
 #:
-#: **This is what keeps already-issued bundles valid.** The hash is taken over the model's
-#: dump, so adding a field silently changes the hash of *every* bundle — including ones
-#: frozen in `research_artifacts.payload` years ago and ones a third party downloaded and
-#: still has. Their recorded `bundle_hash` would no longer match what this code computes,
-#: and `bundle_integrity` would fail on artifacts nobody touched. The scope freeze calls
-#: that outcome out by name: existing v1 bundles remain valid forever.
+#: 旧证据包的哈希必须长期有效；新增模型字段不能改变已发出或已冻结产物的哈希。
 #:
-#: So the hash is defined **per format version**: v1 hashes the fields v1 defined, v2 adds
-#: these two. Growing v3 means adding to this map, not editing the function.
+#: 哈希字段按格式版本定义；将来增加 v3 时扩展此表。
 _FIELDS_ADDED_BY_VERSION: dict[int, tuple[str, ...]] = {
     2: ("prompt_provenance", "prompt_overrides_status"),
 }
 
 
 def compute_bundle_hash(bundle: BundleManifest) -> str:
-    """SHA-256 of every field this bundle's version defines, except ``bundle_hash`` itself.
+    """计算证据包声明版本所包含字段的 SHA-256，排除 bundle_hash 自身。
 
-    Canonical JSON, sorted keys, ``bundle_hash`` blanked, so the hash is reproducible from
-    the bundle's own contents. Fields belonging to a *later* version than this bundle
-    declares are excluded — see `_FIELDS_ADDED_BY_VERSION`.
-    """
+    使用键排序的标准 JSON，保证可由包内内容复算；排除后续版本才新增的字段。"""
     d = bundle.model_dump()
     d["bundle_hash"] = ""
     for version, fields in _FIELDS_ADDED_BY_VERSION.items():
@@ -205,18 +156,18 @@ def compute_bundle_hash(bundle: BundleManifest) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-# ── Claim extraction ──────────────────────────────────────────────────────────────
+# ── Claim 提取 ──
 
 
 def _extract_citation_indices(sentence: str) -> list[int]:
-    """Which [n] markers a sentence carries."""
+    """提取句子中的 [n] 引用编号。"""
     out: list[int] = []
     for m in CITE_RE.finditer(sentence):
         out.extend(int(part.strip()) for part in m.group(1).split(","))
     return sorted(set(out))
 
 
-# ── Assembly ──────────────────────────────────────────────────────────────────────
+# ── 证据包组装 ──
 
 
 def assemble(
@@ -240,14 +191,10 @@ def assemble(
     prompt_provenance: list[dict] | None = None,
     prompt_overrides_status: str | None = None,
 ) -> BundleManifest:
-    """Build a complete bundle from session data. Pure — no DB, no ORM.
+    """由会话数据组装完整证据包，不访问数据库或 ORM。
 
-    **`prompt_provenance` decides the format version, and its presence is not a claim about
-    customisation.** A run that captured what it composed emits v2 whether or not anything
-    was overridden — `prompt_overrides_status: NONE` is a perfectly ordinary v2 bundle. A run
-    with nothing captured emits v1, because its prompts were never recorded and no honest v2
-    can be built from a run that predates the recording.
-    """
+    是否记录 prompt_provenance 决定格式版本，与是否自定义提示词无关。
+    有实际提示词记录就生成 v2；旧运行未记录时只能生成 v1，不能补造历史提示词。"""
 
     report_h = content_hash(report)
 
@@ -307,24 +254,17 @@ def assemble(
 
 
 def serialize(bundle: BundleManifest) -> str:
-    """Canonical JSON for storage/export — readable, deterministic key order."""
+    """生成用于保存或导出的标准 JSON，保持可读且键顺序确定。"""
     return json.dumps(bundle.model_dump(), sort_keys=True, indent=2, ensure_ascii=False) + "\n"
 
 
-#: Prepended to the report text of any demo export (docs/17 §6.2). Markdown, so it
-#: survives into the PDF renderer as well as the `.md` file.
+#: 演示报告导出时添加的 Markdown 标记，PDF 渲染后也应可见，见 docs/17 §6.2。
 #:
-#: **Lives here for the same reason `render_model_attribution_md` does:** both the API
-#: server and the desktop sidecar export `.md`, and both must stamp it. It used to be a
-#: private constant in `app/api/v1/research.py`, which the sidecar could not reach — so the
-#: desktop `.md` export shipped unstamped while `docs/user-guide/29-exports.md` promised
-#: that "every export path stamps the artifact" (#52). That is precisely the artifact the
-#: flag exists to prevent: a scripted, fixture-sourced report that leaves the app looking
-#: like research.
+#: 服务端和桌面端共用此标记，防止脚本数据导出后看起来像真实研究。
+#: 以前标记只在服务端私有模块中，曾导致桌面导出漏标。
 #:
-#: The bundle deliberately does NOT carry this. `report_hash` is checked against the
-#: `draft_hash` recorded at approval, so injecting prose into the report body afterwards
-#: breaks the approval chain. The bundle carries `demo` as a hash-covered field instead.
+#: 不把标记插入证据包正文：批准时的 draft_hash 必须与 report_hash 一致。
+#: 证据包通过受哈希保护的 demo 字段披露演示状态。
 DEMO_STAMP_MD = (
     "> ## ⚠ DEMO — NOT REAL RESEARCH\n"
     ">\n"
@@ -338,41 +278,19 @@ DEMO_STAMP_MD = (
 
 
 def stamp_demo_md(report: str, *, demo: bool) -> str:
-    """Prepend the demo banner when `demo` is set. The one place either host decides.
-
-    A function rather than a bare constant so the rule ("stamped iff demo") has a single
-    implementation too, not just a single string — `tests/test_demo_stamp_parity.py`
-    pins that both hosts route through it.
-    """
+    """仅在 demo 为真时添加演示标记，两个宿主共用同一规则。"""
     return f"{DEMO_STAMP_MD}{report}" if demo else report
 
 
 def render_model_attribution_md(
     model_routing: dict[str, str] | None, checker_accuracy: dict | None = None
 ) -> str:
-    """A "Models used" Markdown footer — the `.md`/`.pdf` export counterpart of this
-    module's `models` field (requirement 1: disclosure "in the report/export").
+    """生成 Markdown 模型披露页脚，供 .md 与 .pdf 导出使用。
 
-    Lives here, not in `app.services.export`, because both the API server AND the
-    desktop sidecar's `.md` export need it, and `app.services.export` lazily imports
-    WeasyPrint — `test_sidecar_import_tree_excludes_weasyprint` pins that the sidecar
-    process never touches that module at all (docs/13 §7). This module is already the
-    documented host-agnostic export home ("no DB, no ORM, no host. Both the API server
-    and the desktop sidecar produce bundles through it" — see the module docstring).
-
-    Appended by the caller, never merged into the report body itself: the body is the
-    exact text a human approved, and `report_hash` is checked against that same
-    `draft_hash` above — mutating it here would break bundle verification for a reason
-    that has nothing to do with the bundle's integrity (the same trap `_DEMO_STAMP`,
-    `app/api/v1/research.py`, documents for the demo banner).
-
-    Empty when routing was never resolved — a run that failed before the planner, or a
-    report exported from before this field existed — never a guessed default (the
-    unmeasured-vs-zero rule).
-
-    A selected-files run also states how accurate its claim checker was measured to be
-    (D-24), from the label its grounding record carries — the run page shows the same words.
-    """
+    放在引擎层，供服务端和桌面端共用，避免桌面导入含 WeasyPrint 的服务端导出模块。
+    由调用方追加到正文之外，不能改动已批准正文，否则会破坏审批哈希。
+    没有解析过路由就返回空文本，不猜测默认模型。
+    选定文件研究还会披露引用检查器已测得的准确性标签，见 D-24。"""
     if not model_routing:
         return ""
     lines = "\n".join(f"- **{role}** — `{route}`" for role, route in sorted(model_routing.items()))

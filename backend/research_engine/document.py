@@ -1,27 +1,8 @@
-"""A typed view of a report (V2.1-a A7).
+"""报告的类型化派生视图，见 V2.1-a A7。
 
-A report is a Markdown string at every layer of this system: in the graph's state, on
-`revisions.report_markdown`, and in the bundle. Its structure is re-derived by regex in
-three places, and `research_engine/claims.py` records what that costs — a single-number
-citation pattern once made 42% of a real report's markers invisible while reporting a
-perfect resolution rate.
-
-**Markdown stays authoritative here, and that is the whole design.** `report_hash` is
-`sha256(report_markdown)`, and that hash is what `reviews.reviewed_hash`,
-`research_artifacts.artifact_hash` and the bundle verifier's approval-chain check all pin.
-Re-rendering a parsed document back into the hash input would put an already-approved
-artifact's verification at the mercy of a parser. So the arrow runs one way:
-
-    LLM output ──> report_markdown ──> report_hash / approval / artifact / bundle
-                        │
-                        └────────────> ReportDocument   (derived, non-authoritative)
-
-The direction inverts only when generation itself emits blocks, which is a later phase.
-
-Parsing reuses `claims.py`'s regexes **by import rather than by restatement**: the document
-and claim extraction must never disagree about what a heading or a list item is, and two
-copies of those rules would eventually do exactly that.
-"""
+原始 Markdown 仍是唯一权威正文，report_hash、审批、产物与证据包都以它为准。
+ReportDocument 仅用于理解结构，不能重新渲染后替代已批准文本，否则解析器变化会破坏哈希。
+标题、列表与引用规则从 claims.py 导入，不能复制出第二套定义。"""
 
 from __future__ import annotations
 
@@ -31,66 +12,49 @@ from pydantic import BaseModel
 
 from research_engine.claims import HEADING_RE, LIST_MARKER_RE, extract_citations
 
-#: Bumped when the block vocabulary or the render rules change. A stored document carries
-#: it so a reader can tell whether it was produced by the rules it is about to apply.
+#: 块类型或渲染规则变化时递增版本，供读取方识别采用的规则。
 SCHEMA_VERSION = 1
 
 BlockKind = Literal["heading", "paragraph", "list_item"]
 
 
 class ReportBlock(BaseModel):
-    """One structural element of a report.
+    """报告中的一个结构元素。
 
-    Three kinds, because three kinds are what the synthesizer emits. Tables, figures,
-    equations and code have no producer until a later phase, and a kind nothing can write
-    is a column nothing fills.
-    """
+    只定义当前综合器会生成的三种类型，暂不为尚无生成流程的结构增加空字段。"""
 
     kind: BlockKind
-    #: The visible text, with the Markdown marker removed — `## Summary` stores `Summary`,
-    #: `- a fact [1]` stores `a fact [1]`. The renderer puts the marker back.
+    #: 去掉 Markdown 标记后的可见文本，渲染时再补回标题或列表标记。
     text: str
     order: int
-    #: Heading depth, 1-6. `None` for every other kind.
+    #: 标题级别为 1–6，其他块为 None。
     level: int | None = None
-    #: The `[n]` markers this block carries, in source order, flattened from grouped forms
-    #: like `[1, 3]`. Derived with `claims.extract_citations` — the same function the
-    #: citation-resolution rate uses, so a marker cannot count here and not there.
+    #: 按出现顺序保存 [n] 编号，组合引用先展开；与引用解析率共用 claims.extract_citations。
     citation_markers: tuple[int, ...] = ()
 
 
 class ReportMetadata(BaseModel):
-    """What identifies this report. Deliberately small.
+    """报告身份的最小信息。
 
-    No workflow, agent, prompt or model provenance: those belong to the phase that
-    introduces them, and recording a version this build cannot know would be a fabricated
-    provenance claim rather than an empty one.
-    """
+    尚未引入的工作流、代理、提示词或模型来源不在这里猜测记录。"""
 
     run_id: str
     revision_version: int
     question: str
-    #: Passed in by the caller, never read from the clock here — a parser that timestamps
-    #: itself is a parser whose output differs on every call, and this one must be a pure
-    #: function of its input.
+    #: 时间由调用方传入，解析器不自行读时钟，保证同一输入得到相同输出。
     generated_at: str
 
 
 class ReportDocument(BaseModel):
-    """The derived, typed view of one report revision."""
+    """一份报告修订的类型化派生视图。"""
 
     schema_version: int = SCHEMA_VERSION
     blocks: tuple[ReportBlock, ...]
     metadata: ReportMetadata
-    #: Whether `render_markdown(self)` reproduces the exact bytes this was parsed from.
+    #: render_markdown 是否能逐字还原解析前的 Markdown。
     #:
-    #: Recorded rather than required. A report using Markdown this vocabulary does not
-    #: model — a fenced code block, a table — still parses, with the construct preserved
-    #: verbatim inside a paragraph, and simply does not round-trip. Saying so is the
-    #: difference between a derived view a reader can trust the provenance of and one that
-    #: quietly claims to be its source. `EXACT` is not a success condition and `LOSSY` is
-    #: not a failure; what matters is that neither is ever mistaken for the authoritative
-    #: `report_markdown`.
+    #: 记录还原精度而不强制要求精确。未知 Markdown 结构作为段落原文保留。
+    #: EXACT 不等于质量通过，LOSSY 也不等于失败；二者都不能取代权威 report_markdown。
     render_fidelity: Literal["EXACT", "LOSSY"]
 
 
@@ -99,12 +63,9 @@ def _heading_level(line: str) -> int:
 
 
 def parse_markdown(markdown: str, *, metadata: ReportMetadata) -> ReportDocument:
-    """Derive a typed view of a report. Pure, deterministic, and never authoritative.
+    """由报告派生类型化视图，纯函数且确定性。
 
-    Unrecognised constructs are not dropped and not guessed at — they become paragraph text
-    verbatim, so the document is always a complete view of the report even where it is a
-    coarse one. `render_fidelity` then records that the view is coarse.
-    """
+    未知结构不丢弃、不猜测，原样保存为段落；render_fidelity 披露是否能准确还原。"""
     blocks: list[ReportBlock] = []
     paragraph: list[str] = []
 
@@ -157,24 +118,17 @@ def parse_markdown(markdown: str, *, metadata: ReportMetadata) -> ReportDocument
     document = ReportDocument(
         blocks=tuple(blocks),
         metadata=metadata,
-        render_fidelity="EXACT",  # provisional; decided by the comparison below
+        render_fidelity="EXACT",  # 暂定值，以下方实际比较结果为准。
     )
     fidelity = "EXACT" if render_markdown(document) == (markdown or "") else "LOSSY"
     return document.model_copy(update={"render_fidelity": fidelity})
 
 
 def render_markdown(document: ReportDocument) -> str:
-    """Render a document back to Markdown.
+    """把派生文档渲染回 Markdown。
 
-    The separator rules are read off what the synthesizer actually emits rather than chosen:
-    a heading is followed by a single newline when the next block is its content and a blank
-    line when it is another heading, consecutive list items are separated by a single
-    newline, and everything else by a blank line. That reproduces this product's own reports
-    byte-for-byte; anything else is reported as `LOSSY` rather than quietly reshaped.
-
-    **Not a path to the hash.** `report_hash` reads `report_markdown`, which is the model's
-    own bytes and is never replaced by this function's output.
-    """
+    分隔规则按综合器现有输出：标题后正文单换行，连续标题间空行，列表项间单换行，其他块间空行。
+    无法逐字还原时标为 LOSSY，不静默改写。report_hash 始终读取原始 report_markdown。"""
     if not document.blocks:
         return ""
 

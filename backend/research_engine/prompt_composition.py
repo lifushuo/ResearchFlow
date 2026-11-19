@@ -1,41 +1,10 @@
-"""
-One home for "which system prompt does this call use" (`internal/rfcs/V3.0-scope-freeze.md` §17).
+"""统一决定每次调用实际使用的系统提示词，见范围冻结 RFC §17。
 
-**Why this module exists.** Nine shipped prompts are selected at eight call sites in
-`graph.py` and four more outside the engine, and five agent *roles* fan out across them —
-three prompts resolve through the role literal `"critic"` alone. V3 lets a user replace the
-prompt for a role, which means something has to decide *which* of a role's prompts an
-override may reach. That decision needs one home, and this is it.
+五个角色对应多个用途，同为 critic 的研究评审可替换，引用核验等用途却必须保护。
+因此可覆盖性按用途判断，不能只按角色判断。此模块可由引擎、服务端、桌面和评测共同导入。
 
-**Why here and nowhere else.** `graph.py` is engine code and may not import `app` or `evals`
-(`tests/task/test_engine_boundary.py`), while the chat call sites live in `app/`, `desktop/`
-and `evals/`. `research_engine/` is the only package all five can import, so the seam has to
-sit inside it. `app/services/run_config.py` — where the *preference* contract lives — is
-disqualified for exactly that reason.
-
-**Why `prompts.py` stays a pure constants module.** `fakes.SCENARIO_BY_PROMPT` is keyed on
-the prompt constant *objects*, so a scripted run finds its script by identity. Keeping the
-constants inert preserves that, and `system_prompt()` below returns the same object rather
-than a copy — a fake run resolves exactly as it did before this module existed.
-
-**Override eligibility is a property of the purpose, never of the role.** Three purposes run
-under `critic` and only one of them may be replaced, so a role is not enough information to
-decide anything. `is_overridable()` therefore takes a purpose and never consults `role_of()`;
-a test asserts that structurally, because the moment eligibility can be computed from a role
-the citation verifier becomes reachable from the `critic` editor.
-
-**The shipped path is untouched.** With no override in force — and for every protected
-purpose — this returns the shipped constant *itself*, the same object, byte for byte. That
-is not an optimisation: `fakes.SCENARIO_BY_PROMPT` resolves a scripted run by prompt
-identity, so a copy would collapse the three scenarios that share `critic` into one.
-
-**The note is sandwiched only around a user's body.** The six constants that carry
-`UNTRUSTED_CONTENT_NOTE` interleave it, 41-88% of the way in and followed by further
-instructions in four of the six. Wrapping a *shipped* prompt would change what every run sees for no benefit,
-so it is not done. A user-authored body has no such framing, so it is wrapped on both
-sides — before, so the model is told what to distrust before reading the instructions, and
-after, because a body ending in an instruction would otherwise have the last word.
-"""
+默认或受保护用途返回原常量对象，不复制、不重新包装，保证脚本模型匹配保持一致。
+仅用户自定义正文需要前后补不可信内容说明；默认提示词本来已有说明，不能重复添加。"""
 
 from __future__ import annotations
 
@@ -47,11 +16,9 @@ from typing import NamedTuple
 from research_engine import prompts
 from research_engine.runconfig import get_run_config
 
-#: Every shipped prompt, keyed by the purpose it serves. The key is `<role>.<purpose>`, so
-#: the role a purpose belongs to is readable from the key and cannot drift from it.
+#: 按 <角色>.<用途> 索引默认提示词，角色直接由键推导，避免两处声明漂移。
 #:
-#: **Fifteen purposes, five roles.** `critic` owns eight, `synthesizer` three and `chat` two —
-#: which is the entire reason a purpose vocabulary exists rather than a role-keyed lookup.
+#: 多个用途共用五个角色，不能只用角色索引来决定替换权限。
 PURPOSE_CONSTANTS: Mapping[str, str] = {
     "planner.main": prompts.PLANNER_PROMPT_V2,
     "executor.main": prompts.EXECUTOR_PROMPT,
@@ -70,18 +37,12 @@ PURPOSE_CONSTANTS: Mapping[str, str] = {
     "chat.project": prompts.PROJECT_CHAT_PROMPT,
 }
 
-#: The five model roles, derived from the purpose keys rather than restated, so a purpose
-#: added under a sixth role is visible here immediately instead of silently ignored.
+#: 从用途键推导模型角色，新角色出现时不会被第二份手写列表漏掉。
 ROLES: tuple[str, ...] = tuple(dict.fromkeys(p.split(".", 1)[0] for p in PURPOSE_CONSTANTS))
 
-#: The purposes a user may replace. An explicit allowlist of exact purpose strings, and the
-#: only way anything becomes overridable.
+#: 可替换用途的唯一显式允许清单，只有精确匹配才能覆盖。
 #:
-#: **Protection is the default, and that is load-bearing.** `PROTECTED_PURPOSES` below is the
-#: *complement* of this set rather than a second hand-written list, so a purpose added to
-#: `PURPOSE_CONSTANTS` and forgotten here is protected rather than exposed. Two lists kept in
-#: step by discipline would eventually disagree, and the direction they disagreed in would be
-#: the unsafe one.
+#: 默认保护：PROTECTED_PURPOSES 取允许清单的补集，新用途忘记登记时仍受保护。
 OVERRIDABLE_PURPOSES: frozenset[str] = frozenset(
     {
         "planner.main",
@@ -92,44 +53,27 @@ OVERRIDABLE_PURPOSES: frozenset[str] = frozenset(
     }
 )
 
-#: Everything else. Derived, never enumerated — see above.
+#: 其余用途全部保护，由补集计算，不再手工枚举。
 #:
-#: Why each of these is not a user's to rewrite:
+#: 下列用途不允许用户改写的原因：
 #:
-#: * `critic.citation_verify` decides whether a citation is supported, which drives the ⚠
-#:   chip and `citation_resolution_rate`. A user who can rewrite it grades their own work.
-#: * `critic.contradiction_detector` can be told to find no conflicts.
-#: * `synthesizer.repair` rewrites citations on a draft, so an override could make fabricated
-#:   citations present as repaired ones — the failure the citation contract exists to prevent.
-#: * `chat.project` carries a refusal line whose absence is how a grounded assistant starts
-#:   answering from its own knowledge instead of saying "not in here".
+#: 引用核验决定证据支持情况，允许改写等于自己评分；矛盾检测可被诱导忽略冲突；
+#: 引用修复可能被改成伪造引用；项目聊天的拒绝规则缺失会让无据回答混入。
 PROTECTED_PURPOSES: frozenset[str] = frozenset(PURPOSE_CONSTANTS) - OVERRIDABLE_PURPOSES
 
-#: Purposes whose shipped prompt carries the untrusted-content framing, and which therefore
-#: need it restored around a replacement body.
+#: 默认提示词含不可信内容说明的用途，替换正文时需重新补上保护框定。
 #:
-#: **Derived, never enumerated.** A prompt that gains the note and is not added to a
-#: hand-written list would lose the framing the moment a user replaced it — the failure
-#: would be silent, in the one place silence is least affordable. Six today; an anti-rot
-#: test pins that this stays computed.
+#: 从提示词实际内容推导，不手写清单，避免新增保护说明后在自定义替换时漏掉。
 NOTE_CARRYING_PURPOSES: frozenset[str] = frozenset(
     p for p, constant in PURPOSE_CONSTANTS.items() if prompts.UNTRUSTED_CONTENT_NOTE in constant
 )
 
-#: Which purposes a **research run** actually executes, and which it does not.
+#: 区分研究运行会执行和不会执行的用途。
 #:
-#: Applicability, not policy. Nothing here decides what may be overridden — that is
-#: `OVERRIDABLE_PURPOSES` above and it is untouched by this partition. This answers a
-#: different question, asked by the bundle producer: *did this prompt take part in the run
-#: whose artifact I am assembling?* A run artifact that claimed provenance for `chat.general`
-#: would be naming a prompt nothing in that run called, which is the same dishonesty class as
-#: a bundle naming models that never answered.
+#: 这里只决定产物应记录哪些提示词来源，不决定覆盖权限。
+#: 未执行的聊天用途不能出现在研究运行来源中，正如不能记录未调用的模型。
 #:
-#: **An explicit partition, because neither default is safe.** Elsewhere a new purpose falls
-#: to PROTECTED and that fails closed. Here it cannot: defaulting a new purpose *out* of the
-#: run set silently drops provenance for a prompt that did run, and defaulting it *in* claims
-#: provenance for one that did not. Both are silent and both are wrong, so an unclassified
-#: purpose fails the anti-rot test instead of picking a side.
+#: 必须显式分类，不能对新用途默认包含或默认排除，否则都会静默错报来源；未分类让测试失败。
 RUN_PURPOSES: frozenset[str] = frozenset(
     {
         "planner.main",
@@ -139,7 +83,7 @@ RUN_PURPOSES: frozenset[str] = frozenset(
         "critic.contradiction_detector",
         "synthesizer.main",
         "synthesizer.repair",
-        # Selected-files runs only (internal/rfcs/V3.1-corpus-scope.md §9.7).
+        # 仅指定文件研究使用，见 RFC V3.1 §9.7。
         "critic.claim_decompose",
         "critic.claim_verify",
         "critic.citation_relevance",
@@ -149,9 +93,7 @@ RUN_PURPOSES: frozenset[str] = frozenset(
     }
 )
 
-#: The run purposes only a **selected-files** run executes — the claim-level grounding
-#: checks (internal/rfcs/V3.1-corpus-scope.md §9.7). Every other run, and every bundle from
-#: one, records the rest of `RUN_PURPOSES` and none of these.
+#: 仅指定文件研究会执行的逐 Claim 核验用途；其他运行及其证据包不记录这些用途。
 SELECTION_ONLY_PURPOSES: frozenset[str] = frozenset(
     {
         "critic.claim_decompose",
@@ -163,54 +105,38 @@ SELECTION_ONLY_PURPOSES: frozenset[str] = frozenset(
     }
 )
 
-#: The complement, spelled out rather than derived, so the partition is checkable in both
-#: directions. Chat runs against a finished report; it is not part of a run's execution.
+#: 显式列出互补用途以供双向核对。聊天针对已完成报告，不属于研究执行。
 NON_RUN_PURPOSES: frozenset[str] = frozenset({"chat.general", "chat.project"})
 
 
 def role_of(purpose: str) -> str:
-    """The model role a purpose runs under — the same string `get_llm()` is called with."""
+    """返回用途所属的模型角色，与 get_llm 使用同一角色字符串。"""
     return _checked(purpose).split(".", 1)[0]
 
 
 def is_overridable(purpose: str) -> bool:
-    """Whether a user's replacement text may be used for this purpose.
+    """判断此用途是否允许用户替换提示词。
 
-    Takes a **purpose**, and deliberately has no role-shaped counterpart. `critic` owns
-    `critic.research` (overridable), `critic.citation_verify` and
-    `critic.contradiction_detector` (both protected), so any answer computed from the role
-    alone would have to be wrong for two of the three. Unknown purposes raise rather than
-    returning `False`, because a typo that silently reads as "protected" hides the typo.
-    """
+    只能按用途决定；同一 critic 角色的不同用途权限不同。
+    未知用途抛错，不能静默返回 False 掩盖拼写错误。"""
     return _checked(purpose) in OVERRIDABLE_PURPOSES
 
 
 class EditableDefault(NamedTuple):
-    """One role's shipped prompt, as someone about to replace it should see it."""
+    """提供某个可编辑角色的默认提示词内容。"""
 
     role: str
     text: str
-    #: Whether `system_prompt` adds the untrusted-content note around a replacement for this
-    #: role — so an editor can say that it will, instead of showing the note as editable.
+    #: 编辑器可据此说明系统会自动添加不可信内容保护，而不让用户编辑保护说明本身。
     framed: bool
 
 
 def editable_defaults() -> tuple[EditableDefault, ...]:
-    """The starting text for each role's prompt editor, in `ROLES` order (scope freeze §12).
+    """按 ROLES 顺序返回各角色编辑器的初始文本，见范围冻结 §12。
 
-    **Display, not reach.** Each role's entry is the shipped text of its one purpose in
-    `OVERRIDABLE_PURPOSES` — the same allowlist `system_prompt` enforces — and nothing reads
-    this to decide what an override may reach; `system_prompt` still answers that alone,
-    before it looks at any config. A protected purpose has no entry because it is not in the
-    allowlist, so no caller can get its text out of here however it asks.
-
-    **The untrusted-content note is removed** from the four shipped prompts that carry it.
-    §5 makes it system-added and not user-editable, and `system_prompt` wraps whatever a user
-    saves in it — so leaving it in the editable text would copy it into the saved body and
-    compose it three times. `framed` says the system adds it, so an editor can say so.
-
-    Reads no run config and no user state: the answer is a property of this build.
-    """
+    仅展示允许替换用途，运行时权限仍由 system_prompt 独立强制检查。
+    移除默认正文中系统管理的不可信内容说明，保存后由系统包裹，避免重复三次。
+    此函数不读取运行配置或用户状态。"""
     by_role: dict[str, str] = {}
     for purpose in sorted(OVERRIDABLE_PURPOSES):
         role = role_of(purpose)
@@ -236,28 +162,19 @@ def editable_defaults() -> tuple[EditableDefault, ...]:
 
 
 def system_prompt(purpose: str) -> str:
-    """The effective system prompt for this purpose, override applied if one is in force.
+    """返回指定用途的实际系统提示词，并在允许时应用覆盖。
 
-    **The single runtime enforcement point.** A protected purpose returns before any
-    override is read — not after a check, not filtered afterwards — so no reordering or
-    later edit can let one through. API validation refuses purpose-shaped keys, but that is
-    a separate concern: this must hold even for a `RunConfig` built by hand, or restored
-    from a row that bypassed validation entirely.
-    """
+    唯一运行时保护点：受保护用途在读取覆盖配置之前就返回默认值。
+    即使配置手工构造或绕过 API 校验，此顺序也不能放宽。"""
     p = _checked(purpose)
     shipped = PURPOSE_CONSTANTS[p]
 
     if p not in OVERRIDABLE_PURPOSES:
-        # Protected: the override is never consulted at all. `_observed` runs *after* the
-        # decision and cannot reach the config, so recording cannot weaken this ordering.
+        # 受保护用途完全不读取覆盖配置。_observed 在决定之后记录，且无法访问配置，不会削弱检查。
         return _observed(p, shipped, overridden=False)
 
-    # Last-resort defence for a config assembled outside the host builders, which validate
-    # all-or-nothing before a run ever starts. Anything that is not usable text — including a
-    # container that is not a mapping at all — reads as "no override", which is the shipped
-    # prompt, never a partially applied one. Falling back rather than raising because this
-    # runs per model call inside a graph node: the honest failure is a run on shipped prompts
-    # (recorded as `UNUSABLE` on the row), not a half-written report.
+    # 防御绕过宿主构造的坏配置：只有整体可用文本才应用，否则回退全部默认提示词。
+    # 节点内不因坏覆盖中断半份报告；宿主在运行记录上披露 UNUSABLE。
     stored = get_run_config().prompt_overrides
     body = stored.get(role_of(p)) if isinstance(stored, Mapping) else None
     if not isinstance(body, str) or not body.strip():
@@ -270,46 +187,24 @@ def system_prompt(purpose: str) -> str:
 
 
 class PromptProvenanceConflict(RuntimeError):
-    """One purpose composed two different prompts inside a single run.
+    """同一运行的同一用途产生了两份不同提示词。
 
-    Impossible while the run's overrides stay frozen, which is why it raises rather than
-    picking a winner: the recovery is to fix whatever unfroze them, not to publish one of
-    two prompts as though it were the only one.
-    """
+    冻结配置下不应发生，必须抛错以暴露冻结失效，不能任选一份伪装成唯一来源。"""
 
 
-#: Where `system_prompt` reports what it just composed, when anyone is listening.
+#: 有观测器时，system_prompt 在这里报告刚刚实际组装的提示词。
 #:
-#: **Observation, not a second composer.** The bundle has to state the prompt a run actually
-#: sent to the model, and the only moment that string exists is the one below — the config
-#: that produced it is torn down when the run ends, and rebuilding it later would report
-#: what *today's* code would compose, which for a protected purpose is the currently shipped
-#: constant rather than the one that ran. So the composer is watched rather than replayed.
+#: 只观察，不另行组装。运行结束后按今日配置重建会得到今日默认值，不能冒充历史实际指令。
 #:
-#: A `ContextVar` holding a **mutable dict**: child tasks inherit a copy of the context, and
-#: that copy holds the same dict, so a node running in its own task still records into the
-#: caller's collection. Nothing is rebound after the run starts.
+#: ContextVar 持有可变字典，子任务继承同一字典引用，确保各节点写入同一运行记录。
 _provenance: ContextVar[dict[str, dict] | None] = ContextVar("_prompt_provenance", default=None)
 
 
 def _observed(purpose: str, text: str, *, overridden: bool) -> str:
-    """Record what was composed and hand it back untouched.
+    """记录实际组装结果，再原样返回同一个字符串对象。
 
-    Returns its argument by identity — `fakes.SCENARIO_BY_PROMPT` resolves a scripted run by
-    `is`, so the shipped path must still yield the constant object itself.
-
-    **`overridden` is the decision, not a comparison.** It comes from the branch that just
-    ran, so a user whose override happens to equal the shipped text is still recorded as
-    having overridden, and a protected purpose can never be recorded as overridden at all.
-
-    **A repeat must be identical, and a conflict raises.** `executor.main` composes at two
-    call sites, and one entry per purpose is only honest because `system_prompt` is pure over
-    (purpose, the run's frozen overrides) — so within one recorder scope the two cannot
-    differ. Silently keeping the first would make a bundle assert one of two prompts while
-    the model saw both, which is the class of quiet wrongness this column exists to remove.
-    Raising instead is loud in the only situation that can produce it: a code change that
-    broke the frozen-config invariant, in which case no provenance is trustworthy anyway.
-    """
+    脚本场景依赖提示词对象身份；overridden 记录实际走过的分支，而不是比较内容是否不同。
+    同用途重复调用必须完全一致，否则抛错，避免只保留第一份而隐藏模型实际见过两套指令。"""
     records = _provenance.get()
     if records is None:
         return text
@@ -334,18 +229,10 @@ def _observed(purpose: str, text: str, *, overridden: bool) -> str:
 
 @contextmanager
 def recording_provenance(into: dict[str, dict] | None = None) -> Iterator[dict[str, dict]]:
-    """Collect every prompt composed inside this block, keyed by purpose.
+    """按用途收集此作用域内实际组装的提示词。
 
-    Scoped rather than always-on: composition happens on chat turns and in tests too, and a
-    process-wide accumulator would mix runs together. `into` lets a resumed run keep adding
-    to what its earlier segments already recorded — a run that pauses at the design gate
-    composes the planner's prompt in one invocation and the synthesizer's in the next, and
-    the bundle needs both.
-
-    Only purposes that actually executed appear. A run whose draft cited everything never
-    composes `synthesizer.repair`, and the absence is the honest record — the frozen RFC asks
-    for "each applicable purpose", not for all seven.
-    """
+    作用域隔离不同运行；into 允许审批恢复后继续添加此前记录。
+    只记录实际执行用途，未发生引用修复就不补造修复提示词来源。"""
     records: dict[str, dict] = {} if into is None else into
     token = _provenance.set(records)
     try:
@@ -355,11 +242,7 @@ def recording_provenance(into: dict[str, dict] | None = None) -> Iterator[dict[s
 
 
 def _checked(purpose: str) -> str:
-    """Fail loudly on an unknown purpose rather than resolving to something plausible.
-
-    A typo here would otherwise surface as a graph that ran to completion on the wrong
-    instructions, which is the failure mode `fakes` was rewritten to remove.
-    """
+    """未知用途立即报错，避免拼写错误让整个图按错误指令继续运行。"""
     if purpose not in PURPOSE_CONSTANTS:
         raise KeyError(
             f"unknown prompt purpose {purpose!r}; known purposes: "

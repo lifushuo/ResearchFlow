@@ -1,10 +1,6 @@
-"""
-Follow-up chat grounded in a completed report (docs/04 §5, docs/05 §3).
+"""基于已完成报告的追问接口（docs/04 §5，docs/05 §3）。
 
-Assistant history is replayed as AIMessage (never SystemMessage — model output must
-not gain system authority, docs/06 §4). Streaming is SSE; the report + sources are
-provided as grounding, wrapped as untrusted content.
-"""
+历史助手回复恢复为 AIMessage，不能升级成 SystemMessage。使用 SSE 输出，报告与来源作为证据输入，并标记为不可信内容（docs/06 §4）。"""
 
 from __future__ import annotations
 
@@ -89,14 +85,11 @@ async def send_message(
 
     history = await recent_turns(db, ChatMessage.session_id == session_id)
 
-    # BYOK first: the corpus store embeds on this user's key exactly as their research
-    # did, so it has to be resolved before the grounding is gathered.
+    # 先解析用户自带密钥，再收集语料证据；语料向量化应与研究一样使用用户自己的密钥。
     user_keys = crypto.user_provider_keys(current_user)
 
-    # Resolved only for the scopes that need it: `report` scope must not touch the
-    # filesystem to answer a question about a report, and must not embed anything either.
-    # `store_factory` stays a callable because that is `chat_scope.gather`'s contract; what
-    # changed is that the corpus's location is the locator's to know, not this route's.
+    # 只在需要语料的范围解析存储；报告范围不应访问语料文件系统或调用向量模型。
+    # store_factory 按 chat_scope.gather 契约保留为可调用对象，实际路径由定位器负责。
     store = None
     if payload.scope in ("corpus", "everything"):
         from app import adapters
@@ -116,15 +109,11 @@ async def send_message(
             store_factory=_corpus_store,
         )
     except EmbeddingsUnavailable as e:
-        # 400, not a cheerful ungrounded answer: the user asked for corpus scope
-        # specifically, and the honest response to "that would have left your machine"
-        # is to say so rather than to answer from somewhere else.
+        # 用户明确选择了语料范围，若执行会外发语料，应返回 400 说明原因，不能偷偷换来源回答。
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    # Chat resolves prompt overrides live. There is no run to snapshot and no resume to stay
-    # consistent with, so a turn answers under the preferences as they stand — the opposite
-    # of the run path, and deliberately so. Composed through `system_prompt` rather than
-    # concatenated here, because that function is the one place override policy is applied.
+    # 聊天没有需要前后保持一致的运行快照，所以每轮实时读取提示词偏好。
+    # 仍统一经过 system_prompt 应用覆盖策略，不能在这里直接拼接。
     with chat_prompt_context(current_user):
         chat_system = system_prompt("chat.general")
 
@@ -143,10 +132,9 @@ async def send_message(
         keys_token = set_user_keys(user_keys)
         acc = ""
         try:
-            llm = get_llm("chat")  # raises with an actionable message if no key
-            # Sources first so the client can render citation chips as text streams in,
-            # and so a web-scoped answer's [n] markers resolve to something. `scope` is
-            # echoed back because the answer has to be able to say which one produced it.
+            llm = get_llm("chat")  # 缺少密钥时抛出可操作的错误提示。
+            # 先发送来源，便于前端随流式正文渲染引用，并解析网页回答的 [n]。
+            # 同时返回实际 scope，明确回答使用哪个范围的证据。
             yield (
                 "data: "
                 + json.dumps(

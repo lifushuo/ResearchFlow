@@ -1,34 +1,10 @@
-"""
-The research lifecycle — the persistence side of a run, host-free.
+"""研究运行的持久化生命周期，由服务端和桌面端共同使用。
 
-The research *engine* is unchanged: `research_engine.graph` plans, executes, criticises and
-synthesizes exactly as it does today, and `RunOutcome` is still the plain-data handoff. What
-changes is where a host writes that outcome. This module is the destination:
+研究引擎负责规划、执行、证据检查和综合，RunOutcome 只传递执行结果；本模块把结果保存为运行、计划、来源、证据、报告修订、结论、冲突、审核和最终产物。这里不依赖 FastAPI、鉴权、Redis 或加密，避免两种主机各写一套规则。
 
-    question → ResearchRun → ResearchPlan → Sources + Evidence → Revision
-             → Claims → ClaimEvidenceLinks → Contradictions → Review → Artifact → Bundle
+四条约束：检索到不等于引用过，来源编号不能编造；逐条证据核验结果必须来自引擎，未检查就保留 UNCHECKED；有效冲突必须有两端来源锚点，证据定位只能采用唯一精确匹配；只有 APPROVED 的 REPORT 审核能授权最终产物，统一由 app.authorization 判断。
 
-**Host-agnostic on purpose.** No FastAPI, no auth, no Redis, no crypto. The server router and
-the desktop sidecar both call these functions, so the lifecycle has one home rather than the
-two that this repository keeps rediscovering (AGENTS.md, "two hosts, one contract").
-
-Four rules, and this module is where each becomes behaviour rather than documentation:
-
-* **Retrieved is not cited.** A `Source` gets a `citation_index` only if the synthesizer
-  numbered it. Never generated (I6).
-* **An item is attested only to what the graph actually verified.** The snippet check in
-  `research_engine.graph.verify_evidence_snippets` runs per item and records its verdict on
-  the chunk (`attestation_grade`, `snippet_unverified`); `record_evidence` below reads that
-  verdict rather than asserting one. An item the check never reached — fake-mode runs, or a
-  chunk with no snippet to check — lands `UNCHECKED`, honestly (I…§14).
-* **A contradiction is a conflict between two attributed quotations.** `DETECTED` needs both
-  source anchors; an evidence anchor is set only on an exact, unique quotation match (I7, I8).
-* **Only an APPROVED REPORT review authorizes an artifact**, and the check goes through
-  `app.authorization` rather than being re-derived here (I3).
-
-Rework appends. `record_revision` allocates the next `version`, so revision 1 is never
-overwritten and `Review.sequence` keeps the decision order that produced it.
-"""
+返工只新增修订，不覆盖旧版；Review.sequence 保存审核顺序。"""
 
 from __future__ import annotations
 
@@ -52,9 +28,8 @@ from research_engine import citation_rate, document
 from research_engine import claims as claim_rules
 from research_engine.graph import _norm_url
 
-#: Engine `RunOutcome.status` strings → `research_runs.status`.
-#: `awaiting_approval` becomes `AWAITING_REVIEW`; nothing else moves, and `CANCELLED` is
-#: reachable only through `request_cancel`, never inferred from a message.
+# 将引擎 RunOutcome.status 映射为 research_runs.status。
+# awaiting_approval 对应 AWAITING_REVIEW；取消只能经过 request_cancel，不能从消息内容推断。
 OUTCOME_STATUS = {
     "awaiting_plan": "AWAITING_PLAN",
     "awaiting_approval": "AWAITING_REVIEW",
@@ -64,14 +39,14 @@ OUTCOME_STATUS = {
 
 
 class LifecycleError(Exception):
-    """A transition the domain does not allow. Raised before anything is written."""
+    """不允许的领域状态变更；在实际写入之前抛出。"""
 
 
 def content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
-# ── 1. The run ────────────────────────────────────────────────────────────────────
+# 1. 创建与更新研究运行
 
 
 async def create_run(
@@ -90,7 +65,7 @@ async def create_run(
     corpus_selection: dict | None = None,
     offline: bool = False,
 ) -> ResearchRun:
-    """Open a new run. `owner_id` is denormalised so every authorization is single-table."""
+    """创建运行；owner_id 直接存于本表，权限校验不必跨表查询。"""
     run = ResearchRun(
         id=uuid.uuid4(),
         project_id=project_id,
@@ -116,18 +91,10 @@ async def create_run(
 
 
 async def set_status(db: AsyncSession, run: ResearchRun, status: str) -> None:
-    """Move the run's status, refusing the one transition the schema cannot express.
+    """更新运行状态，但不允许绕过取消规则。
 
-    `ck_run_cancelled` ties `CANCELLED` to `cancelled_at`, so cancellation has its own entry
-    point (`request_cancel`) and cannot be reached by a bare status write.
-
-    It also cannot be *left* by one. A cancelled run is terminal by the user's decision, and
-    the constraint enforces that from below: any status write on a row with `cancelled_at`
-    set raises `IntegrityError` from whichever background task attempted it. Refusing here
-    turns that into a named error at the call site instead of a constraint violation three
-    layers down — the failure this replaces was a resume dispatched after a cancel writing
-    RUNNING and killing its Celery task (issue #54).
-    """
+    ck_run_cancelled 要求取消状态与 cancelled_at 一致，取消必须走 request_cancel。任务一旦取消也不能再离开终态。
+    这里提前拒绝非法更新，给调用方清楚的错误，避免后台恢复任务写入 RUNNING 后才撞上数据库约束。"""
     if status == "CANCELLED":
         raise LifecycleError("use request_cancel(); CANCELLED must carry cancelled_at")
     if run.status == "CANCELLED":
@@ -137,7 +104,7 @@ async def set_status(db: AsyncSession, run: ResearchRun, status: str) -> None:
 
 
 async def request_cancel(db: AsyncSession, run: ResearchRun, *, by: uuid.UUID) -> None:
-    """Durable cancellation — a row, not a TTL'd cache key."""
+    """将取消决定持久化到数据库，不依赖会过期的缓存键。"""
     run.status = "CANCELLED"
     run.cancelled_at = datetime.now(UTC)
     run.cancel_requested_by = by
@@ -145,20 +112,9 @@ async def request_cancel(db: AsyncSession, run: ResearchRun, *, by: uuid.UUID) -
 
 
 async def record_failure(db: AsyncSession, run: ResearchRun, error: str | None) -> None:
-    """Record that the run failed — unless the user had already stopped it (issue #54).
+    """保存执行失败；若用户已取消，则保留取消状态，但仍记录错误原因。
 
-    A cancelled run keeps its status. `ck_run_cancelled` ties CANCELLED to `cancelled_at`,
-    so writing FAILED over it does not merely mis-record: it violates the constraint and
-    raises `IntegrityError` from whatever background task was unlucky enough to be holding
-    the run. Observed live — cancel a run mid-flight, let its worker hit any error, and the
-    error handler died on the constraint instead of recording the failure.
-
-    The guard lives here rather than at the call sites because this is the only function
-    that writes FAILED, and the call sites are three and growing (`persist_outcome` twice,
-    the corpus-mode guard in `execute_run`, and `tasks._mark_run_failed`). The message is
-    still kept: what went wrong is worth knowing even when the run's fate was already
-    decided by the user.
-    """
+    强行把 CANCELLED 改为 FAILED 会违反数据库约束，使错误处理本身再次失败。这个检查集中在唯一的失败写入口，保证多个调用方遵循同一规则。"""
     if run.status == "CANCELLED":
         run.error_message = error
         await db.flush()
@@ -178,7 +134,7 @@ async def record_metrics(
     elapsed_seconds: float | None = None,
     citation_resolution_rate: float | None = None,
 ) -> None:
-    """Spend and timings. `citation_resolution_rate` stays NULL when unmeasured — never 0."""
+    """保存用量与耗时；未测量的 citation_resolution_rate 保留 NULL，不能写成 0。"""
     run.cost_usd = cost_usd
     run.tokens_input = tokens_input
     run.tokens_output = tokens_output
@@ -189,7 +145,7 @@ async def record_metrics(
     await db.flush()
 
 
-# ── 2. The plan ───────────────────────────────────────────────────────────────────
+# 2. 研究计划
 
 
 async def record_plan(
@@ -200,12 +156,9 @@ async def record_plan(
     outline_sections: list,
     origin: str = "MODEL_PROPOSED",
 ) -> ResearchPlan:
-    """Append a plan version. The session pipeline overwrote `plan_json`; this inserts and never updates.
+    """新增计划版本，永不覆盖已有提案。
 
-    `origin` is a real value here — a run knows whether the model proposed the
-    plan or a human edited it. `UNKNOWN` exists only for rows written before origin was
-    recorded, and nothing may write it now — a run that cannot say has not been asked.
-    """
+    origin 区分模型提案与人工编辑；UNKNOWN 仅兼容尚未记录来源的历史数据，新记录不能使用它。"""
     if origin == "UNKNOWN":
         raise LifecycleError("UNKNOWN is for imported plans only; a native run knows")
     version = (
@@ -229,23 +182,22 @@ async def record_plan(
 
 
 async def approve_plan(db: AsyncSession, plan: ResearchPlan) -> None:
-    """Stamp the plan approved. `uq_plan_approved` allows one per run."""
+    """标记计划已批准；uq_plan_approved 保证每次运行最多有一个获批计划。"""
     plan.approved_at = datetime.now(UTC)
     await db.flush()
 
 
-# ── 3. Sources and evidence ───────────────────────────────────────────────────────
+# 3. 来源与证据
 
 
 @dataclass
 class EvidenceWrite:
-    """What was persisted, and enough of the index to link claims and contradictions."""
+    """保存写入结果与查找索引，后续据此关联结论和冲突。"""
 
     sources_by_url: dict[str, uuid.UUID]
-    #: citation_index → the first evidence row from that source. `[n]` resolves through this.
+    # 引用编号 citation_index 对应该来源第一条证据；正文 [n] 通过它解析。
     evidence_by_index: dict[int, uuid.UUID]
-    #: (source_id, quoted text) → every evidence row carrying it. A list, because a
-    #: contradiction may only refine to a UNIQUE match.
+    # 用来源和引用原文查找所有匹配证据；冲突只能在唯一匹配时进一步定位。
     evidence_by_quote: dict[tuple[uuid.UUID, str], list[uuid.UUID]]
     watermark: int
     source_count: int
@@ -259,23 +211,11 @@ async def record_evidence(
     evidence: list[dict],
     numbered_sources: list[dict] | None = None,
 ) -> EvidenceWrite:
-    """Persist the executor's evidence and the sources it names.
+    """保存执行器返回的证据与来源。
 
-    `numbered_sources` is the synthesizer's `_number_sources` output when synthesis has
-    run. A source present in evidence but absent from that list is **retrieved but not
-    cited**, and gets `citation_index = NULL` — the distinction S3 exists to hold. Evidence
-    with an empty `source_url` has no identity and is refused rather than given one.
+    numbered_sources 来自综合器的编号结果。证据中出现但未被编号的来源保留 citation_index=NULL，不能把检索到误当成引用过；没有 source_url 的证据缺少来源身份，拒绝保存。
 
-    **Idempotent over what is already stored.** Rework resumes the graph at the synthesizer
-    with the evidence it already had, and the host persists the whole final state again, so
-    every item arrives a second time. Each incoming item is paired one-for-one with a stored
-    row carrying the same source, task, snippet and key fact, and reuses it — its id, so the
-    new revision's claims link the rows the last one linked, and its sequence, so the
-    watermark says nothing new was seen. Only the unpaired remainder is inserted.
-    One-for-one rather than "any match", so an item the executor genuinely returned twice
-    stays stored twice. A reused row keeps the provenance verdict it was written with:
-    snippets are verified in the executor, which a rework does not re-enter.
-    """
+    返工会再次提交已有状态，因此按来源、任务、片段和关键事实，将输入与旧行一一配对，复用原 ID、序号及核验结果，只插入剩余条目。必须一一对应，不能用“有任意匹配就跳过”，否则会误吞执行器实际返回的重复条目。"""
     index_by_url: dict[str, int] = {}
     title_by_url: dict[str, str] = {}
     for entry in numbered_sources or []:
@@ -292,7 +232,7 @@ async def record_evidence(
     evidence_by_quote: dict[tuple[uuid.UUID, str], list[uuid.UUID]] = {}
     watermark = 0
 
-    # Stored rows not yet paired with an incoming item, oldest first, keyed by identity.
+    # 按身份索引尚未配对的旧证据，优先匹配较早的记录。
     unpaired: dict[tuple, list[tuple[uuid.UUID, int]]] = {}
     for eid, source_id, task_id, digest, key_fact, sequence in (
         await db.execute(
@@ -338,8 +278,7 @@ async def record_evidence(
                     normalized_url=norm,
                     title=title_by_url.get(norm) or item.get("source_title") or None,
                     kind="CORPUS" if url.startswith("corpus://") else "WEB",
-                    # The executor records whether it fetched a body or quoted a
-                    # search result, so this is observed rather than assumed.
+                    # 执行器已记录内容来自网页正文还是搜索摘要，这里读取实测来源，不自行假设。
                     retrieval_status=(
                         "CORPUS_DOCUMENT"
                         if url.startswith("corpus://")
@@ -364,14 +303,9 @@ async def record_evidence(
         else:
             inserted += 1
             sequence = base + inserted
-            # The graph's per-item verdict, read rather than re-derived — see
-            # `verify_evidence_snippets` for what sets each of these on the chunk dict.
-            # `snippet_unverified` means the check ran and blanked a fabricated quotation;
-            # `attestation_grade` means it ran and the snippet matched what a tool actually
-            # returned (as `FETCHED_BODY` or `SEARCH_SNIPPET` — `read_webpage` handles a
-            # `corpus://` URL the same as any other fetch). Neither present means the check
-            # never reached this item (fake mode, or nothing to check), which is exactly what
-            # UNCHECKED is for — a corpus item is not exempt from that absence.
+            # 沿用引擎的逐条核验结果，判定规则见 verify_evidence_snippets。
+            # snippet_unverified 表示核验发现虚构片段并清空；attestation_grade 表示片段匹配真实工具返回，类型为 FETCHED_BODY 或 SEARCH_SNIPPET。
+            # 两个标记都没有就表示未检查，保留 UNCHECKED；语料库来源也不能因此免检。
             grade = item.get("attestation_grade")
             if url.startswith("corpus://") and grade:
                 grade = "CORPUS_DOCUMENT"
@@ -424,7 +358,7 @@ async def record_evidence(
     )
 
 
-# ── 4–6. Revision, claims, links ──────────────────────────────────────────────────
+# 4—6. 报告修订、结论及证据关联
 
 
 @dataclass
@@ -441,12 +375,9 @@ async def record_revision(
     report_markdown: str,
     evidence_index: EvidenceWrite | None = None,
 ) -> RevisionWrite:
-    """Append the next immutable revision, with its claims and their evidence links.
+    """新增不可变的报告修订，同时保存结论和证据关联。
 
-    Rework calls this again: `version` is allocated from what already exists, so revision 1
-    survives untouched. `evidence_watermark` records the last evidence sequence visible at
-    synthesis — a threshold, not a count, so gaps do not affect it.
-    """
+    返工按已有记录分配下一个 version，旧版保持原样。evidence_watermark 是综合时可见的最大证据序号，不是条数，序号有空缺也不影响。"""
     if not report_markdown:
         raise LifecycleError("a revision must carry the report it is a version of")
 
@@ -471,14 +402,10 @@ async def record_revision(
         run_id=run.id,
         version=version,
         report_markdown=report_markdown,
-        # Still the Markdown, and deliberately so. `reviews.reviewed_hash`,
-        # `research_artifacts.artifact_hash` and the bundle verifier's approval-chain check
-        # all pin this value, so hashing a rendered document instead would put every
-        # already-approved artifact at the mercy of a parser.
+        # 哈希始终基于 Markdown 原文。审核哈希、产物哈希与证据包批准链都绑定这份字节。
+        # 若改为对渲染结果算哈希，解析器变化就会使既有批准失效。
         report_hash=content_hash(report_markdown),
-        # The typed view, derived from those same bytes. `generated_at` is passed rather
-        # than read from the clock inside the parser, which is what keeps the document a
-        # pure function of the revision it describes.
+        # 结构化视图也从同一份原文解析；generated_at 由调用方传入，不在解析器里读时钟，保证同样输入得到同样文档。
         report_document=document.parse_markdown(
             report_markdown,
             metadata=document.ReportMetadata(
@@ -505,13 +432,11 @@ async def record_revision(
             run_id=run.id,
             position=position,
             text=text,
-            # The synthesizer emits prose, not structured claims, so this is what the
-            # extraction honestly is. MODEL_STRUCTURED arrives with a structured emitter.
+            # 综合器输出的是文字，结论由文本提取；只有未来真正输出结构化结论时才能标 MODEL_STRUCTURED。
             extraction_method="DERIVED_FROM_REPORT",
             verification_state="UNCHECKED",
             verification_method="NOT_RUN",
-            # Never inferred. Nothing observed that a sentence in this revision IS the
-            # assertion from the last one, and matching by text would manufacture it.
+            # 不能仅因文字相同，就假定当前结论与上一版是同一个断言；未观测到的关联不编造。
             lineage_id=None,
         )
         db.add(claim)
@@ -519,7 +444,7 @@ async def record_revision(
         for marker in dict.fromkeys(claim_rules.extract_citations(text)):
             target = by_index.get(marker)
             if target is None:
-                continue  # a marker resolving to nothing links to nothing
+                continue  # 引用编号无法解析到来源时，就不建立证据关联。
             db.add(
                 ClaimEvidenceLink(
                     id=uuid.uuid4(),
@@ -536,12 +461,9 @@ async def record_revision(
 
 
 async def _evidence_by_citation_index(db: AsyncSession, run_id) -> dict[int, uuid.UUID]:
-    """citation_index → first evidence row, rebuilt from the database.
+    """从数据库重建“引用编号→第一条证据”的索引。
 
-    Used when a revision is written in a later transaction than its evidence (rework), so
-    the in-memory index from `record_evidence` is gone. Uncited sources are excluded by the
-    `IS NOT NULL` filter, which is the whole point of the nullable index.
-    """
+    返工的修订可能晚于证据事务写入，原内存索引已不存在。通过 IS NOT NULL 排除未引用来源。"""
     rows = (
         await db.execute(
             select(Source.citation_index, Evidence.id)
@@ -556,7 +478,7 @@ async def _evidence_by_citation_index(db: AsyncSession, run_id) -> dict[int, uui
     return out
 
 
-# ── 7. Contradictions ─────────────────────────────────────────────────────────────
+# 7. 证据冲突
 
 
 async def record_contradictions(
@@ -567,12 +489,9 @@ async def record_contradictions(
     evidence_index: EvidenceWrite | None = None,
     detector_ran: bool = True,
 ) -> int:
-    """Persist the detector's pairs as conflicts between attributed quotations.
+    """把检测器返回的成对引文保存为冲突。
 
-    `detector_ran=False` records that fact instead of silently writing nothing: a detector
-    that was unavailable and a run with no conflicts are different findings, and
-    `detection_state` is where that difference lives.
-    """
+    检测器没运行与确实没发现冲突是不同结论，detector_ran=False 时必须通过 detection_state 明确记录。"""
     if not detector_ran:
         db.add(
             Contradiction(
@@ -593,9 +512,7 @@ async def record_contradictions(
             for row in (await db.execute(select(Source).where(Source.run_id == run.id))).scalars()
         }
 
-    # The pairs ride in the same state rework re-persists, so they are paired one-for-one
-    # with what is stored exactly as `record_evidence` pairs evidence. Reusing the stored
-    # row also keeps any review decision already made on it.
+    # 返工会重复提交冲突状态，因此也与旧记录一一配对，避免重复插入，并保留已有人工审核决定。
     unpaired = Counter(
         (
             await db.execute(
@@ -625,7 +542,7 @@ async def record_contradictions(
         quote_b = pair.get("snippet_b") or None
 
         def refine(source_id, quote):
-            """The evidence row carrying this quotation — only if there is exactly one."""
+            """只有恰好一条证据携带该引用原文时，才返回证据定位。"""
             if source_id is None or not quote:
                 return None
             hits = by_quote.get((source_id, quote.strip()[:500]), [])
@@ -633,7 +550,7 @@ async def record_contradictions(
 
         ev_a, ev_b = refine(src_a, quote_a), refine(src_b, quote_b)
         if ev_a is None or ev_b is None:
-            ev_a = ev_b = None  # ck_contra_refine: half a resolved pair is not a pair
+            ev_a = ev_b = None  # ck_contra_refine 要求成对定位；只找到一边不能算完整关联。
         detected = src_a is not None and src_b is not None and src_a != src_b
         summary_a, summary_b = pair.get("claim_a") or None, pair.get("claim_b") or None
         nature = pair.get("nature") or None
@@ -664,7 +581,7 @@ async def record_contradictions(
                 summary_a=summary_a,
                 summary_b=summary_b,
                 nature=nature,
-                # The detector assigns no dimension, and neither does a run yet.
+                # 检测器尚未提供冲突维度，运行记录也不自行推断。
                 dimension="UNCLASSIFIED",
                 detection_state="DETECTED" if detected else "NOT_RUN",
                 review_state="UNREVIEWED",
@@ -674,7 +591,7 @@ async def record_contradictions(
     return written
 
 
-# ── 8. Reviews ────────────────────────────────────────────────────────────────────
+# 8. 人工审核
 
 
 async def _next_sequence(db: AsyncSession, run_id) -> int:
@@ -694,7 +611,7 @@ async def record_plan_review(
     decision: str = "APPROVED",
     feedback: str | None = None,
 ) -> Review:
-    """A decision about a plan version. `revision_id` is NULL, and it authorizes nothing."""
+    """保存某个计划版本的审核；revision_id 为空，不授权生成报告产物。"""
     review = Review(
         id=uuid.uuid4(),
         run_id=run.id,
@@ -705,8 +622,8 @@ async def record_plan_review(
         gate="PLAN",
         decision=decision,
         feedback=feedback,
-        # The plan's canonical serialisation. Opaque on the session path, computed here — but still not
-        # checked by the bundle verifier, which only binds report approvals.
+        # 这里计算计划的标准化序列化；会话路径将其当作不透明值。
+        # 证据包校验器仍只绑定报告批准，不校验此计划内容。
         reviewed_hash=content_hash(f"{plan.version}|{plan.tasks}|{plan.outline_sections}"),
     )
     db.add(review)
@@ -728,7 +645,7 @@ async def record_report_review(
     decision: str,
     feedback: str | None = None,
 ) -> Review:
-    """A decision about a revision. The hash binds to the exact bytes reviewed."""
+    """保存某个报告修订的审核；哈希绑定审核者实际看到的原始字节。"""
     if decision not in ("APPROVED", "REWORK_REQUESTED", "REJECTED"):
         raise LifecycleError(f"unknown report decision {decision!r}")
     review = Review(
@@ -741,8 +658,7 @@ async def record_report_review(
         gate="REPORT",
         decision=decision,
         feedback=feedback,
-        # `revisions.report_markdown` is immutable, which is what makes this a permanent
-        # property rather than one that survives until the next rework.
+        # revisions.report_markdown 不可变，因此审核始终绑定同一份正文，不会因下次返工而变化。
         reviewed_hash=revision.report_hash,
     )
     db.add(review)
@@ -771,22 +687,10 @@ async def _audit(db: AsyncSession, run: ResearchRun, actor_id, action: str) -> N
 async def measure_citation_resolution(
     db: AsyncSession, run: ResearchRun, revision: Revision
 ) -> float | None:
-    """How much of the approved report's citation apparatus resolves. NULL when unmeasured.
+    """测量获批报告的引用可解析比例；未测量时返回 NULL。
 
-    Measured here because *here* is when the report becomes final. The engine measures it
-    on its own `completed` outcome, and a run never reaches one: approving at the report
-    gate finalizes the run in the domain rather than resuming the graph, so nothing was
-    ever computing this — `citation_resolution_rate` was NULL on every run the product
-    produced, while History offered a filter on it and the run card displayed it.
-
-    The rule itself is not restated: `research_engine.citation_rate` is the one definition
-    the benchmark, the eval judge and this all read, so the number a user sees and the
-    number a published measurement quotes cannot drift.
-
-    NULL survives as NULL. A report that cites nothing has nothing to resolve, which is a
-    different finding from a report whose every marker is broken — the distinction this
-    product exists to keep.
-    """
+    报告在领域层批准后直接定稿，不再恢复引擎，因此不能依赖引擎 completed 分支来计算。测量必须发生在这里。
+    统一使用 research_engine.citation_rate，避免页面、基准评测与 Judge 各算一套。没有引用意味着无可测对象，应保留 NULL，不能等同于全部引用失效。"""
     numbered = (
         (
             await db.execute(
@@ -805,16 +709,13 @@ async def measure_citation_resolution(
     return rate
 
 
-# ── 9. Artifact ───────────────────────────────────────────────────────────────────
+# 9. 冻结最终产物
 
 
 async def create_artifact(db: AsyncSession, run: ResearchRun) -> ResearchArtifact:
-    """Freeze the approved record. Only an APPROVED REPORT review gets here.
+    """冻结获批记录；仅 APPROVED 的 REPORT 审核可进入。
 
-    The authorization decision is `app.authorization`'s, not this module's: one accessor,
-    so a second copy cannot drift. The payload is a frozen bundle rather than a set of
-    joins, so reading it never touches live tables.
-    """
+    授权统一由 app.authorization 判断。保存的是冻结证据包，后续读取无需重新连接实时表来组装内容。"""
     review = await authorization.approving_report_review(db, run.id)
     if review is None:
         raise LifecycleError(
@@ -829,8 +730,7 @@ async def create_artifact(db: AsyncSession, run: ResearchRun) -> ResearchArtifac
     if manifest is None:
         raise LifecycleError("the run has no assemblable bundle; refusing to freeze nothing")
     if manifest.report_hash != review.reviewed_hash:
-        # The artifact must bind to the bytes the human approved. A mismatch means the
-        # bundle was assembled from a different revision than the one reviewed.
+        # 产物必须绑定人工批准的原文字节；不匹配说明证据包用了另一份修订，必须拒绝。
         raise LifecycleError(
             f"report_hash {manifest.report_hash[:12]}… does not match the approved "
             f"{review.reviewed_hash[:12]}…"
@@ -854,11 +754,11 @@ async def create_artifact(db: AsyncSession, run: ResearchRun) -> ResearchArtifac
     return artifact
 
 
-# ── 10. Archive, Restore & Delete ──────────────────────────────────────────────────
+# 10. 归档、恢复和删除
 
 
 async def archive_run(db: AsyncSession, run: ResearchRun) -> ResearchRun:
-    """Mark a run archived. Idempotent."""
+    """标记为已归档；重复操作结果不变。"""
     if run.archived_at is None:
         run.archived_at = datetime.now(UTC)
         await db.flush()
@@ -866,7 +766,7 @@ async def archive_run(db: AsyncSession, run: ResearchRun) -> ResearchRun:
 
 
 async def unarchive_run(db: AsyncSession, run: ResearchRun) -> ResearchRun:
-    """Restore an archived run to active history. Idempotent."""
+    """将已归档运行恢复到活动历史列表；重复操作结果不变。"""
     if run.archived_at is not None:
         run.archived_at = None
         await db.flush()
@@ -874,35 +774,29 @@ async def unarchive_run(db: AsyncSession, run: ResearchRun) -> ResearchRun:
 
 
 async def delete_run(db: AsyncSession, run: ResearchRun) -> None:
-    """Permanently delete a run and all associated relational records.
+    """永久删除运行及关联关系记录。
 
-    Refuses active / non-terminal runs (PENDING, RUNNING, AWAITING_PLAN, AWAITING_REVIEW)
-    with LifecycleError. Reviews and artifacts are deleted in the same transaction; the two
-    polymorphic tables — agent logs and project-memory chunks — carry no foreign key and so
-    are deleted explicitly; and the run itself is deleted, cascading its plans, sources,
-    evidence, revisions, claims, annotations, links, and contradictions.
-    """
+    PENDING、RUNNING、AWAITING_PLAN、AWAITING_REVIEW 等未终结状态不允许删除。审核与产物在同一事务删除。
+    代理日志和项目记忆属于多态引用，没有外键级联，必须显式删除；删除运行后，其计划、来源、证据、修订、结论、批注、关联和冲突由外键级联清理。"""
     if run.status in ("PENDING", "RUNNING", "AWAITING_PLAN", "AWAITING_REVIEW"):
         raise LifecycleError(
             f"This run is still active ({run.status}). Cancel it or wait for it to finish before deleting."
         )
 
-    # 1. Delete polymorphic AgentLogs
+    # 1. 删除多态引用的代理日志 AgentLogs
     await db.execute(delete(AgentLog).where(AgentLog.session_id == run.id))
 
-    # 1b. And its project-memory chunks, which are polymorphic for the same reason and so
-    # carry no cascade either. A deleted run whose text stays retrievable would let project
-    # chat quote a report that no longer exists. Guarded because this function runs on both
-    # hosts and the desktop one has no memory table to delete from.
+    # 同时显式删除项目记忆片段；它们也没有级联外键。
+    # 否则运行删掉后，项目聊天仍可能引用已不存在的报告。桌面端没有记忆表，要先判断是否支持。
     if memory.is_available(db):
         await db.execute(delete(MemoryChunk).where(MemoryChunk.source_report_id == run.id))
 
-    # 2. Delete ResearchArtifact for this run
+    # 2. 删除本次运行的最终产物 ResearchArtifact
     await db.execute(delete(ResearchArtifact).where(ResearchArtifact.run_id == run.id))
 
-    # 3. Delete Review rows for this run (RESTRICT foreign key)
+    # 3. 删除审核 Review；其外键是 RESTRICT，必须先清理
     await db.execute(delete(Review).where(Review.run_id == run.id))
 
-    # 4. Delete the run (cascades plans, sources, evidence, revisions, claims, annotations, links, contradictions)
+    # 4. 删除运行，级联清理计划、来源、证据、修订、结论、批注、关联和冲突
     await db.delete(run)
     await db.flush()

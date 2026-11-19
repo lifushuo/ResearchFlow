@@ -1,36 +1,10 @@
-"""
-Execution wiring: the research engine, persisted into the research domain.
+"""连接研究引擎与领域持久化的适配层，不是另一套研究流程。
 
-This is an **adapter**, not a second pipeline. `research_engine.runner.run` and `.resume` are
-called exactly as `app/workers/pipeline_runner.py` calls them, with the same ports, the same
-`RunConfig`, the same LangGraph topology and the same checkpointer. Nothing in
-`research_engine/` learns the domain exists — the dependency points one way, from here into the
-engine.
+与会话 Worker 一样，通过 runner.run/resume 调用相同的图、端口、配置和检查点。依赖只从本模块指向引擎，引擎不感知业务数据库。
 
-    POST /runs ──► ResearchRun (PENDING)
-                       │
-                       ├─ Celery: run_research_pipeline
-                       │    ├─ resolve routing + BYOK + RunConfig   (shared)
-                       │    ├─ runner.run(...)                      (unchanged engine)
-                       │    ├─ RunOutcome  +  final checkpoint state
-                       │    └─ persist_outcome() ──► run_lifecycle ──► run rows
-                       │
-                       └─ POST /report-review APPROVED ──► Artifact ──► bundle ──► verifier
+执行结果来自两处：RunOutcome 提供报告、编号来源和用量，LangGraph 检查点提供证据与冲突。通过三态读取器读取一次，再在事务中保存；此后 evidence 表是业务依据，检查点仅保留执行历史。
 
-**Two sources, because the engine has two outputs.** `RunOutcome` carries the report, the
-numbered source list, cost and tokens. Evidence and contradictions live in the LangGraph
-checkpoint and always have — the session bundle route reads them the same way. So the adapter
-reads the final state once, through the tri-state reader, and persists it transactionally.
-After that the `evidence` table is authoritative and the checkpoint is execution history.
-
-**The tri-state matters here too.** A run whose checkpoint cannot be read has not gathered
-zero evidence; it has an unknown amount. `persist_outcome` records which of the three it was
-and refuses to write a revision claiming citations it cannot resolve.
-
-`persist_outcome` is deliberately the seam: pure over (db, run, outcome, state), with no
-Celery, no Redis and no HTTP, so the integration test can drive the real engine and then call
-it directly.
-"""
+检查点读失败意味着证据数量未知，不是零条。persist_outcome 保存读取状态，不能生成无法解析引用的修订。它只依赖 db、run、outcome、state，不依赖 Celery、Redis 或 HTTP，便于直接验证持久化行为。"""
 
 from __future__ import annotations
 
@@ -62,10 +36,8 @@ from research_engine.runner import RunOutcome
 
 logger = structlog.get_logger()
 
-#: One decrypt path and one fallback for BYOK keys, shared with the session worker rather
-#: than restated. The *preference* contract no longer arrives from here: it lives in
-#: `app/services/run_config.py`, which the desktop may import and `app.workers` is not
-#: (`tests/workflow/test_layer_boundaries.py` lists `app.workers` as infrastructure).
+# 与会话 Worker 共用用户密钥解密和回退路径，不再复制实现。
+# 用户偏好契约位于 app/services/run_config.py；桌面端可导入服务层，不能依赖 app.workers 基础设施层。
 from app.workers.pipeline_runner import _user_provider_keys  # noqa: E402
 
 __all__ = [
@@ -78,12 +50,9 @@ __all__ = [
 
 @dataclass
 class PersistResult:
-    """What the adapter wrote, and what it declined to write.
+    """记录本次适配器写入和拒绝写入的内容。
 
-    `evidence_outcome` is the tri-state, carried out so a caller can log it and a test can
-    assert on it. `revision` is None when the run produced no report — a failed run, or one
-    stopped at a gate.
-    """
+    evidence_outcome 明确证据读取状态，供日志和验证使用；没有生成报告时 revision 为 None，例如执行失败或只到达计划关卡。"""
 
     status: str
     evidence_outcome: str
@@ -96,55 +65,36 @@ class PersistResult:
 
 
 async def provider_keys_for(db: AsyncSession, owner_id: uuid.UUID) -> dict[str, str]:
-    """This run's BYOK keys. Shared with the session worker — one decrypt path, one fallback."""
+    """获取本运行使用的用户自带密钥；与会话 Worker 共用解密和回退规则。"""
     return await _user_provider_keys(db, str(owner_id))
 
 
 async def freeze_prompt_overrides(db: AsyncSession, run: ResearchRun) -> None:
-    """Stamp the prompt overrides this run will execute under. Start only, exactly once.
+    """仅在首次开始时冻结本运行的提示词覆盖配置。
 
-    Called inside the transaction that writes RUNNING, so a run is never observable as
-    started without the configuration it started under. **Start is decided by the caller's
-    arguments, not by finding the column NULL** — NULL is also what every run predating the
-    column holds, and re-resolving on one of those would hand a resumed run instructions its
-    first half never saw.
-    """
+    与写入 RUNNING 同一事务保存，避免出现已启动却没有配置快照的运行。是否首次开始由调用参数决定，不能看字段是否为 NULL，因为旧版运行也可能为 NULL；恢复旧任务时重新解析会改变后半段使用的指令。"""
     user = (await db.execute(select(User).where(User.id == run.owner_id))).scalar_one_or_none()
     frozen, status = snapshot_overrides(user)
-    # `None` rather than `{}` for the empty case: the status already says which of the three
-    # this is, and a column holding two spellings of "nothing" invites a reader to branch on
-    # the wrong one.
+    # 空配置统一保存为 None，不混用 {}；具体状态已有单独字段说明，避免调用方根据两种空值作出不同判断。
     run.effective_prompt_overrides = frozen or None
     run.prompt_overrides_status = status
     await db.flush()
 
 
 def prompt_overrides_for_run(run: ResearchRun) -> tuple[dict[str, str], bool]:
-    """The overrides a run executes under, read from its own row and nothing else.
+    """只从运行记录读取冻结的提示词覆盖配置，两个主机遵循同一规则。
 
-    **The execution-source rule, in one place for both hosts.** Once a run has started, the
-    snapshot is the only source: consulting the owner's live preferences on resume would let
-    an edit made while the run sat at a human gate rewrite the instructions its first half
-    was already written under. A snapshot that cannot be used yields shipped prompts for
-    every purpose — never a partial application, and never a re-resolution.
-
-    Returns `(overrides, needs_unusable_stamp)`. The caller owns the write because the two
-    hosts commit on different transactions; only the *status* is ever corrected, so whatever
-    was stored stays inspectable.
-    """
+    恢复时不能重新读取用户当前偏好，否则暂停期间的设置修改会改变同一次研究的指令。快照不可用时全部退回项目默认提示词，不部分应用，也不重新解析偏好。
+    返回覆盖配置和是否需要标记快照不可用；写事务由调用方负责，原快照内容始终保留以便排查。"""
     overrides, status = usable_overrides(run.effective_prompt_overrides)
     stamp = status == OVERRIDES_UNUSABLE and run.prompt_overrides_status != OVERRIDES_UNUSABLE
     return overrides, stamp
 
 
 async def run_config_for_run(db: AsyncSession, run: ResearchRun) -> RunConfig:
-    """The engine config for a run.
+    """构建本次研究的引擎配置，优先级为运行记录、用户设置、部署默认值。
 
-    Deliberately the same resolution order as the session worker — run → user → deployment — and
-    the same snapshot rule: once `model_routing` is stamped on the run it wins, so a resumed
-    run keeps the models it started with rather than producing a report whose halves were
-    written by different models.
-    """
+    模型路由一旦在运行中冻结就始终优先使用，确保恢复前后由同一套模型完成报告。"""
     user = (await db.execute(select(User).where(User.id == run.owner_id))).scalar_one_or_none()
 
     routing = model_routing.resolve(
@@ -158,16 +108,15 @@ async def run_config_for_run(db: AsyncSession, run: ResearchRun) -> RunConfig:
     base = run_config_from_settings()
     overrides = preference_overrides(user)
 
-    # Read from the row, never from `user` — see `prompt_overrides_for_run`. Desktop
-    # counterpart: `sidecar._drive_run`, calling the same function rather than restating it.
+    # 从运行记录读取，不重新读取 user 偏好，规则见 prompt_overrides_for_run。
+    # 桌面 sidecar._drive_run 也调用同一函数。
     prompt_overrides, unusable_stamp = prompt_overrides_for_run(run)
     if unusable_stamp:
         run.prompt_overrides_status = OVERRIDES_UNUSABLE
         await db.flush()
 
     overrides |= {"prompt_overrides": prompt_overrides, **row_overrides(run)}
-    # The demo rule, shared with the session worker and both desktop drivers — see
-    # `app/services/run_config.py` for why it is one branch and why it has to be one home.
+    # 演示模式判断与会话和桌面运行共用 app/services/run_config.py 的实现，避免多处分支不一致。
     config, needs_stamp = apply_demo_rule(
         base, row_demo=bool(run.demo), host_is_scripted=base.llm_mode == "fake"
     )
@@ -186,53 +135,31 @@ async def persist_outcome(
     state: dict | None = None,
     prompt_provenance: dict[str, dict] | None = None,
 ) -> PersistResult:
-    """Write one graph invocation's result into the research domain. Caller owns the transaction.
+    """保存一次图调用的结果；事务由调用方提交。
 
-    `state` is the final checkpoint values; pass it directly (a test that already has them)
-    or pass `saver` and let this read them through the tri-state reader. Passing neither
-    means the evidence is **unknown**, and that is recorded rather than treated as zero.
-
-    `prompt_provenance` is what `system_prompt` composed during *this* invocation, captured
-    by `recording_provenance`. It is **merged**, not assigned: a run pausing at a human gate
-    composes the planner's prompt in one invocation and the synthesizer's in a later one, and
-    the bundle needs the union. Omitting it leaves the column exactly as it was, so a caller
-    that does not drive the graph cannot erase what an earlier segment recorded.
-    """
-    # **Before every early return below.** A prompt this invocation composed is a fact about
-    # what executed, like the spend the cancelled branch deliberately keeps — not a
-    # conclusion about the run, so no outcome status suppresses it. Placed lower, it was
-    # dropped for the invocation that ends at the plan gate, and the planner's prompt —
-    # always the first one composed — never reached any bundle. The golden run journey
-    # caught that; nothing else would have, because every unit test drove a single
-    # uninterrupted invocation.
+    可直接传入检查点 state，或传 saver 让本函数通过三态读取器获取。两者都没有时记为证据未知，不当成零。
+    prompt_provenance 记录这次实际组成的提示词，需与前次合并：人工关卡前后可能分别组成规划和综合提示词，证据包必须保留两段。省略参数时不清空旧记录。"""
+    # 必须在所有提前返回分支之前保存实际提示词来源。
+    # 它描述真正执行过的内容，不受最终成功、失败或取消状态影响；否则停在计划关卡时会漏掉规划提示词。
     #
-    # Merged earlier-first: a purpose already recorded keeps the string it actually ran
-    # under, matching the recorder's own first-write-wins rule within one invocation.
+    # 已有用途的提示词保留首次执行值，与记录器首次写入优先的规则一致。
     if prompt_provenance:
-        # This invocation's records first, the existing ones second, so an already-recorded
-        # purpose keeps the string it actually ran under. A resumed run recomposes nothing,
-        # but if it ever did, the earlier segment is the one the report was written from.
+        # 合并时先放本次记录，再用已有记录覆盖同名用途，保留最早实际执行的提示词。
+        # 恢复不应重新组成旧用途；即使发生，也以原段执行时的内容为依据。
         run.effective_prompt_provenance = {
             **prompt_provenance,
             **(run.effective_prompt_provenance or {}),
         }
 
-    # A run the user stopped stays stopped (issue #54). Cancellation is advisory — nothing
-    # interrupts the graph — so the outcome still arrives, minutes later with a real model,
-    # and every branch below would move the run out of CANCELLED.
+    # 用户取消的运行必须保持取消。当前取消不抢占引擎，在途调用稍后仍会返回结果，不能因此改回其他状态。
     #
-    # Without this the write did not merely mis-record: `ck_run_cancelled` ties CANCELLED to
-    # `cancelled_at`, so the UPDATE violated the constraint and raised IntegrityError inside
-    # the worker's background task. The status survived (the transaction rolled back) but the
-    # spend went with it — a run cancelled after $0.50 recorded $0.00. Guarding here is what
-    # turns an accidental save-by-constraint into a decision, and keeps the money.
+    # ck_run_cancelled 要求状态与取消时间一致；取消后强行改状态会使整个事务回滚，连真实费用也丢失。
+    # 先做判断才能既保留用户决定，又保存已经发生的用量。
     #
-    # Spend is committed because tokens burned between the stop and the pipeline noticing are
-    # real; dropping them would make usage totals lie. Nothing else is written: the run's own
-    # conclusion is not the user's decision, and the user's decision is the one that stands.
+    # 取消到引擎发现停止之间实际消耗的 Token 仍要记录。
+    # 除此之外不更新结论数据；运行自己的结果不能推翻用户取消决定。
     #
-    # Two more homes of this rule for sessions — `pipeline_runner._persist_outcome` and
-    # `sidecar._apply_outcome`. Change all three.
+    # 会话的另外两处实现是 pipeline_runner._persist_outcome 和 sidecar._apply_outcome；修改此规则时三处必须一致。
     if run.status == "CANCELLED":
         await run_lifecycle.record_metrics(
             db,
@@ -254,10 +181,9 @@ async def persist_outcome(
         await run_lifecycle.record_failure(db, run, outcome.error)
         return PersistResult(status="FAILED", evidence_outcome="NOT_READ")
 
-    # ── the plan gate ─────────────────────────────────────────────────────────────
+    # 计划审核关卡
     if outcome.status == "awaiting_plan":
-        # The proposal, not a decision: `approved_at` stays NULL until a PLAN review
-        # stamps it, and `origin` says the model wrote it.
+        # 这里只保存模型提案：origin 标明模型生成，approved_at 等到 PLAN 审核批准时才填写。
         await run_lifecycle.record_plan(
             db,
             run,
@@ -275,7 +201,7 @@ async def persist_outcome(
         await run_lifecycle.set_status(db, run, "AWAITING_PLAN")
         return PersistResult(status="AWAITING_PLAN", evidence_outcome="NOT_READ")
 
-    # ── evidence, from the checkpoint, tri-state ──────────────────────────────────
+    # 从检查点读取证据，并保留三态读取结果
     evidence_outcome = "NOT_READ"
     values: dict = {}
     if state is not None:
@@ -292,10 +218,8 @@ async def persist_outcome(
     written = None
     if evidence_outcome == "READ":
         evidence = [e for e in (values.get("evidence") or []) if isinstance(e, dict)]
-        # An evidence item with no `source_url` has no identity anywhere, and
-        # `record_evidence` refuses the whole batch rather than invent one. The engine's
-        # own numbering skips such items too, so dropping them here loses nothing the
-        # report could have cited — but it IS a drop, so it is counted and logged.
+        # 没有 source_url 的证据没有来源身份，不能凭空补造。
+        # 引擎编号也会跳过它，因此过滤不会丢失可引用来源；但过滤行为必须计数和记录日志。
         usable = [e for e in evidence if (e.get("source_url") or "").strip()]
         if len(usable) != len(evidence):
             logger.warning(
@@ -303,10 +227,8 @@ async def persist_outcome(
                 run_id=str(run.id),
                 skipped=len(evidence) - len(usable),
             )
-        # A selected-files run may persist evidence and sources only from its frozen
-        # selection. `ScopedCorpus` should make this unreachable; reaching it means a path
-        # around the port exists, so the run fails loudly instead of quietly dropping the
-        # offending items (internal/rfcs/V3.1-corpus-scope.md §8.5).
+        # 所选文件模式只允许保存冻结选择范围内的来源和证据。
+        # ScopedCorpus 应已保证此约束；若仍出现越界，说明存在绕过端口的路径，应明确失败，不能静默丢弃越界证据（RFC V3.1 §8.5）。
         bad = corpus_selection.violations(
             run.corpus_selection,
             [e["source_url"] for e in usable]
@@ -324,10 +246,10 @@ async def persist_outcome(
         written = await run_lifecycle.record_evidence(
             db, run, evidence=usable, numbered_sources=outcome.sources
         )
-        # Each synthesis writes a fresh record; a rework's re-validation replaces it.
+        # 每次综合都重新保存核验记录；返工后的再次核验替换本次状态。
         run.grounding_report = values.get("grounding_report")
 
-    # ── the revision, its claims and their links ──────────────────────────────────
+    # 报告修订、结论与证据关联
     revision_version = claim_count = link_count = 0
     report = outcome.report
     if report:
@@ -337,22 +259,20 @@ async def persist_outcome(
         revision_version = result.revision.version
         claim_count, link_count = result.claim_count, result.link_count
 
-    # ── contradictions ────────────────────────────────────────────────────────────
+    # 冲突记录
     contradiction_count = 0
     if evidence_outcome == "READ":
         pairs = [c for c in (values.get("contradictions") or []) if isinstance(c, dict)]
-        # `detector_ran=True` even for an empty list: the engine runs the detector on every
-        # non-corpus path and surfaces nothing when it is unavailable, so "no pairs" here is
-        # a measured absence. A caller that knows the detector was skipped passes False.
+        # 即使没有冲突对，也记录 detector_ran=True：这里的非语料路径已运行检测器。
+        # 若调用方明确知道检测被跳过，应传 False，不能把未检测当成未发现。
         contradiction_count = await run_lifecycle.record_contradictions(
             db, run, pairs=pairs, evidence_index=written
         )
 
-    # ── metrics and status ────────────────────────────────────────────────────────
+    # 运行指标与状态
     rate = None
     if outcome.status == "completed" and report:
-        # Measured once, when the report becomes final — the same rule and the same
-        # function the session worker uses. NULL when there was nothing to measure.
+        # 报告定稿时只测量一次，与会话 Worker 共用规则和函数。没有可测对象就保持 NULL。
         rate = citation_rate.resolution_rate(report, outcome.sources)
     await run_lifecycle.record_metrics(
         db,
@@ -364,15 +284,13 @@ async def persist_outcome(
         citation_resolution_rate=rate,
     )
 
-    # Persisted, not merely logged. Whether the evidence was ever read is what separates a
-    # measured zero from an unmeasured one, and `run_bundle` has to be able to ask the run
-    # itself — a log line cannot be consulted at export time.
+    # 证据是否成功读取必须持久化，不能只写日志。
+    # 证据包导出需要据此区分“实测零条”和“数量未知”。
     run.evidence_outcome = evidence_outcome
 
     status = run_lifecycle.OUTCOME_STATUS.get(outcome.status, "RUNNING")
     if status == "COMPLETED" and not report:
-        # A completed run with no report is not completed. Fail closed rather than mark a
-        # run finished with nothing to review.
+        # 声称完成却没有报告属于无效结果，应明确失败，不能把空运行标成已完成。
         await run_lifecycle.record_failure(db, run, "the graph completed without a report")
         status = "FAILED"
     else:
@@ -391,18 +309,10 @@ async def persist_outcome(
 
 
 def observe_persisted(run: ResearchRun, outcome: RunOutcome, result: PersistResult) -> None:
-    """Record a run that ended in the states `persist_outcome` owns.
+    """在提交成功之后，记录 persist_outcome 负责的终态指标。
 
-    **Called after the caller commits, never inside `persist_outcome`.** A Prometheus
-    counter has no transaction: incrementing it before the commit means a rolled-back
-    write leaves a run counted that the database never recorded, and a counter cannot be
-    decremented back. `persist_outcome`'s own docstring says the caller owns the
-    transaction, so the caller owns this too — both drivers call it on the line after their
-    `db.commit()`, while the row is still attached.
-
-    Completion is deliberately not reachable from here: a run reaches COMPLETED at the
-    approval route, and `app/metrics.py::_PERSISTED_TERMINAL` is where that is enforced.
-    """
+    Prometheus 计数没有事务，提交前增加会把随后回滚的运行也算进去，且无法撤销。所以由主机驱动在 db.commit() 后调用。
+    最终完成发生在报告批准接口，不由这里记录；app/metrics.py::_PERSISTED_TERMINAL 限定了此边界。"""
     metrics.observe_persisted_run(
         result.status,
         cost_usd=outcome.cost_usd,
@@ -413,13 +323,9 @@ def observe_persisted(run: ResearchRun, outcome: RunOutcome, result: PersistResu
 
 
 def lifecycle_event(result: PersistResult) -> dict:
-    """The event a host publishes after `persist_outcome`, in the existing vocabulary.
+    """把持久化结果转成主机应发布的生命周期事件。
 
-    Reuses `research_engine.events.make_event` and the same four names the session stream and
-    both hosts' stop-lists already know (`PLAN_READY`, `HITL_READY`, `COMPLETED`, `FAILED`),
-    so no second event architecture appears and no stream is left waiting on a name nothing
-    publishes.
-    """
+    复用引擎 make_event 和既有 PLAN_READY、HITL_READY、COMPLETED、FAILED，保证两个主机和会话流识别相同事件，不另造一套消息协议。"""
     if result.status == "AWAITING_PLAN":
         return events.make_event("PLAN_READY", data={"run_id": None})
     if result.status == "AWAITING_REVIEW":
@@ -434,11 +340,8 @@ def lifecycle_event(result: PersistResult) -> dict:
         )
     if result.status == "FAILED":
         return events.make_event("FAILED", data={"reason": "see error_message"})
-    # A cancelled run reports FAILED rather than a name of its own (issue #54). `CANCELLED`
-    # is not in `_TERMINAL_EVENTS` on either host, so inventing it here would leave the
-    # stream open on a run that will never publish again — and the fall-through below would
-    # otherwise tell the UI a run the user stopped had COMPLETED. `POST /{id}/cancel`
-    # publishes nothing itself, so this is the event that actually closes the stream.
+    # 取消使用 FAILED 事件关闭现有事件流，不新增 CANCELLED 消息类型。
+    # 两个主机的停止列表没有 CANCELLED，贸然新增会让流一直等待；同时也不能落入默认分支，把取消误报成完成。
     if result.status == "CANCELLED":
         return events.make_event("FAILED", data={"reason": "Research stopped by user."})
     return events.make_event(
@@ -446,19 +349,16 @@ def lifecycle_event(result: PersistResult) -> dict:
         data={
             "revision_version": result.revision_version,
             "claim_count": result.claim_count,
-            # The tri-state, carried into the event: a UI must be able to tell "no
-            # evidence" from "evidence unknown".
+            # 事件也带上三态读取结果，便于界面区分没有证据和证据情况未知。
             "evidence_outcome": result.evidence_outcome,
         },
     )
 
 
-# ── The worker driver ─────────────────────────────────────────────────────────────
+# 服务端 Worker 驱动入口
 #
-# Everything above is host-free. This part is the server's half — the run lock, one DB
-# session scope, the Postgres checkpointer, the event sink — and it is deliberately a near
-# mirror of `pipeline_runner._execute` rather than a new design. The differences are the
-# row it loads (`ResearchRun`) and where the outcome goes (`persist_outcome`).
+# 上面的函数不依赖主机；下面负责服务端的运行锁、数据库会话、Postgres 检查点和事件写入。
+# 基本流程与 pipeline_runner._execute 一致，区别是读取 ResearchRun，并交给 persist_outcome 保存。
 
 
 async def execute_run(
@@ -467,9 +367,8 @@ async def execute_run(
     resume: tuple[bool, str | None] | None = None,
     plan: dict | None = None,
 ) -> None:
-    """Drive one run through the engine and persist it into the research domain."""
-    # First, before the Redis pool, the lock and the row lookup, so everything this driver
-    # logs on the way — including the failures that return early — names the run.
+    """驱动一次研究运行，调用引擎并将结果保存到领域表。"""
+    # 先绑定运行日志标识，再初始化 Redis、加锁和查记录；这样提前失败的日志也能关联到本次运行。
     bind_research_run_context(run_id)
 
     from app import adapters
@@ -483,11 +382,10 @@ async def execute_run(
     )
     from research_engine import runner
 
-    lock_token = uuid.uuid4().hex
+    lock_token = uuid.uuid4().hex  # 这句生成一个随机令牌。
     await init_redis_pool()
     try:
-        # Celery can redeliver, so double execution is a real risk here in a way it is not
-        # in a single-process desktop app. Same lock, same key space as the session worker.
+        # Celery 可能重投消息，因此要防止重复执行；与会话 Worker 使用相同的锁规则与键空间。
         if not await acquire_session_lock(
             run_id, lock_token, ttl=settings.celery_task_timeout_seconds + 60
         ):
@@ -502,23 +400,17 @@ async def execute_run(
                     logger.error("run_not_found", run_id=run_id)
                     return
 
-                # "No new research will be started for this run" is what `POST /cancel`
-                # tells the caller, in those words. Without this it was not true: a resume
-                # dispatched after the cancel — approving the plan of a run you had just
-                # stopped — started the pipeline again, and the `set_status` below wrote
-                # RUNNING over CANCELLED, violating `ck_run_cancelled` and killing the task
-                # on an IntegrityError. Observed live before this guard existed.
+                # 取消后不得再启动该运行的新研究。
+                # 恢复消息可能晚于取消到达，必须先检查，否则既会重跑，还会把 CANCELLED 改为 RUNNING 并违反数据库约束。
                 #
-                # Returning rather than raising: the run is already in the terminal state
-                # the user asked for, nothing is wrong, and there is nothing new to publish
-                # — the stream closed when the cancel did.
+                # 已取消就是用户要求的终态，直接返回即可，不抛异常，也不再发布新消息。
                 if run.status == "CANCELLED":
                     logger.info("run_start_skipped_cancelled", run_id=run_id)
                     return
 
                 await run_lifecycle.set_status(db, run, "RUNNING")
-                # Same transaction as RUNNING, and only on a start: a resume re-enters here
-                # with `resume`/`plan` set and must inherit the snapshot, not replace it.
+                # 与 RUNNING 同一事务冻结提示词，仅在首次开始时执行。
+                # 恢复时 resume/plan 已设置，应继承原快照，不能替换。
                 if resume is None and plan is None:
                     await freeze_prompt_overrides(db, run)
                 await db.commit()
@@ -545,11 +437,8 @@ async def execute_run(
                 dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
                 async with AsyncPostgresSaver.from_conn_string(dsn) as saver:
                     await saver.setup()
-                    # A plain `with`, not an item of the `async with` above: the recorder is
-                    # synchronous, and naming it there raises TypeError before the graph
-                    # starts — every server run failed on entry that way, and only the real
-                    # worker in golden-e2e reached this line to show it. It wraps the graph
-                    # alone; the collection outlives the block, which only uninstalls it.
+                    # 记录器是同步上下文管理器，必须使用普通 with，不能放进 async with，否则图启动前就会报错。
+                    # 它只包围图执行；退出时移除记录器，但已收集的数据仍可在外面使用。
                     with recording_provenance() as composed:
                         if plan is not None:
                             outcome = await runner.resume(
@@ -573,20 +462,15 @@ async def execute_run(
                                 feedback=feedback,
                                 **ports,
                             )
-                    # `run` was loaded before the pipeline started and has been held since,
-                    # with `expire_on_commit=False`: a stop made mid-run is in the row and not
-                    # in the object. Re-read what `persist_outcome`'s guard decides on, or it
-                    # misses the stop, writes over CANCELLED, and `ck_run_cancelled` rolls the
-                    # spend back with the write (issue #54).
+                    # run 是执行前加载的旧 ORM 对象，取消可能已发生在数据库中。
+                    # 保存前必须重新读取 cancelled_at，否则覆盖 CANCELLED 会触发约束并回滚真实用量。
                     await db.refresh(run, ["status", "cancelled_at"])
-                    # Read the state INSIDE the saver context: the evidence lives there and
-                    # the connection closes on exit.
+                    # 在保存器上下文内读取状态，因为退出后数据库连接会关闭。
                     result = await persist_outcome(
                         db, run, outcome, saver=saver, prompt_provenance=composed
                     )
 
-                # Persist, commit, then publish — a client acting on COMPLETED must never
-                # re-read a status that has not caught up.
+                # 先保存、提交，再发布；客户端收到完成事件后不能读到旧状态。
                 await db.commit()
                 observe_persisted(run, outcome, result)
                 await sink(run_id, lifecycle_event(result))
@@ -606,43 +490,31 @@ async def execute_run(
 
 
 def row_overrides(run: ResearchRun) -> dict:
-    """The `RunConfig` fields a run reads off its own row — one home for both run builders.
+    """统一把运行行字段转换为 RunConfig，服务端和桌面共用。
 
-    `run_config_for_run` here and `sidecar._drive_run` on the desktop both call this, so a
-    field added to the row reaches the engine on both hosts or on neither. That second hop,
-    row → `RunConfig`, is the one AGENTS.md records being forgotten: `corpus_mode` was on
-    the row while the server researched the open web, because installing the corpus port
-    only decides what `get_corpus()` answers — `retrievers.search` and
-    `tools.read_webpage` branch on this config and cannot see a database.
-    """
+    请求存入数据库还不够，必须继续传到引擎配置。只安装语料端口不能代替 corpus_mode；检索器和工具从 RunConfig 决定是否访问网页。"""
     return {
         "skip_plan_gate": bool(run.skip_plan_gate),
         "topic_seeds": tuple(run.topic_seeds or ()),
         "outline_template": run.outline_template,
         "corpus_mode": bool(run.corpus_mode),
-        # Frozen at creation, read off the row, never re-resolved.
+        # 创建时冻结，之后只从运行行读取，不重新解析。
         "corpus_allowed_ids": selection_ids_for_run(run),
         "offline": bool(run.offline),
     }
 
 
 def selection_ids_for_run(run: ResearchRun) -> frozenset[str] | None:
-    """The document-version ids this run may read, from its frozen selection.
+    """从冻结选择返回运行允许读取的文档版本，两端共用。
 
-    One home for both run builders (`run_config_for_run` here, `sidecar._drive_run` on the
-    desktop), asserted by object identity like the other two-host rules. `None` for a run
-    with no recorded selection: a web run, or a corpus run created before selections
-    existed, which reads its project's whole corpus as it always did.
-    """
+    没有保存选择时为 None，包括网页运行和旧语料运行；后者仍读取原来整个项目语料。"""
     return corpus_selection.allowed_ids(run.corpus_selection)
 
 
 def corpus_port_for(store, config):
-    """The corpus port a run installs: its store, scoped to its selection when it has one.
+    """构建运行使用的语料端口，有文件选择时严格限定范围。
 
-    Shared by both hosts so a selection cannot be enforced on one and forgotten on the
-    other (internal/rfcs/V3.1-corpus-scope.md §8.4).
-    """
+    两种主机共用，避免仅一端执行选择限制（RFC V3.1 §8.4）。"""
     from research_engine.corpus import ScopedCorpus
 
     if config.corpus_allowed_ids is None:
@@ -651,28 +523,17 @@ def corpus_port_for(store, config):
 
 
 async def record_corpus_snapshot(db: AsyncSession, run: ResearchRun, store) -> None:
-    """Stamp the corpus identity and version this run is about to read.
+    """记录运行即将读取的语料身份和版本，两端共用。
 
-    One home for both hosts. The server reaches it through `_corpus_port` and the desktop
-    through its own run driver, and `AGENTS.md` records what happens to a rule with two
-    homes — so this is asserted by object identity rather than kept in step by discipline.
-
-    A snapshot, not a lock. Nothing prevents the corpus changing while the run proceeds, and
-    nothing needs to: a superseded version stays readable, so evidence gathered before a
-    change still resolves to the bytes that were cited. What the pair records is the state
-    at the moment the corpus was opened, which is the claim a bundle can honestly make.
-    """
+    这是打开时状态快照，不是锁；运行期间语料仍可变化，旧版本保持可读，已有证据仍解析到原字节。不能声称整个运行期间语料完全没变。"""
     run.corpus_id, run.corpus_version = await store.identity()
     await db.flush()
 
 
 async def _corpus_port(db: AsyncSession, run: ResearchRun, ports: dict) -> str | None:
-    """Attach the corpus store, or return the reason the run cannot proceed.
+    """连接语料存储；不能继续时返回原因。
 
-    Both guards are the session worker's, unchanged: a remote embedder would egress the corpus,
-    and a missing corpus database means the documents were never ingested. Returning the
-    reason rather than raising keeps the caller's failure path in one place.
-    """
+    要求本地向量化防外发，且语料数据库必须已存在；缺少数据库意味着文档尚未摄取。返回原因让调用方统一处理失败。"""
     from app import adapters
 
     embedder = await adapters.embeddings_for(ports["provider_keys"])

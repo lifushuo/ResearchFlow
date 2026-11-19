@@ -45,6 +45,16 @@ STEP = "docker/stamp_image.py"
 #: build args, the Dockerfile declares them, the stamping step reads them.
 FACTS = ("BUILD_VERSION", "BUILD_GIT_SHA", "BUILD_DIRTY")
 
+
+def test_evaluation_workers_receive_the_same_build_identity():
+    """评测镜像也必须接收构建身份，不能只核验 API 和业务 Worker。"""
+    config = yaml.safe_load((ROOT / "docker-compose.evaluation.override.yml").read_text())
+    for name in ("eval-pipeline-online", "eval-pipeline-offline"):
+        args = config["services"][name]["build"]["args"]
+        assert args["BUILD_STAMP"] == "local"
+        assert all(args[fact] == "${" + fact + ":-}" for fact in FACTS)
+
+
 STALE = {
     "VERSION": "2.1.0",
     "GIT_SHA": "33f1916" + "0" * 33,

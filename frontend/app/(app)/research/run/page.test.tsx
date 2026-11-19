@@ -5,14 +5,7 @@ import type { RunGraph } from "@/lib/types";
 
 import RunPage from "./page";
 
-/**
- * Every `dt`/`dd` on the run page sits inside a `dl`.
- *
- * The Evidence Chain Overview put its four figure pairs in a plain grid `div`, which is not
- * valid HTML: a term/description pair has no meaning outside a description list, and
- * assistive technology reads it as loose text. This renders the page for a finished run —
- * the state the overview appears in — and checks every pair on it, not only the one block.
- */
+/** 研究页中的全部 dt/dd 都必须位于 dl 内。证据链概览曾将四组名称和值放入普通网格 div，读屏器因缺少描述列表结构只能读成零散文本。此测试渲染概览会出现的完成状态，并核查页面上的全部描述项，而不只检查一个区块。 */
 
 const current = vi.hoisted(() => ({ graph: null as unknown }));
 
@@ -32,7 +25,7 @@ vi.mock("@/hooks/runs", async (original) => ({
   }),
   useRunStream: () => ({ events: [], degraded: false }),
 }));
-// The workspace below the header has its own tests; only the header's markup is at issue.
+// 工作区内容另有测试；此处只检查页头的 HTML 结构。
 vi.mock("@/components/runs/RunWorkspace", () => ({
   RunWorkspace: () => null,
   CancelButton: () => null,
@@ -150,35 +143,28 @@ describe("the run page's description lists", () => {
     current.graph = graph();
     const { container } = render(<RunPage />);
     const pairs = container.querySelectorAll("dt, dd");
-    expect(pairs.length).toBeGreaterThanOrEqual(8); // the overview's four figures
+    expect(pairs.length).toBeGreaterThanOrEqual(8); // 概览中的四项指标。
     for (const el of pairs) {
       expect(el.closest("dl"), `${el.tagName} "${el.textContent}" has no dl`).not.toBeNull();
     }
   });
 });
 
-/**
- * A demo run must never read as research on the question that was asked.
- *
- * The demo's report answers a fixed question whatever was typed, fully cited, so a reader who
- * skims past a two-word badge reads an unrelated, confident answer as research on their own
- * question — which is what happened: a question about one company came back as a report on
- * retrieval-augmented generation. The badge stays; the page also says it in a sentence.
- */
+/** 演示报告必须明确说明它没有研究用户提出的问题。演示无论输入为何都返回带引用的固定内容，单靠两字徽标容易使读者误认为是针对自身问题的研究，因此页面还必须用完整句子说明。 */
 describe("a demo run's page", () => {
   it("says plainly that nothing was researched and the question never reached a model", () => {
     current.graph = graph({ run: { ...graph().run, demo: true } });
     render(<RunPage />);
-    const notice = screen.getByRole("note", { name: /demo run/i });
-    expect(notice).toHaveTextContent("Demo run — no LLM research was performed");
+    const notice = screen.getByRole("note", { name: /演示研究/i });
+    expect(notice).toHaveTextContent("演示研究——未使用大模型进行实际研究");
     expect(notice).toHaveTextContent(
-      "Your question was not sent to a model. This report is a scripted demonstration",
+      "你的问题未发送给模型。本报告是脚本演示",
     );
   });
 
   it("is not shown on a run a model actually researched", () => {
     current.graph = graph({ run: { ...graph().run, demo: false } });
     render(<RunPage />);
-    expect(screen.queryByRole("note", { name: /demo run/i })).toBeNull();
+    expect(screen.queryByRole("note", { name: /演示研究/i })).toBeNull();
   });
 });

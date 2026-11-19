@@ -16,6 +16,10 @@ os.environ.setdefault(
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 os.environ.setdefault("JWT_SECRET_KEY", "test-secret-" + "a" * 32)
 
+# 裁判配置也不能从开发者的 .env 泄漏进离线测试。
+for _name in ("EVAL_JUDGE_MODEL", "EVAL_JUDGE_BASE_URL", "EVAL_JUDGE_API_KEY"):
+    os.environ[_name] = ""
+
 # Pin model routing so tests never inherit the operator's .env choice (e.g. a local
 # Ollama route priced at $0 would break the cost-accounting assertions). Priced
 # catalog models keep fake-mode cost estimates deterministic and non-zero.

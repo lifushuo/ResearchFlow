@@ -14,18 +14,13 @@ import { firstNameOf } from "@/lib/user";
 
 import { Avatar } from "./Avatar";
 
-/**
- * Account menu for the sidebar.
- *
- * Supports expanded full-width profile card trigger and collapsed compact icon trigger.
- * Positions the popup menu upwards/outwards so it is never clipped or offscreen.
- */
+/** 侧边栏账户菜单。支持展开时的整行资料卡片和折叠时的紧凑图标；弹层向上或向外定位，防止裁切或超出视口。 */
 export function AccountMenu({ user, collapsed = false }: { user: User; collapsed?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const logout = useLogout();
-  // Profile and Log out are account features; the desktop is one local user with neither.
-  // Asked of the host rather than inferred from the build flag.
+  // 个人资料和退出属于账户功能；桌面端只有本地用户，不提供这些操作。
+  // 向宿主查询能力，而非根据构建标志推断。
   const { accounts } = useCapabilities();
   const { resolvedTheme, setTheme } = useTheme();
 
@@ -33,7 +28,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
-  // Close on outside click / Escape, and return focus to the trigger
+  // 点击外部或按 Escape 时关闭，并将焦点还给触发按钮。
   useEffect(() => {
     if (!open) return;
 
@@ -54,7 +49,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
     };
   }, [open]);
 
-  // Navigating away should close the menu
+  // 离开当前页面时关闭菜单。
   const [prevPath, setPrevPath] = useState(pathname);
   if (pathname !== prevPath) {
     setPrevPath(pathname);
@@ -68,7 +63,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
     } catch {
       /* best-effort: cookies are cleared server-side regardless */
     } finally {
-      toast.success("Signed out");
+      toast.success("已退出登录");
       router.replace("/login");
     }
   };
@@ -94,11 +89,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
         <Avatar user={user} size={collapsed ? 30 : 32} />
         {!collapsed && (
           <>
-            {/* Name only. The address is on the Profile page and nowhere in the chrome:
-                a sidebar is on screen for the whole session, in every screen share and
-                every screenshot, and an email address is the one identifier here that is
-                also a credential elsewhere. Identifying the signed-in account does not
-                need it — the display name and avatar do that. */}
+            {/* 侧边栏始终出现在截图和共享屏幕中，只显示名称与头像；邮箱仅放在个人资料页，避免暴露登录标识。 */}
             <div className="min-w-0 flex-1">
               <div className="truncate text-xs font-semibold text-text-primary">
                 {displayName}
@@ -125,14 +116,14 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
       {open && (
         <div
           role="menu"
-          aria-label="Account"
+          aria-label="账户"
           className={`animate-fade-in absolute z-50 border border-border/80 bg-bg-surface/95 shadow-xl backdrop-blur-md overflow-hidden p-1.5 ${
             collapsed
               ? "left-full bottom-0 ml-3 w-60 origin-bottom-left"
               : "bottom-full left-0 mb-2 w-full min-w-[13.5rem] origin-bottom-left"
           }`}
         >
-          {/* Identity header */}
+          {/* 账户身份标题 */}
           <div className="flex items-center gap-3 px-3 py-2.5 bg-bg-elevated/40 border border-border/60 mb-1">
             <Avatar user={user} size={34} />
             <div className="min-w-0 flex-1">
@@ -140,14 +131,14 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
                 {user.display_name || firstNameOf(user)}
               </div>
               <div className="truncate font-mono text-[0.6875rem] text-text-muted">
-                Signed in
+                已登录
               </div>
             </div>
           </div>
 
           <div className="my-1 border-t border-border/50" />
 
-          {/* Nav items */}
+          {/* 导航项 */}
           {accounts && (
             <Link
               href="/profile"
@@ -168,7 +159,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
                 <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
                 <circle cx="12" cy="7" r="4" />
               </svg>
-              <span>Profile</span>
+              <span>个人资料</span>
             </Link>
           )}
 
@@ -191,12 +182,12 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
               <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
               <circle cx="12" cy="12" r="3" />
             </svg>
-            <span>Settings</span>
+            <span>设置</span>
           </Link>
 
           <div className="my-1 border-t border-border/50" />
 
-          {/* Theme switcher */}
+          {/* 主题切换 */}
           <button
             type="button"
             role="menuitem"
@@ -232,10 +223,10 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
                   <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
                 </svg>
               )}
-              <span>Appearance</span>
+              <span>外观</span>
             </span>
             <span className="shrink-0 bg-bg-elevated px-2 py-0.5 font-mono text-[0.6875rem] font-medium border border-border/60 text-text-muted">
-              {isDark ? "Dark" : "Light"}
+              {isDark ? "深色" : "浅色"}
             </span>
           </button>
 
@@ -269,7 +260,7 @@ export function AccountMenu({ user, collapsed = false }: { user: User; collapsed
                     <line x1="21" y1="12" x2="9" y2="12" />
                   </svg>
                 )}
-                <span>Sign out</span>
+                <span>退出登录</span>
               </button>
             </>
           )}

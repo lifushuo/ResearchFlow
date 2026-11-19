@@ -1,54 +1,36 @@
-"""
-Merging a settings request into a user's stored preferences — one home, both hosts.
+"""两个主机共用的用户偏好合并逻辑。
 
-Preferences arrive a section at a time, so a request carries only the fields the section it
-came from owns and a naive overwrite would blank every other section. Both hosts therefore
-merge rather than replace, and that rule already had two copies before this module existed.
-
-`prompt_overrides` needs a second level of the same care, and it is the reason this is a
-function rather than a `dict.update` at each call site. It is a map, so a top-level merge
-would replace the whole map: a request setting one role's prompt would silently drop the
-other four. So it merges per role, and `null` deletes that role's entry rather than storing
-a null — the difference between "reset this one" and "I sent you nothing about it", which
-the top-level merge cannot express on its own.
-
-Nothing here validates. `app.schemas.auth.UserPreferences` does that, on both hosts, before
-anything reaches this function.
-"""
+请求只包含当前设置分区，必须按字段合并，不能清空其他分区。prompt_overrides 还需按角色再合并一层；角色值为 null 表示重置该角色，缺失则不修改。
+结构校验由 UserPreferences 提前完成，本函数不重复校验。"""
 
 from __future__ import annotations
 
 from typing import Any
 
-#: The one preference whose value is a map and therefore cannot be merged at the top level.
-#: A second such preference would join it here rather than growing a branch at a call site.
+# 值为映射的偏好需深一层合并；新增同类偏好也应集中登记，不能在调用点加私有分支。
 _NESTED_MAP_PREFERENCES = ("prompt_overrides",)
 
 
 def merge_preferences(stored: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
-    """The stored preferences with `incoming` applied. Neither argument is mutated.
+    """返回应用 incoming 后的偏好，不修改两个输入对象。
 
-    `incoming` is expected to carry only the fields the request actually set — on the server
-    that is `model_dump(exclude_unset=True)`, so a field the client never mentioned is absent
-    here rather than present as `None`, and absent means "leave it alone".
-    """
+    incoming 只含客户端明确设置的字段，未提及不等同于 None，而是保持原值。"""
     merged = dict(stored or {})
     for key, value in incoming.items():
         if key not in _NESTED_MAP_PREFERENCES:
             merged[key] = value
             continue
         if value is None:
-            # The whole map reset: the user cleared every override at once.
+            # 用户明确清空整份提示词覆盖映射。
             merged.pop(key, None)
             continue
         nested = dict(merged.get(key) or {})
         for inner_key, inner_value in value.items():
             if inner_value is None:
-                nested.pop(inner_key, None)  # reset this role to its shipped prompt
+                nested.pop(inner_key, None)  # 将该角色重置为项目默认提示词。
             else:
                 nested[inner_key] = inner_value
-        # An empty map is the same state as no map, and storing `{}` would leave a user who
-        # reset their last override looking different from one who never set any.
+        # 空映射等同未配置，最后一项重置后统一为空，避免与从未配置的用户出现无意义差别。
         if nested:
             merged[key] = nested
         else:

@@ -1,9 +1,6 @@
-"""
-Structured I/O contracts for the agent pipeline (docs/architecture/04-agent-architecture.md §2).
+"""智能体流水线的结构化输入输出契约（docs/architecture/04-agent-architecture.md §2）。
 
-Every LLM boundary is validated against one of these models. Parse/validation
-failure is a node failure — never a silent fallback (docs/11 §1 rule 2).
-"""
+每个模型边界都由这里的模型校验。解析或校验失败即节点失败，不能静默回退（docs/11 §1 rule 2）。"""
 
 from __future__ import annotations
 
@@ -21,12 +18,9 @@ class ResearchTask(BaseModel):
     query: str = Field(min_length=3, description="A concrete, independently searchable query")
     rationale: str = ""
     status: TaskStatus = "pending"
-    # Plan gate fields (internal/07 Phase 4). Absent/empty is the exact shape a task
-    # had before this field existed, so a run that skips the gate is unaffected.
+    # 计划审核字段（internal/07 Phase 4）；缺省或空值兼容字段引入前的任务形状，不影响跳过关卡的研究。
     subtopics: list[str] = Field(default_factory=list)
-    # False means the reviewer dropped this task at the gate — plan_gate_node filters
-    # these out before the executor ever sees the list. True (the default) is what
-    # every task effectively was before this field existed: nothing was ever excluded.
+    # False 表示审核者排除此任务，plan_gate_node 会在交给执行器前过滤；默认 True 与旧行为一致，保留全部任务。
     include: bool = True
     source_hint: str | None = None
 
@@ -41,7 +35,7 @@ class ResearchTask(BaseModel):
 
 
 class OutlineSection(BaseModel):
-    """One section of the proposed report structure (internal/07 Phase 4)."""
+    """报告建议结构中的一个章节（internal/07 Phase 4）。"""
 
     title: str = Field(min_length=1)
     description: str = ""
@@ -63,14 +57,11 @@ class PlannerOutput(BaseModel):
     def _bounded(cls, v: list[ResearchTask]) -> list[ResearchTask]:
         if not v:
             raise ValueError("planner must produce at least 1 task")
-        # A default, not a wall (internal/07 Phase 4) — the plan gate is what lets a
-        # user raise this per-run by adding tasks themselves; the configured cap is
-        # only what the *planner* may propose unprompted. 6 reproduces today's
-        # hardcoded ceiling exactly.
+        # 配置只限制规划器主动提出的任务数；用户仍可在审核关卡手动新增任务（internal/07 Phase 4）。默认值 6 保持原有硬编码上限的行为。
         cap = get_run_config().max_planner_tasks
         if len(v) > cap:
             v = v[:cap]
-        # Normalize ids to 1..n so downstream tagging is stable.
+        # 将 ID 规范为 1..n，稳定下游任务标记。
         for i, t in enumerate(v, start=1):
             t.id = i
         return v
@@ -78,12 +69,7 @@ class PlannerOutput(BaseModel):
 
 class EvidenceChunk(BaseModel):
     task_id: int = 0
-    # Required, and it must stay required. A chunk with no URL still validates if this
-    # carries a default, so it reaches `state["evidence"]` and makes the list non-empty —
-    # and non-empty is the exact predicate `route_after_critic` and `_no_research_reason`
-    # use to decide the run has something to report. Sourceless chunks would then count as
-    # evidence and carry an uncitable run into synthesis. The alias normalisation below is
-    # the right way to be generous to loosely-shaped model output; a default is not.
+    # source_url 必须保持必填。若设默认值，无来源的块也能通过校验，让 evidence 非空，并误导 route_after_critic 和 _no_research_reason 放行无法引用的研究；兼容不规范输出应使用下方别名归一化，而非允许缺失来源。
     source_url: str
     source_title: str = ""
     snippet: str = Field("", max_length=500, description="Verbatim supporting text")
@@ -133,10 +119,7 @@ class CriticVerdict(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v):
-        # Models routinely express confidence as a 0–100 percentage (e.g. 60) rather
-        # than a 0–1 probability. Coerce and clamp instead of rejecting: a benign scale
-        # difference must not discard an otherwise-valid verdict (or, worse, crash the
-        # run). Non-numeric input falls back to the neutral default.
+        # 模型常以 0–100 百分比表达置信度，而非 0–1 概率；转换并钳制数值，避免良性的尺度差异丢弃有效评审或使研究崩溃。非数字回退到中性默认值。
         try:
             f = float(v)
         except TypeError, ValueError:
@@ -148,26 +131,18 @@ class CriticVerdict(BaseModel):
     @field_validator("feedback_for_executor")
     @classmethod
     def _feedback_required_on_fail(cls, v: str | None, info) -> str | None:
-        # When a verdict fails, the executor needs something actionable.
+        # 未通过的评审必须给执行器提供可执行的改进意见。
         if info.data.get("passed") is False and not (v and v.strip()):
             return "Insufficient evidence; gather more independent, well-cited sources."
         return v
 
 
 class Source(BaseModel):
-    """A numbered citation the UI renders (docs/05 §1 — sessions.sources).
+    """界面渲染的一条编号引用（docs/05 §1，sessions.sources）。
 
-    A single page routinely supports several distinct facts, and the executor extracts a
-    separate verbatim snippet for each. Keeping only one of them — as this schema did
-    until docs/12 M5 defect D3 — meant a citation chip could show a snippet that had
-    nothing to do with the sentence it was attached to, since the same source is cited
-    for ~8 different claims on average. That quietly broke the product's central promise:
-    hover a citation, read the text that backs *this* claim.
-
-    So `snippets` holds every distinct snippet extracted from the source. `snippet` is
-    retained as the first one for backward compatibility with `sessions.sources` rows
-    written before the fix and with any client reading the old shape.
-    """
+    同一页面往往支持多个事实，执行器会分别提取逐字片段；若只保存一个，
+    引用提示可能展示与当前句子无关的内容，违背悬停后可核查本条主张的承诺。
+    snippets 保存该来源全部不同片段；snippet 仍保留首条，兼容旧 sessions.sources 行及旧客户端。"""
 
     index: int
     url: str
@@ -177,12 +152,10 @@ class Source(BaseModel):
 
 
 class ContradictionPair(BaseModel):
-    """One direct conflict between two sources (docs/12 M11).
+    """两个来源间的一组直接冲突（docs/12 M11）。
 
-    Both claims must be quoted from the snippets the detector was shown — the
-    validator in `contradictions.py` drops any pair whose source URL was not in
-    the evidence, so a hallucinated or injected source can never reach the report.
-    """
+    双方主张必须引自检测器实际看到的片段。contradictions.py 的校验器
+    丢弃来源 URL 不在证据中的冲突对，防止虚构或注入的来源进入报告。"""
 
     claim_a: str = Field(
         max_length=400,
@@ -214,9 +187,7 @@ class ContradictionPair(BaseModel):
 
 
 class ContradictionReport(BaseModel):
-    """The detector's structured output. `pairs` is capped, not rejected, on overflow:
-    surfacing ten real conflicts and dropping two is strictly better than failing the
-    whole check because a model was prolific."""
+    """检测器的结构化输出。pairs 超过上限时截断而非拒绝整批；展示十条真实冲突并舍弃两条，比因模型返回过多而让整个检查失败更有价值。"""
 
     pairs: list[ContradictionPair] = Field(default_factory=list)
 

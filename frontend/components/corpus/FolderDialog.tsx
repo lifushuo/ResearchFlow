@@ -17,10 +17,6 @@ export type FolderAction = "rename" | "move" | "delete";
 
 const TOP_LEVEL = "";
 
-function plural(n: number, one: string, many = `${one}s`): string {
-  return `${n} ${n === 1 ? one : many}`;
-}
-
 /**
  * Rename, move or delete one corpus folder (RFC V3.1 §7.1).
  *
@@ -55,7 +51,7 @@ export function FolderDialog({
   const pending = update.isPending || remove.isPending;
 
   const fail = (err: unknown) =>
-    toast.error(err instanceof ApiError ? err.message : "That did not work. Nothing was changed.");
+    toast.error(err instanceof ApiError ? err.message : "操作未成功，未做任何更改。");
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -79,7 +75,7 @@ export function FolderDialog({
         {
           onSuccess: (done) => {
             toast.success(
-              `Deleted ${plural(done.folders_deleted, "folder")} and ${plural(done.documents_deleted, "file")}`,
+              `已删除 ${done.folders_deleted} 个文件夹和 ${done.documents_deleted} 份文档`,
             );
             onClose();
           },
@@ -91,17 +87,17 @@ export function FolderDialog({
 
   const title =
     action === "rename"
-      ? `Rename “${folder.name}”`
+      ? `重命名“${folder.name}”`
       : action === "move"
-        ? `Move “${folder.name}”`
-        : `Delete “${folder.name}”?`;
+        ? `移动“${folder.name}”`
+        : `确定删除“${folder.name}”吗？`;
   const doomed = action === "delete" ? folderDeletion(tree, folder.id) : null;
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center p-4">
       <button
         type="button"
-        aria-label="Close without changing anything"
+        aria-label="关闭且不做更改"
         tabIndex={-1}
         onClick={onClose}
         className="absolute inset-0 bg-black/40"
@@ -122,7 +118,7 @@ export function FolderDialog({
 
           {action === "rename" && (
             <label className="mt-3 block text-sm text-text-secondary">
-              New name
+              新名称
               <input
                 ref={firstRef}
                 value={name}
@@ -135,14 +131,14 @@ export function FolderDialog({
 
           {action === "move" && (
             <label className="mt-3 block text-sm text-text-secondary">
-              Move into
+              移动到
               <select
                 ref={firstRef}
                 value={parent}
                 onChange={(e) => setParent(e.target.value)}
                 className="mt-1 block w-full border border-border bg-bg-elevated px-2 py-1 text-text-primary"
               >
-                <option value={TOP_LEVEL}>Top level</option>
+                <option value={TOP_LEVEL}>顶层目录</option>
                 {moveTargets(tree, folder.id).map((f) => (
                   <option key={f.id} value={f.id}>
                     {f.name}
@@ -156,17 +152,16 @@ export function FolderDialog({
             <div id="folder-dialog-consequence" className="mt-3 space-y-2 text-sm text-text-secondary">
               <p>
                 {doomed.subfolders > 0
-                  ? `This folder and its ${plural(doomed.subfolders, "subfolder")} will be removed. `
-                  : "This folder will be removed. "}
+                  ? `将删除此文件夹及其 ${doomed.subfolders} 个子文件夹。`
+                  : "将删除此文件夹。"}
                 <strong className="text-text-primary">
                   {doomed.files > 0
-                    ? `${plural(doomed.files, "file")} filed only here will be deleted, with every version.`
-                    : "No files will be deleted."}
+                    ? `仅存放于此处的 ${doomed.files} 份文档及其所有版本也将删除。`
+                    : "不会删除任何文档。"}
                 </strong>
               </p>
               <p>
-                Files also in another folder stay there. Research that cited a deleted file
-                keeps the quotes it gathered.
+                同时归属其他文件夹的文档会保留。引用过已删除文档的研究仍保留当时收集的引文。
               </p>
             </div>
           )}
@@ -179,14 +174,14 @@ export function FolderDialog({
               onClick={onClose}
               disabled={pending}
             >
-              Cancel
+              取消
             </button>
             <button
               type="submit"
               className={action === "delete" ? "btn btn-danger" : "btn btn-primary"}
               disabled={pending || (action === "rename" && !name.trim())}
             >
-              {action === "rename" ? "Rename" : action === "move" ? "Move" : "Delete folder"}
+              {action === "rename" ? "重命名" : action === "move" ? "移动" : "删除文件夹"}
             </button>
           </div>
         </form>

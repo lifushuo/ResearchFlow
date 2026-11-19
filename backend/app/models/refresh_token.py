@@ -1,4 +1,4 @@
-"""Server-side refresh-token records for rotation + revocation (docs/06 §1)."""
+"""服务端刷新令牌记录，支持轮换与吊销（docs/06 §1）。"""
 
 import uuid
 from datetime import datetime
@@ -13,7 +13,7 @@ from app.models.types import UuidType
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
-    # id doubles as the jti.
+    # 记录 ID 同时作为令牌 jti。
     id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         UuidType,

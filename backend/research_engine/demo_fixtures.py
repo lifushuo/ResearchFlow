@@ -1,22 +1,8 @@
-"""Content for the seeded demo session (docs/17 §6.1).
+"""首次启动演示会话的数据，见 docs/17 §6.1。
 
-Deliberately NOT `fakes.py`. Those are the *test* fixtures: their output is
-deterministic filler ("A citable fact [1]" citing "Fixture Source 1") because tests
-assert on it, and it must stay that way. Pointing a stranger's first launch at them
-made the product introduce itself with placeholder data — the one thing a tool whose
-claim is verifiability cannot afford.
-
-**The evidence here is real.** Both sources exist, and each `snippet` is verbatim text
-fetched from the URL it is attributed to (arXiv abstracts, retrieved 2026-08-15). That
-matters because the UI presents a snippet as the verbatim quote supporting a claim: an
-invented snippet under a real DOI would be a fabricated citation, which is the exact
-failure this product exists to make impossible. If you edit a snippet, re-fetch it —
-do not paraphrase.
-
-Every claim in `DEMO_REPORT` is supported by the snippet it cites and carries no number
-absent from that snippet, so the graph's own citation-fidelity pass leaves the draft
-untouched. `tests/test_demo_fixtures.py` enforces both properties.
-"""
+这里不同于测试占位数据。来源真实存在，片段逐字采自对应 arXiv 摘要，采集日期为 2026-08-15。
+修改片段必须重新抓取核对，不能改写后冒充原文。
+演示报告的每条 Claim 都由对应片段支持，不添加片段中没有的数字，由测试持续校验。"""
 
 from __future__ import annotations
 
@@ -29,8 +15,7 @@ from research_engine.fakes import ScriptedScenario, _ScriptedModel
 
 DEMO_QUERY = "What is retrieval-augmented generation, and when does it beat fine-tuning?"
 
-# Verbatim abstracts, fetched from the URLs below. Kept under the 500-char EvidenceChunk
-# cap (schemas.py) so they survive the executor contract unmodified.
+# 对应 URL 的逐字摘要，保持在 EvidenceChunk 的 500 字符上限内，避免执行器修改。
 DEMO_SOURCES: list[dict[str, Any]] = [
     {
         "index": 1,
@@ -68,9 +53,7 @@ DEMO_SOURCES: list[dict[str, Any]] = [
     },
 ]
 
-# No claim carries a digit: the graph's `_numbers_grounded` check requires every
-# number-like token to appear verbatim in a cited snippet, so a stray year would strip
-# the markers off an otherwise supported sentence. Dates belong in the source titles.
+# Claim 不带数字，因为 _numbers_grounded 要求数字逐字出现在证据中；日期放在来源标题。
 DEMO_REPORT = """# Retrieval-augmented generation versus fine-tuning
 
 ## Summary
@@ -108,7 +91,7 @@ reproduce this report.
 
 
 def demo_search(query: str, max_results: int) -> list[dict]:
-    """Search results for the demo: the real sources, never invented ones."""
+    """演示搜索结果只使用真实来源，不编造来源。"""
     return [
         {"title": s["title"], "url": s["url"], "snippet": s["snippet"]}
         for s in DEMO_SOURCES[:max_results]
@@ -116,9 +99,7 @@ def demo_search(query: str, max_results: int) -> list[dict]:
 
 
 def demo_read_webpage(url: str) -> dict:
-    """Page read for the demo. Returns the stored verbatim text for a known source and
-    fails closed for anything else — a demo must not invent a page body for a URL whose
-    content nobody captured."""
+    """演示网页读取只返回已采集来源的原文；其他 URL 明确拒绝，不能临时编造页面。"""
     for source in DEMO_SOURCES:
         if source["url"] == url:
             return {
@@ -131,13 +112,9 @@ def demo_read_webpage(url: str) -> dict:
 
 
 class _DemoModel(_ScriptedModel):
-    """The scripted model with demo content in place of test filler.
+    """用真实演示内容替代测试占位文本的脚本模型。
 
-    Subclasses rather than copies `_ScriptedModel`: the roles that are pure contract
-    plumbing (critic, contradiction detector, citation verifier) are inherited, so a
-    change to the graph's node contract updates both at once. Only the roles a user
-    actually reads are overridden.
-    """
+    继承 _ScriptedModel 的评审、矛盾检测和引用核验契约，仅覆盖用户实际阅读的角色输出。"""
 
     def _reply(self, messages: list[BaseMessage]) -> AIMessage:
         system = "\n".join(str(m.content) for m in messages if getattr(m, "type", "") == "system")

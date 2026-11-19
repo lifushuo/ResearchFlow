@@ -1,22 +1,6 @@
-"""
-Response and request bodies for the model-routing surface.
+"""模型路由接口共用的请求和响应结构。
 
-**Why these live in `app/schemas/` rather than beside the routes.** Both hosts serve
-`/models`, `/models/routing`, `/models/local/status`, `/models/custom/status` and
-`/models/providers/test`, and a shared route returning a different shape on one host is a
-UI that renders correctly in the web build and wrongly in the desktop build with nothing
-failing in between (AGENTS.md, "two hosts, one contract").
-
-The desktop could not declare these models while they sat in `app/api/v1/models.py`: that
-module imports `app.config`, and `Settings` requires `database_url` and `jwt_secret_key`,
-neither of which an installed app has. The packaged sidecar dies at import if it reaches
-them (#50). So the shapes moved here — pure pydantic, no configuration — and the route
-module re-exports them. Same relocation, and same reason, as `app/schemas/runs.py` and
-`app/services/document_headers.py`.
-
-Nothing in this module may import `app.config`, `app.db`, or anything reaching them;
-`tests/workflow/test_sidecar_startup.py` fails if that changes.
-"""
+两种主机必须返回一致字段；这些模型只依赖 Pydantic，不能依赖服务端 app.config 或 app.db，否则缺少数据库和 JWT 设置的桌面无法导入。路由模块继续重新导出以兼容旧位置。"""
 
 from __future__ import annotations
 
@@ -46,9 +30,9 @@ class CatalogResponse(BaseModel):
     presets: dict[str, dict[str, dict[str, str]]]
     preset_names: list[str]
     available_providers: list[str]
-    # What this user's runs use today: their saved preference, else the deployment's.
+    # 当前运行实际使用的路由：用户保存值优先，否则部署默认值。
     effective_routing: dict[str, str]
-    # None when the user has no preference of their own and is on the deployment default.
+    # 用户没有独立偏好、跟随部署默认时为 None。
     user_routing: dict[str, str] | None
     deployment_routing: dict[str, str]
 
@@ -70,20 +54,14 @@ class LocalLLMStatusResponse(BaseModel):
     models: list[LocalModelInfo]
     error: str | None
     hint: str | None
-    # "Not detected" used to conflate two states with different fixes
-    # (internal/07 Phase 2b): install vs. start.
+    # 区分未安装和未启动，两者需要不同操作，不能都叫未检测到（internal/07 Phase 2b）。
     install_state: Literal["running", "installed_not_running", "not_installed"]
 
 
 class CustomEndpointStatusResponse(BaseModel):
-    """What the configured OpenAI-compatible endpoint says it can serve.
+    """自定义兼容端点实际报告的模型 ID 列表。
 
-    `models` is a bare list of ids rather than `ModelInfo`, and deliberately so: this
-    provider has no catalog entry, so there is no price, context window or capability flag
-    to report. Dressing the ids up in the same shape as catalogued models would invent
-    fields whose only honest value is null — and a `0.0` price here would silently read as
-    "free" for a gateway that bills.
-    """
+    不套用目录 ModelInfo，因为端点没有可验证的价格、上下文或能力数据；不能补造零价格冒充免费。"""
 
     configured_base_url: str
     reachable: bool
@@ -93,18 +71,17 @@ class CustomEndpointStatusResponse(BaseModel):
 
 
 class ReadinessResponse(BaseModel):
-    """Whether this user can run research at all right now (docs/17 §8a)."""
+    """当前用户是否真正具备启动研究的条件（docs/17 §8a）。"""
 
     ready: bool
-    # Which half is satisfied, so the UI can say something specific rather than
-    # "not configured" — the two have completely different next steps.
+    # 分别报告哪些条件满足，便于界面给出具体下一步，不能只说未配置。
     has_cloud_key: bool
     local_reachable: bool
     local_chat_models: int
 
 
 class ProviderTestRequest(BaseModel):
-    """A key to probe before it is stored (internal/07 Phase 2a)."""
+    """保存前待探测的密钥（internal/07 Phase 2a）。"""
 
     model_config = {"str_strip_whitespace": True}
 
@@ -123,21 +100,19 @@ class RoutingResponse(BaseModel):
 
 
 class PromptDefault(BaseModel):
-    """One role's editable shipped prompt (scope freeze §12, D-1)."""
+    """单个角色可编辑的默认提示词（范围冻结 §12，D-1）。"""
 
     role: str
-    # The shipped text with the untrusted-content note removed — the part a user replaces.
+    # 移除不可信内容说明后的默认文本，也就是用户实际替换的部分。
     default_prompt: str
-    # True when the system adds that note before and after a replacement for this role.
+    # 若系统会在替换内容前后补上安全说明，则为 True。
     untrusted_content_framed: bool
 
 
 class PromptDefaultsResponse(BaseModel):
-    """`GET /models/prompt-defaults` — what the per-role prompt editors start from.
+    """提示词编辑器的初始默认内容。
 
-    A property of the build, identical for every caller and on both hosts: no user state,
-    no protected purpose, no hash. A user's own overrides come from `GET /auth/me`.
-    """
+    由构建决定，对所有用户和主机相同，不包含用户状态、受保护用途或哈希；用户覆盖另由 GET /auth/me 获取。"""
 
     max_chars: int
     roles: list[PromptDefault]

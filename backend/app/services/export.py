@@ -1,11 +1,6 @@
-"""
-Report export (docs/05 §3, docs/29): Markdown → styled HTML → PDF.
+"""报告导出流程：Markdown 转安全样式 HTML，再转 PDF（docs/05 §3，docs/29）。
 
-WeasyPrint links native Pango/Cairo libraries. Those are present in the Docker image
-but not necessarily in a bare dev environment, so it is imported lazily inside
-`render_pdf` — the API (and the `.md` export) start fine without them, and only the PDF
-endpoint surfaces a clear error when the libraries are missing.
-"""
+WeasyPrint 需要原生 Pango/Cairo，放在 render_pdf 内延迟导入；开发环境缺库仍可启动 API 和导出 Markdown，仅 PDF 入口明确失败。"""
 
 from __future__ import annotations
 
@@ -14,14 +9,11 @@ import re
 
 import markdown as md
 
-# Re-exported so `research.py` can keep calling `export.render_model_attribution_md`.
-# The implementation lives in `research_engine.bundle` (not here) because the desktop
-# sidecar needs it too, and this module lazily imports WeasyPrint —
-# `test_sidecar_import_tree_excludes_weasyprint` pins that the sidecar process never
-# imports this module at all (docs/13 §7). Import it directly from there instead.
+# 模型署名实现统一放在 research_engine.bundle，供桌面直接使用。
+# 这里仅重新导出以兼容 research.py；桌面不应导入会间接涉及 WeasyPrint 的本模块。
 from research_engine.bundle import render_model_attribution_md  # noqa: F401
 
-# Print stylesheet — self-contained, no external assets (works offline in the renderer).
+# 打印样式完全自包含，不加载外部资源，渲染时可离线工作。
 _PDF_CSS = """
 @page { size: A4; margin: 2cm; }
 body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11pt;
@@ -47,17 +39,14 @@ pre { background: #f3f3f5; padding: 8pt; border-radius: 4px; overflow-x: auto; }
 .models code { background: none; padding: 0; }
 """
 
-# Matches single and grouped citation markers — `[1]` and `[1, 3]` alike.
+# 同时匹配单个与成组引用，例如 [1] 和 [1, 3]。
 #
-# The third place the single-number-only pattern appeared (docs/12 M5, defect D1). Here it
-# meant a grouped citation silently lost its superscript styling in exported .md and .pdf
-# reports, so the exported artifact rendered citations inconsistently with the app that
-# produced it. Each number is superscripted separately, matching how the UI chips them.
+# 成组引用要逐个转上标，与前端引用标记一致；仅匹配单编号会使导出样式悄悄丢失（docs/12 M5，D1）。
 _CITATION_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def _superscript_citations(match: re.Match[str]) -> str:
-    """`[1, 3]` → `<sup>[1]</sup><sup>[3]</sup>`, one marker per cited source."""
+    """把 [1, 3] 拆成两个来源各自的上标引用标记。"""
     return "".join(f"<sup>[{part.strip()}]</sup>" for part in match.group(1).split(","))
 
 
@@ -85,12 +74,9 @@ def _sources_html(sources: list[dict]) -> str:
 
 
 def _models_html(model_routing: dict[str, str] | None, checker_accuracy: dict | None) -> str:
-    """A role → route breakdown (requirement 1: disclosure "in the report/export").
+    """披露角色到实际模型路由的对应关系。
 
-    Empty when routing was never resolved — a run that failed before the planner, or a
-    report exported from before this field existed — never a guessed default (the
-    unmeasured-vs-zero rule).
-    """
+    尚未解析过路由的失败运行或旧报告返回空值，不猜默认模型。"""
     if not model_routing:
         return ""
     items = "".join(
@@ -112,9 +98,8 @@ def render_html(
     model_routing: dict[str, str] | None = None,
     checker_accuracy: dict | None = None,
 ) -> str:
-    """Full standalone HTML document for the report (used by the PDF renderer)."""
-    # Render inline [n] markers as superscripts before markdown conversion so they
-    # survive as <sup> in the output.
+    """生成报告的独立完整 HTML，供 PDF 渲染器使用。"""
+    # 先把正文 [n] 转成上标，再执行 Markdown 转换，确保输出保留 sup 标记。
     body_md = _CITATION_RE.sub(_superscript_citations, report_markdown or "")
     body_html = md.markdown(body_md, extensions=["extra", "sane_lists"])
     safe_title = html.escape(title)
@@ -134,11 +119,10 @@ def render_pdf(
     model_routing: dict[str, str] | None = None,
     checker_accuracy: dict | None = None,
 ) -> bytes:
-    """Render the report to PDF. Raises RuntimeError if WeasyPrint's native libs are
-    unavailable — the caller maps that to a clear 501."""
+    """将报告渲染为 PDF；缺少原生库时抛 RuntimeError，由调用方转换成清楚的 501。"""
     try:
         from weasyprint import HTML
-    except (OSError, ImportError) as e:  # missing Pango/Cairo native libs
+    except (OSError, ImportError) as e:  # 缺少 Pango/Cairo 原生库。
         raise RuntimeError(f"PDF rendering is unavailable in this environment: {e}") from e
 
     document = render_html(

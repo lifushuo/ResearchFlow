@@ -1,26 +1,12 @@
-"""
-Report outline templates (internal/07 Phase 4).
+"""报告大纲模板，见 internal/07 Phase 4。
 
-The four structures a researcher picks between at the design gate, held as **data** so
-there is exactly one copy of them. The alternative — a picker in the browser that knows
-the section list, and a prompt on the server that also knows it — is the shape of every
-drift bug catalogued in AGENTS.md, and here it would be silent: the UI would promise a
-structure the synthesizer never received.
-
-So the flow is: the picker asks the API for this catalog, sends back only a template
-*id*, `RunConfig.outline_template` carries that id, and `planner_node` resolves it into
-the `proposed_outline` the reviewer then edits. What the synthesizer is finally handed is
-the reviewer's edited list, not the template — the template is only the starting point.
-
-`custom` is deliberately empty: it means "I will author the sections myself at the gate",
-which is a different thing from "no outline" (that is `outline_template=None`, today's
-unconstrained synthesizer).
-"""
+模板集中存为数据，界面从 API 获取，只提交模板 ID。
+规划器展开后交用户编辑，综合器最终使用批准后的列表，避免界面承诺与实际提示词不一致。
+custom 空模板表示用户自己编写；None 表示无约束默认结构，含义不同。"""
 
 from __future__ import annotations
 
-#: template id → ordered sections. Titles become the report's `##` headings, and the
-#: description is guidance for the synthesizer rather than text that appears verbatim.
+#: 模板 ID 对应有序章节；标题成为 ## 标题，description 仅作生成指导。
 TEMPLATES: dict[str, dict] = {
     "literature_review": {
         "label": "Literature Review",
@@ -61,19 +47,15 @@ TEMPLATES: dict[str, dict] = {
 
 
 def sections_for(template_id: str | None) -> list[dict]:
-    """The sections a template id resolves to. Unknown or absent → no sections.
+    """返回模板章节；未知或缺失时返回空列表。
 
-    Never raises: this reads a value that arrives from a request, and a typo'd template
-    must degrade to today's unconstrained report rather than fail a run that has already
-    been paid for. The reviewer sees the empty outline at the gate either way, so the
-    mistake is visible before anything is spent.
-    """
+    不因请求拼写错误中断运行，回退无约束大纲，用户在研究花费前仍可看到并修改。"""
     template = TEMPLATES.get(template_id or "")
     return [dict(s) for s in template["sections"]] if template else []
 
 
 def catalog() -> list[dict]:
-    """The picker's payload: id, label, one-line summary, and the sections themselves."""
+    """返回选择器数据：ID、标签、单行摘要和章节列表。"""
     return [
         {
             "id": template_id,

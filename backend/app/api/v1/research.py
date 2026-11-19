@@ -1,11 +1,6 @@
-"""
-Research endpoints (docs/05 §3, docs/02 §2/§5).
+"""研究会话接口（docs/05 §3，docs/02 §2/§5）。
 
-Auth is cookie-based (works with native EventSource). The SSE stream replays the
-durable agent_logs (honoring Last-Event-ID) before tailing live Redis events, so a
-reconnecting client loses nothing. Approval writes an audit_log row and resumes the
-pipeline from its checkpoint.
-"""
+Cookie 鉴权兼容浏览器 EventSource。SSE 先按 Last-Event-ID 回放持久日志，再监听 Redis，防止断线丢消息。批准会记录审计，并从检查点恢复流程。"""
 
 from __future__ import annotations
 
@@ -63,9 +58,8 @@ from app.workers.dispatch import get_session_dispatcher
 from research_engine import bundle
 from research_engine.events import make_event
 
-#: Replay ends at a true terminal only; the live tail also ends at a gate, because a
-#: suspended graph publishes nothing more until a human acts. Both hosts and both surfaces
-#: use these two lists — see `app/services/event_stream.py` for why they must differ.
+# 历史回放只在真正终态停止，实时监听还在人工关卡停止，因为图等待人工操作时不会继续发消息。
+# 两种主机和两种研究入口共用这些列表，区别原因见 app/services/event_stream.py。
 _REPLAY_STOP_EVENTS = ("COMPLETED", "FAILED")
 _TERMINAL_EVENTS = ("COMPLETED", "FAILED", "HITL_READY", "PLAN_READY")
 
@@ -81,8 +75,7 @@ async def start_research(
     _rl: None = Depends(enforce_research_rate_limit),
     dispatcher: SessionDispatcher = Depends(get_session_dispatcher),
 ):
-    # Monthly token ceiling (0 = unlimited). Checked before enqueueing so a
-    # capped user gets a clear 402 instead of a session that fails mid-run.
+    # 入队前检查月度 Token 上限，0 表示不限。超额时立即返回清楚的 402，而不是等任务执行中途失败。
     if current_user.monthly_token_limit > 0:
         used = await usage.monthly_tokens(db, current_user.id)
         if used >= current_user.monthly_token_limit:
@@ -95,9 +88,8 @@ async def start_research(
                 ),
             )
 
-    # Per-run model choice, validated here so an unroutable model is rejected before a
-    # session exists rather than failing inside the worker minutes later. None means
-    # "use my saved settings", which the runner resolves (user → deployment).
+    # 在创建会话前校验本次模型选择，避免任务跑起来后才发现路由无效。
+    # None 表示沿用已保存设置，之后按用户、部署顺序解析。
     routing = None
     if payload.model_routing:
         try:
@@ -105,8 +97,7 @@ async def start_research(
         except model_routing.InvalidRouting as e:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
-    # Resolve the target project (404s if it isn't this user's), or fall back to their
-    # default so a first-time account can start research without creating one first.
+    # 解析目标项目并检查归属；未指定则使用默认项目，让新用户可以直接开始。
     project = await resolve_project(db, current_user.id, payload.project_id)
 
     session = Session(
@@ -116,14 +107,12 @@ async def start_research(
         status=SessionStatus.PENDING,
         research_depth=payload.depth,
         model_routing=routing,
-        # Both of these were accepted by the request schema and then dropped on the floor:
-        # the session took the column default instead, so "Restrict to uploaded corpus"
-        # silently ran an ordinary web search. Persist what the caller actually asked for.
+        # 这些字段虽然被请求结构接受，也必须真正存入会话记录。
+        # 否则会退回列默认值，导致用户选择仅用上传语料，实际却进行了网页搜索。
         corpus_mode=payload.corpus_mode,
         demo=payload.demo,
-        # Research design gate (internal/07 Phase 4). Same rule as the two above and the
-        # same reason they are commented: a request field that never reaches the row is
-        # a promise the run does not keep. `_run_config_for` reads all three back.
+        # 计划关卡同样必须持久化，_run_config_for 恢复时会读取这些选项（internal/07 Phase 4）。
+        # 只接受请求却不存记录，会让执行行为违背用户选择。
         skip_plan_gate=payload.skip_plan_gate,
         topic_seeds=payload.topic_seeds or None,
         outline_template=payload.outline_template,
@@ -133,8 +122,7 @@ async def start_research(
     await db.refresh(session)
 
     await dispatcher.start(str(session.id), str(current_user.id))
-    # Bind the run's correlation identity so the trigger log joins with the Celery
-    # task and engine logs under one correlation_id (= session_id).
+    # 绑定本次会话的 correlation_id，让触发请求、Celery 任务与引擎日志可以串联。
     bind_session_context(str(session.id), user_id=str(current_user.id))
     logger.info("research_started", session_id=str(session.id))
     return ResearchStartResponse(session_id=session.id, status=session.status)
@@ -149,15 +137,9 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List this user's sessions, optionally scoped to one project.
+    """列出当前用户的会话，可按项目筛选。
 
-    `archived` selects one list or the other rather than merging them: archiving exists
-    to get a session *out* of the way, so the default view must never include it, and
-    the archive is a deliberate destination rather than a filter people stumble into.
-
-    `project_id` is validated for ownership before it reaches the query, so it can never
-    be used to read another user's project.
-    """
+    活动和归档列表分开，默认不混入归档会话；项目筛选前必须验证归属，避免越权。"""
     limit = max(1, min(limit, 100))
     filters = [
         Session.user_id == current_user.id,
@@ -187,13 +169,9 @@ async def list_sessions(
 
 @router.get("/outline-templates", response_model=list[OutlineTemplateSchema])
 async def list_outline_templates(_: User = Depends(get_current_user)):
-    """The report structures offered at the design gate (internal/07 Phase 4).
+    """返回计划审核可选的报告结构（internal/07 Phase 4）。
 
-    Served from `research_engine.outlines` rather than hardcoded in the picker, so the
-    sections the UI previews are the sections the synthesizer is actually given. Declared
-    above `/{session_id}` because that route parses its segment as a UUID and would 422
-    this path rather than falling through to it.
-    """
+    直接读取引擎 outlines，保证预览与综合器收到的章节一致。静态路由放在 UUID 路由前，避免被误当会话 ID 而返回 422。"""
     from research_engine import outlines
 
     return [OutlineTemplateSchema.model_validate(t) for t in outlines.catalog()]
@@ -210,8 +188,7 @@ async def get_session(
 
 
 async def _cited_session_store(db, session_id, document_id, current_user, corpus, also_in):
-    """A session's twin of `runs._cited_store`. Sessions record no corpus identity and no
-    selection, so the only rules that apply are ownership and "a source it recorded"."""
+    """会话版引用语料定位。会话没有冻结语料身份或文件选择，因此仅检查归属及来源是否确实被该会话记录。"""
     session = await _authorized_session(db, session_id, current_user.id)
     store = await cited_documents.store_holding(
         corpus,
@@ -237,7 +214,7 @@ async def get_cited_document_text(
     corpus: CorpusLocator = Depends(get_corpus_locator),
     also_in: list[uuid.UUID] = Depends(cited_documents.no_other_projects),
 ):
-    """The extracted text of one document version this session cited (RFC V3.1 §7.3)."""
+    """读取该会话引用的文档版本的提取正文（RFC V3.1 §7.3）。"""
     store = await _cited_session_store(db, session_id, document_id, current_user, corpus, also_in)
     found = await store.extracted(document_id)
     if found is None:
@@ -254,7 +231,7 @@ async def download_cited_document(
     corpus: CorpusLocator = Depends(get_corpus_locator),
     also_in: list[uuid.UUID] = Depends(cited_documents.no_other_projects),
 ):
-    """The original file of one document version this session cited."""
+    """读取该会话引用的文档版本的原始文件。"""
     store = await _cited_session_store(db, session_id, document_id, current_user, corpus, also_in)
     found = await store.blob(document_id)
     if found is None:
@@ -282,14 +259,11 @@ async def stream_events(
 
         channel = f"session:{session_id}:events"
         pubsub = redis.pubsub()
-        # Subscribe BEFORE snapshotting the backlog. Any event published in the gap
-        # between the snapshot and the subscribe would otherwise be lost from both —
-        # which stranded fast resume→COMPLETED runs on the monitor. Now such an event
-        # is queued on the pubsub and deduped against the backlog by its durable id.
+        # 先订阅再拍历史快照，避免两步之间发布的事件在历史和实时流中都丢失。
+        # 重复事件按持久 ID 去重，快速恢复后立即完成的任务也不会被漏掉。
         await pubsub.subscribe(channel)
         try:
-            # Snapshot the backlog AFTER subscribing. Uses a fresh session because the
-            # request-scoped one is closed once the endpoint returns and streaming begins.
+            # 订阅之后用新数据库会话读取历史；请求自己的会话会在响应进入流式阶段时关闭，不能继续使用。
             async with AsyncSessionLocal() as sdb:
                 backlog = (
                     (
@@ -303,9 +277,8 @@ async def stream_events(
                     .all()
                 )
 
-            # The loop is `app/services/event_stream.py`, shared with the run stream and
-            # both desktop streams. This route keeps only what genuinely differs: the
-            # backlog query and the Redis subscription.
+            # 监听循环由 app/services/event_stream.py 统一实现。
+            # 本路由只保留实际不同的历史查询和 Redis 订阅方式。
             async for frame in sse_frames(
                 connected={"type": "connected"},
                 backlog=[(row.id, row.payload) for row in backlog],
@@ -327,29 +300,16 @@ async def stream_events(
     )
 
 
-#: The demo banner and the "stamped iff demo" rule now live in `research_engine.bundle`,
-#: the host-agnostic export home, so the desktop sidecar stamps `.md` identically (#52).
-#: Aliased here because this module and `runs` have always referred to `_DEMO_STAMP`.
+# 演示标记规则统一位于不依赖主机的 research_engine.bundle，确保桌面 Markdown 导出一致。
+# 保留 _DEMO_STAMP 别名，兼容既有引用位置。
 _DEMO_STAMP = bundle.DEMO_STAMP_MD
 
 
 def _report_or_404(session: Session, *, stamp_demo: bool = True) -> str:
-    """The report to export, stamped in place if this session was a demo.
+    """取得待导出的报告；演示会话默认加上演示说明。
 
-    Every export route funnels through here on purpose, and stamping is the default:
-    stamping at each call site would work until someone adds a fourth export and forgets,
-    and an unstamped demo report is indistinguishable from real research the moment it
-    leaves the app.
-
-    `stamp_demo=False` exists for exactly one caller, the bundle. A bundle is a
-    *verifiable* artifact: `report_hash` is checked against the `draft_hash` recorded when
-    the human approved the draft, so injecting prose into the report body afterwards
-    breaks the approval chain and makes every demo bundle fail verification for a reason
-    that has nothing to do with its integrity. Teaching a reader that FAIL is normal for
-    demos would defeat the verifier far more thoroughly than a missing banner. The bundle
-    carries its provenance in the hash-covered `demo` field instead, and the verifier
-    prints it above the verdict.
-    """
+    所有文字导出走同一入口，避免新增导出格式时忘记标记，使演示被误认为真实研究。
+    证据包唯一例外使用 stamp_demo=False：批准链验证正文哈希，批准后插入说明会破坏它。证据包改以受哈希保护的 demo 字段说明身份。"""
     report = session.final_report or session.draft_report
     if not report:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="No report available to export.")
@@ -386,7 +346,7 @@ async def export_pdf(
             report, session.sources or [], title=title, model_routing=session.model_routing
         )
     except RuntimeError as e:
-        # Native PDF libs unavailable in this environment (docs/09 §1 bakes them in).
+        # 当前环境缺少 PDF 原生库；正式镜像应按 docs/09 §1 包含这些依赖。
         raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
     filename = f"research-{str(session.id)[:8]}.pdf"
     return Response(
@@ -409,9 +369,8 @@ async def export_bundle_json(
             detail="Bundle export is only available for COMPLETED sessions.",
         )
 
-    # Unstamped on purpose — see `_report_or_404`. The bundle's `demo` field carries the
-    # provenance and is covered by `bundle_hash`; prose in the report body would break the
-    # approval-chain check instead.
+    # 证据包正文不追加演示标记，原因见 _report_or_404。
+    # 演示身份在受 bundle_hash 保护的 demo 字段中披露，避免破坏正文批准链。
     report = _report_or_404(session, stamp_demo=False)
 
     agent_logs = (
@@ -499,13 +458,9 @@ async def get_plan(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """The research design this run is working from (internal/07 Phase 4).
+    """读取本次实际使用的研究计划（internal/07 Phase 4）。
 
-    404 rather than an empty plan when `plan_json` is null: a run that skipped the gate,
-    or has not reached it, has no design to show, and returning `{"tasks": []}` for that
-    would read as "the planner proposed nothing" — a measurement that was never taken
-    rendering as zero, which is the failure mode AGENTS.md opens with.
-    """
+    plan_json 为空时返回 404，不能伪造空任务列表；未到达或跳过关卡表示没有可展示计划，不代表规划器实测提案为零项。"""
     session = await _authorized_session(db, session_id, current_user.id)
     if session.plan_json is None:
         raise HTTPException(
@@ -523,18 +478,10 @@ async def submit_plan(
     current_user: User = Depends(get_current_user),
     dispatcher: SessionDispatcher = Depends(get_session_dispatcher),
 ):
-    """Approve the research design, with edits, and let the run continue.
+    """批准并可编辑研究计划，然后继续执行。
 
-    Mirrors `approve_or_rework` deliberately, down to the 409: resuming a thread that is
-    not suspended at `plan_gate_node` would push a plan-shaped payload into whichever
-    interrupt is actually pending, and `hitl_gate_node` reads `decision["approved"]` —
-    absent here — as a rejection, silently counting a rework nobody asked for.
-
-    The decision is written to the row *before* the resume is queued, so the record of
-    what a human chose survives a worker that dies mid-run. That is the same ordering
-    the approval path uses for its `AuditLog`, and for the same reason: the human's
-    decision is evidence, and evidence is written when it is made.
-    """
+    必须确认当前停在计划关卡，否则把计划负载交给报告关卡会被误解成拒绝。
+    先保存人工决定再入队恢复，保证即使 Worker 随后崩溃，审核事实仍可追溯。"""
     session = await _authorized_session(db, session_id, current_user.id)
     if session.status != SessionStatus.AWAITING_PLAN:
         raise HTTPException(
@@ -543,8 +490,7 @@ async def submit_plan(
         )
 
     proposed = (session.plan_json or {}).get("tasks") or []
-    # None means "unedited" — keep the proposal. Not the same as `[]`, which is a
-    # reviewer who excluded everything and gets the 422 below.
+    # None 表示未编辑，沿用提案；[] 表示排除全部任务，应返回 422。
     tasks = [t.model_dump() for t in payload.tasks] if payload.tasks is not None else proposed
     outline = (
         [s.model_dump() for s in payload.outline]
@@ -559,8 +505,7 @@ async def submit_plan(
             detail="Keep at least one task — a plan with nothing in it researches nothing.",
         )
 
-    # Store what was decided, not what was proposed: `kept` is the list the executor will
-    # actually run, so a later reader of this endpoint sees the design behind the report.
+    # 保存实际获批的 kept，不是未筛选提案；后续查询应看到报告真正执行的研究设计。
     session.plan_json = {"tasks": kept}
     session.outline_json = {"sections": outline}
     session.plan_approved_at = datetime.now(UTC)
@@ -570,8 +515,7 @@ async def submit_plan(
             user_id=current_user.id,
             action="plan_approved",
             feedback=None,
-            # The design a human signed off on, hashed the same way the draft is at the
-            # other gate, so the bundle's approval chain can carry both decisions.
+            # 对人工批准的计划计算哈希，与草稿审核规则一致，使证据包能携带两次决定。
             draft_hash=hashlib.sha256(
                 json.dumps({"tasks": kept, "outline": outline}, sort_keys=True).encode("utf-8")
             ).hexdigest(),
@@ -641,16 +585,9 @@ async def cancel_session(
     current_user: User = Depends(get_current_user),
     emit_terminal_event: TerminalEventEmitter = Depends(get_terminal_event_emitter),
 ):
-    """Stop an in-progress research run.
+    """请求停止在途会话，并持久记录终止事件。
 
-    `emit_terminal_event` writes the FAILED event durably before publishing it — this
-    used to call `publish_event` directly, which only ever reached a *live* listener. A
-    client that reconnected to the stream after the cancel (rather than watching it
-    happen) got the row's terminal `status` on its next fetch but no matching entry in
-    the stream's own replay, because nothing durable was ever written for this one event.
-    `data.reason` — not `message` — matches the convention `session_events.lifecycle_event`
-    already established for every other terminal event; `make_event` is the same builder.
-    """
+    emit_terminal_event 先落盘 FAILED 再发布，断线后重连也能回放取消事件；直接 publish_event 只对当时在线的客户端可见。原因使用 data.reason，沿用既有生命周期事件结构。"""
     session = await _authorized_session(db, session_id, current_user.id)
     if session.status not in (SessionStatus.RUNNING, SessionStatus.PENDING):
         raise HTTPException(
@@ -660,10 +597,8 @@ async def cancel_session(
 
     session.status = SessionStatus.FAILED
     session.error_message = "Research stopped by user."
-    # Durable, and the reason the run cannot be un-stopped by its own outcome (issue #54).
-    # This replaces a `session:{id}:cancelled` Redis key that carried a 1h TTL and which a
-    # repository-wide search found no reader for — it never did anything, and could not have
-    # survived a worker restart if it had. `_persist_outcome` reads this instead.
+    # 把取消持久化，后续结果不能推翻它。
+    # 此前带一小时 TTL 的 Redis 取消键没有读取方，也无法可靠跨重启；现在 _persist_outcome 读取数据库决定。
     session.cancelled_at = datetime.now(UTC)
     await db.commit()
     await db.refresh(session)
@@ -682,7 +617,7 @@ async def archive_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Move a session out of the active list. Reversible, loses nothing."""
+    """从活动列表归档会话；可以恢复，不丢失数据。"""
     session = await _authorized_session(db, session_id, current_user.id)
     if session.archived_at is None:
         session.archived_at = datetime.now(UTC)
@@ -711,14 +646,9 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Permanently delete a session and everything derived from it.
+    """永久删除会话及其派生内容。
 
-    Agent logs, chat messages, and audit rows go with it via ON DELETE CASCADE. The
-    LangGraph checkpoints are keyed by thread id in tables we do not own, so they are
-    dropped explicitly — otherwise "delete" would leave the full agent state (including
-    fetched page content) behind, which is exactly what a user deleting a session is
-    asking us not to do.
-    """
+    代理日志、聊天和审计通过外键级联删除；LangGraph 检查点属于独立表，必须按 thread ID 显式删除，避免残留完整研究状态和网页正文。"""
     session = await _authorized_session(db, session_id, current_user.id)
     if session.status == SessionStatus.RUNNING:
         raise HTTPException(
@@ -726,15 +656,15 @@ async def delete_session(
             detail="This session is still running. Wait for it to finish before deleting.",
         )
 
-    # Explicit and guarded — see `memory.purge_report`. The relationship no
-    # longer cascades, because a cascade promises a table one host does not have.
+    # 项目记忆需要显式且有条件清理，规则见 memory.purge_report。
+    # 不能配置无条件级联，因为桌面主机没有这张记忆表。
     await memory.purge_report(db, session_id)
     await db.delete(session)
     await db.commit()
 
     try:
         await checkpoints.delete_thread(str(session_id))
-    except Exception as e:  # noqa: BLE001 — the user's rows are gone; log and move on
+    except Exception as e:  # noqa: BLE001 — 用户记录已删除；后续清理失败只记录日志
         logger.warning("checkpoint_cleanup_failed", session_id=str(session_id), error=str(e))
 
     logger.info("session_deleted", session_id=str(session_id))

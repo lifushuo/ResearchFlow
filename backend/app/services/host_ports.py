@@ -1,20 +1,7 @@
-"""
-`Depends(...)` providers for the server's implementations of `app.ports` (docs/13 §5.2).
+"""供 FastAPI 注入服务端 app.ports 实现的工厂（docs/13 §5.2）。
 
-Lives here rather than in `app.adapters` for the same reason `get_run_dispatcher` lives
-in `app.workers.dispatch` rather than in `app.run_dispatch`: `app.adapters` imports
-`app.db.redis` at module scope, and the routes these providers serve — `projects.py`,
-`corpus.py`, `research.py` — are imported by the desktop at *request* time to delegate
-to them. An import at module scope here would pull `redis` into the sidecar's
-request-time tree, which `research-sidecar.spec` excludes and `test_sidecar_startup.py`'s
-`test_lazy_v2_imports_pull_in_no_excluded_package` catches.
-
-Every import below is deferred to the call. The desktop never actually calls these — it
-passes its own `CorpusLocator`/`CheckpointDeleter` explicitly to the shared handler, the
-same pattern `get_run_dispatcher` documents — so the deferred imports never execute there;
-they only need to resolve as names when this module is imported, which is why the module
-itself stays clean while its function bodies are not.
-"""
+路由会在桌面请求时导入，因此这里不能在模块顶部导入 adapters，否则会连带引入桌面未打包的 Redis 和配置。
+服务端实现都延迟到函数调用时导入；桌面直接传自己的端口，因此不会执行这些导入。"""
 
 from __future__ import annotations
 
@@ -22,39 +9,27 @@ from app.ports import CheckpointDeleter, CorpusLocator, TerminalEventEmitter
 
 
 def get_corpus_locator() -> CorpusLocator:
-    """FastAPI dependency: this deployment's corpus convention.
+    """注入部署的语料定位器。
 
-    A plain `ServerCorpusLocator()` instantiation used to sit inline in route bodies —
-    harmless on the server, but it meant those bodies could never run unmodified on a
-    host with a different corpus convention. This is the seam: the desktop passes its own
-    locator over its one flat store directly, and the route stops knowing which host it is.
-    """
+    避免在共用路由里直接 new ServerCorpusLocator，让桌面可传自己的布局实现，路由无需辨认主机。"""
     from app.adapters import ServerCorpusLocator
 
     return ServerCorpusLocator()
 
 
 def get_checkpoint_deleter() -> CheckpointDeleter:
-    """FastAPI dependency: this deployment's way to drop a thread's checkpoint state.
+    """注入部署的检查点删除方式。
 
-    `checkpoints.delete_thread` already matches `CheckpointDeleter`'s call shape
-    (`async (thread_id: str) -> None`), so the server's implementation of the port is
-    that function itself — no wrapper class needed, unlike the corpus locator above.
-    """
+    checkpoints.delete_thread 已匹配异步协议，直接作为实现，不再包装多余类。"""
     from app.services import checkpoints
 
     return checkpoints.delete_thread
 
 
 def get_terminal_event_emitter() -> TerminalEventEmitter:
-    """FastAPI dependency: how this deployment writes and publishes one event outside
-    the pipeline's own event flow.
+    """注入图执行之外的单条事件写入与发布方式。
 
-    Reuses `agent_log_sink` rather than restating its write-then-publish-then-attach-id
-    ordering a second time — the factory already takes exactly `(db, session_id)`, so
-    this just calls the `EventSink` it returns once instead of for a whole run's worth
-    of events.
-    """
+    复用 agent_log_sink 的先提交再发布及附带 ID 规则，不再复制消息顺序。"""
     from app.adapters import agent_log_sink
 
     async def _emit(db, session_id: str, event: dict) -> None:

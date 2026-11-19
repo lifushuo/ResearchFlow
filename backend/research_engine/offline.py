@@ -1,35 +1,22 @@
-"""
-The Offline guarantee: every model call a run makes stays on this machine.
+"""Offline 保证本轮所有模型调用留在本机，见 RFC V3.1 §6.2。
 
-internal/rfcs/V3.1-corpus-scope.md §6.2. A separate guarantee from "only selected files",
-which limits what evidence may come from and says nothing about where model calls go. A run
-can satisfy either without the other, so the two are enforced and recorded independently.
-
-What this checks: the five role routes. A route is local when it is `ollama:` with an Ollama
-endpoint on this machine, or `custom:` with a custom endpoint on this machine. Every other
-provider is a cloud service by definition. Whether an endpoint is local is decided by
-`embeddings.is_local_endpoint` after `llm_factory.map_local_host` — the one implementation
-both of those already are, never a third copy.
-
-What it does not need to check: the embedder and the web. An Offline run is always a
-corpus-only run, so `read_webpage` and `web_search` refuse the web, and the corpus store
-already refuses a non-local embedder in corpus mode (`CorpusStore.
-_require_local_embedder_in_corpus_mode`).
-
-Scripted (`llm_mode="fake"`) runs call no model and are never refused.
-"""
+这与只用选中文件是不同承诺，分别检查记录。
+检查五个角色路由：Ollama 或 custom 必须实际指向本机，其余供应商属于远程服务。
+复用地址改写和本地判断，不复制第三套规则。
+Offline 同时采用仅资料库模式，因此网络工具已拒绝外网、资料库已拒绝远程嵌入。
+fake 模式不调用真实模型，不因路由被拒绝。"""
 
 from __future__ import annotations
 
 from research_engine.embeddings import is_local_endpoint
 from research_engine.runconfig import ROLES, RunConfig
 
-#: The prefix every refusal starts with, so a host and a test can recognise it.
+#: 所有拒绝消息共用前缀，供宿主与测试识别。
 OFFLINE_UNAVAILABLE = "offline_unavailable"
 
 
 def violations(cfg: RunConfig, *, custom_base_url: str = "") -> list[str]:
-    """One line per role whose model would leave this machine; empty when all stay local."""
+    """逐角色列出会外发的模型路由；全部本地则为空。"""
     if cfg.llm_mode == "fake":
         return []
     from research_engine.llm_factory import map_local_host
@@ -54,7 +41,7 @@ def violations(cfg: RunConfig, *, custom_base_url: str = "") -> list[str]:
 
 
 def refusal(cfg: RunConfig, *, custom_base_url: str = "") -> str | None:
-    """The failure message for an Offline run that cannot stay offline, or None."""
+    """返回不能满足 Offline 的原因；符合时返回 None。"""
     if not cfg.offline:
         return None
     found = violations(cfg, custom_base_url=custom_base_url)

@@ -1,31 +1,15 @@
-"""
-What the product refuses, and why — stated once, in the product's own terms.
+"""统一描述业务拒绝原因，不依赖 HTTP 传输。
 
-**Not HTTP.** A use case knows that a run belongs to someone else, or that a gate is not
-pending, or that this host has no project memory. It does not know whether that reaches a
-client as `404`, as a gRPC status, or as an exception in a library caller. Deciding here
-would make the application layer import one delivery mechanism — which is precisely what
-`tests/workflow/test_layer_boundaries.py` refuses, and what stopped `app/api/v1/runs.py`
-from being movable: it raised `HTTPException` at 13 sites while *both* hosts called it.
-
-The mapping to a status code lives in `app/services/error_responses.py`, which both hosts
-install. One table, so a status can only change in one place, and so the question "what
-does this product return when a run is not yours?" has an answer you can read rather than
-grep for.
-
-Nothing here may import FastAPI, the host, or anything under `desktop/`.
-"""
+业务层只判断不存在、越权、关卡不匹配或功能不支持，不决定 HTTP/gRPC 状态。FastAPI 映射统一在 app/services/error_responses.py，由两种主机安装。
+本模块禁止导入 FastAPI、主机基础设施或 desktop，保持应用层可共用。"""
 
 from __future__ import annotations
 
 
 class AppError(Exception):
-    """A refusal the product means, as opposed to a crash it did not.
+    """预期的业务拒绝，不同于意外崩溃。
 
-    `detail` is written for the person who will read it in the interface — `AGENTS.md`
-    requires that a guard which fires says which one and by how much, and a bare
-    "bad request" forces a source read to learn what happened.
-    """
+    detail 面向用户，应说明哪个限制被触发及超出多少，不能只写模糊的请求错误。"""
 
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
@@ -33,64 +17,43 @@ class AppError(Exception):
 
 
 class NotFound(AppError):
-    """The thing does not exist, **or is not yours**.
+    """对象不存在或不属于当前用户，两者使用同一错误。
 
-    Deliberately one error for both. Distinguishing them would confirm that a run exists to
-    someone who cannot read it, which is a disclosure the product does not need to make —
-    `research.py::_authorized_session` and `runs.py::_run_or_404` have always answered 404
-    rather than 403, and the parity suite asserts it on both hosts.
-    """
+    不区分可避免泄露他人的研究确实存在；服务端与桌面都按 404 处理。"""
 
 
 class Conflict(AppError):
-    """The request is well-formed and the current state refuses it.
+    """请求结构正确，但当前状态不允许操作。
 
-    The gates are the reason this exists: resuming a thread that is not suspended at the
-    matching interrupt pushes a plan-shaped payload into whichever interrupt is pending,
-    and `hitl_gate_node` reads a missing `approved` key as a rejection — silently counting
-    a rework nobody asked for.
-    """
+    例如必须在匹配的人工关卡恢复，否则计划负载可能被报告关卡误当成拒绝。"""
 
 
 class Invalid(AppError):
-    """The caller's input cannot be honoured — an unroutable model, an empty task list.
+    """输入结构正确但业务不能接受，例如模型不可路由或任务列表为空。
 
-    Distinct from FastAPI's own body validation, which rejects a malformed *shape* before
-    any of this runs and answers 422. This is a well-shaped request the domain refuses.
-    """
+    与框架在进入业务前拒绝的格式错误不同。"""
 
 
 class Unprocessable(AppError):
-    """Well-formed, understood, and semantically refused — answered `422`.
+    """输入结构正确、业务无法处理，对外返回 422。
 
-    `Invalid` and `Unprocessable` both mean "the domain will not accept this", and they are
-    two errors only because the product already answers two codes: the run surface has
-    always used `422` for an unknown depth, an unroutable model or an emptied task list,
-    while the corpus surface uses `400`. Phase 4 is a refactor, so it preserves both rather
-    than picking one — unifying them is a client-visible contract change and needs its own
-    decision, recorded as a follow-up in the plan.
-    """
+    与 Invalid 含义近似，但保留已有契约：运行接口使用 422，语料接口使用 400。统一状态码属于可见行为变更，不能借重构悄悄修改。"""
 
 
 class PayloadTooLarge(AppError):
-    """Well-formed, and simply too big to accept."""
+    """请求可以理解，但大小超过允许范围。"""
 
 
 class DependencyUnavailable(AppError):
-    """Something the product needs is not reachable right now — an embedding server, a
-    provider. Not the caller's mistake, and the difference between "fix your file" and
-    "try again later" is the whole value of separating it from `Invalid`."""
+    """所需向量服务或模型供应商暂不可达。
+
+    这是依赖故障，不是用户输入有误，应提示稍后重试，而不是要求用户改文件。"""
 
 
 class CapabilityUnavailable(AppError):
-    """This host does not have the feature, by product design.
+    """当前主机按产品设计不支持此能力。
 
-    Project memory is pgvector-only; server-side PDF is not in the desktop bundle. A `404`
-    would say "you asked wrong" and a `500` would say "we broke"; both are false. The
-    `capability` field is what lets a client branch on *which* thing is absent rather than
-    parsing prose, and it is what makes a capability difference observable instead of a
-    claim in a table.
-    """
+    例如桌面没有 pgvector 项目记忆或服务端 PDF 依赖；不能误报成用户请求错误或系统崩溃。capability 字段供客户端识别缺少哪种能力，不必解析提示文字。"""
 
     def __init__(self, detail: str, *, capability: str) -> None:
         super().__init__(detail)

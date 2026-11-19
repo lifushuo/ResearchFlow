@@ -1,11 +1,7 @@
-"""
-Pipeline event emission indirection (docs/02 §5, docs/05 §4).
+"""流水线事件发送的间接层，见 docs/02 §5、docs/05 §4。
 
-Graph nodes call `emit(...)`; the actual sink is a ContextVar-held async callable.
-The worker sets it to a sink that (1) inserts an agent_logs row for durable SSE
-replay and (2) publishes to Redis for live fan-out. In tests it defaults to a
-collector or no-op, so the graph runs with no DB/Redis.
-"""
+节点调用 emit，实际发送器由 ContextVar 提供。Worker 同时落库用于 SSE 回放并发布到 Redis。
+测试默认收集或忽略事件，因此引擎可以不依赖数据库与 Redis。"""
 
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ logger = structlog.get_logger()
 Emitter = Callable[[str, dict], Awaitable[None]]
 
 
-async def _noop(session_id: str, event: dict) -> None:  # pragma: no cover - trivial
+async def _noop(session_id: str, event: dict) -> None:  # pragma: no cover — 默认空实现
     return None
 
 
@@ -29,7 +25,7 @@ _emitter: ContextVar[Emitter] = ContextVar("pipeline_emitter", default=_noop)
 
 
 def set_emitter(fn: Emitter):
-    """Install an emitter for the current context. Returns the ContextVar token."""
+    """为当前上下文安装事件发送器，返回可恢复原设置的 ContextVar 令牌。"""
     return _emitter.set(fn)
 
 
@@ -45,14 +41,10 @@ def make_event(
     detail: dict | None = None,
     data: dict | None = None,
 ) -> dict:
-    """Build an event envelope without sending it.
+    """只构造事件，不发送。
 
-    Exposed so a host can emit *lifecycle* events (HITL_READY / COMPLETED / FAILED)
-    through its own sink at a moment of its choosing. The server host emits them only
-    after committing the session row, so a client that receives COMPLETED and
-    immediately re-fetches never sees a stale RUNNING status. Pipeline events from
-    graph nodes go through `emit` and the installed emitter instead.
-    """
+    宿主可在会话事务提交后再发 HITL_READY、COMPLETED、FAILED，
+    避免客户端收到完成通知后立即查询却仍看到 RUNNING。图内事件仍通过 emit 发送。"""
     return {
         "type": event_type,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -77,19 +69,15 @@ async def emit(
 
 
 async def _write_through_cancellation(write: Awaitable[None]) -> None:
-    """Let a sink write already under way land before a cancellation takes effect.
+    """取消生效前等待已经开始的事件写入完成。
 
-    A node's fan-out cancels the siblings of a failed task (`concurrency.gather_or_cancel`),
-    and a sibling is often inside `emit`. Cancelling there interrupts the host's commit
-    halfway — measured to leak the pooled connection on aiosqlite (desktop) and to drop it
-    on asyncpg — and leaves the event maybe-durable. A write takes milliseconds, so the
-    cancellation waits for it and is then honoured; no *new* write starts after it.
-    """
+    并发兄弟任务失败会触发取消；若在提交中途取消，可能泄漏或丢弃数据库连接。
+    因此先完成当前写入，再传播取消，不再启动新写入。"""
     task = asyncio.ensure_future(write)
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
-        # A second cancellation during the wait is absorbed the same way; the write lands.
+        # 等待期间再次收到取消，也先保证当前写入结束。
         while not task.done():
             try:
                 await asyncio.wait([task])

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useActiveProject } from "@/components/ActiveProject";
 import { SessionCard } from "@/components/SessionCard";
 import { useSessions } from "@/hooks/queries";
+import { researchDepthLabel } from "@/lib/format";
 import { STATUS_ORDER, statusMeta } from "@/lib/status";
 import type { SessionStatus } from "@/lib/types";
 
@@ -17,7 +18,7 @@ const LIMIT = 20;
  * and not filtered for.
  */
 const FILTERS: { value: SessionStatus | "ALL"; label: string }[] = [
-  { value: "ALL", label: "All" },
+  { value: "ALL", label: "全部" },
   ...STATUS_ORDER.map((value) => ({ value, label: statusMeta(value).label })),
 ];
 
@@ -34,10 +35,10 @@ const DEPTHS = ["fast", "balanced", "comprehensive"] as const;
  * unmeasured-as-zero bug wearing a filter.
  */
 const CITATION_BANDS = {
-  ALL: { label: "Any", match: () => true },
-  PERFECT: { label: "100% verified", match: (r: number | null) => r === 1 },
-  PARTIAL: { label: "Under 100%", match: (r: number | null) => r !== null && r < 1 },
-  UNMEASURED: { label: "Not measured", match: (r: number | null) => r === null },
+  ALL: { label: "不限", match: () => true },
+  PERFECT: { label: "100% 引用可定位", match: (r: number | null) => r === 1 },
+  PARTIAL: { label: "引用定位率低于 100%", match: (r: number | null) => r !== null && r < 1 },
+  UNMEASURED: { label: "未测量", match: (r: number | null) => r === null },
 } as const;
 
 export function SessionHistory() {
@@ -87,34 +88,33 @@ export function SessionHistory() {
             id="session-history"
             className="font-serif text-lg font-bold tracking-tight text-text-primary"
           >
-            {showArchived ? "Archived sessions" : "Sessions"}
+            {showArchived ? "已归档的旧版研究" : "旧版研究记录"}
           </h2>
           <p className="mt-0.5 max-w-2xl text-xs leading-relaxed text-text-muted">
-            Research recorded as sessions{active && <> in {active.name}</>}, before runs.
-            Readable, chattable and exportable; new research is recorded above.
+            旧版研究记录{active && <>，所属项目：{active.name}</>}。仍可阅读、追问和导出；新研究显示在上方列表。
           </p>
         </div>
         {/* Two independent axes, laid out as two controls: a single row of tabs would
             imply that picking a depth clears the status, which it does not. */}
         <div className="flex flex-wrap items-center gap-3">
           <label className="flex items-center gap-1.5 font-mono text-xs text-text-muted">
-            <span>Depth</span>
+            <span>研究深度</span>
             <select
               value={depth}
               onChange={(e) => setDepth(e.target.value as typeof depth)}
               className="border border-border bg-bg-surface px-2 py-1 font-mono text-xs text-text-primary"
             >
-              <option value="ALL">Any</option>
+              <option value="ALL">不限</option>
               {DEPTHS.map((d) => (
                 <option key={d} value={d}>
-                  {d}
+                  {researchDepthLabel(d)}
                 </option>
               ))}
             </select>
           </label>
 
           <label className="flex items-center gap-1.5 font-mono text-xs text-text-muted">
-            <span>Citations</span>
+            <span>引用定位率</span>
             <select
               value={band}
               onChange={(e) => setBand(e.target.value as keyof typeof CITATION_BANDS)}
@@ -130,13 +130,13 @@ export function SessionHistory() {
 
           {models.length > 1 && (
             <label className="flex items-center gap-1.5 font-mono text-xs text-text-muted">
-              <span>Model</span>
+              <span>模型</span>
               <select
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 className="max-w-[12rem] border border-border bg-bg-surface px-2 py-1 font-mono text-xs text-text-primary"
               >
-                <option value="ALL">Any</option>
+                <option value="ALL">不限</option>
                 {models.map((m) => (
                   <option key={m} value={m}>
                     {m}
@@ -146,7 +146,7 @@ export function SessionHistory() {
             </label>
           )}
 
-          <div className="flex flex-wrap gap-1" role="tablist" aria-label="Filter by status">
+          <div className="flex flex-wrap gap-1" role="tablist" aria-label="按状态筛选">
             {FILTERS.map((f) => (
               <button
                 key={f.value}
@@ -176,7 +176,7 @@ export function SessionHistory() {
                   : "bg-bg-surface text-text-muted border-border hover:text-text-primary"
               }`}
             >
-              {showArchived ? "← Active History" : "Archived"}
+              {showArchived ? "← 返回历史记录" : "已归档"}
             </button>
           </div>
         </div>
@@ -190,28 +190,28 @@ export function SessionHistory() {
         </div>
       ) : isError ? (
         <div className="card text-sm text-text-muted">
-          Couldn&apos;t load sessions.{" "}
+          无法加载旧版研究记录。{" "}
           <button onClick={() => refetch()} className="text-accent hover:underline">
-            Retry
+            重试
           </button>
         </div>
       ) : rows.length === 0 ? (
         <div className="card text-center">
           {showArchived ? (
             <p className="text-sm text-text-secondary">
-              Nothing archived. Archiving moves a session out of History without deleting it.
+              暂无归档记录。归档会将研究移出历史列表，但不会删除它。
             </p>
           ) : (
             <>
               <p className="text-sm text-text-secondary">
-                No sessions in {active ? `“${active.name}”` : "this project"}.
+                暂无旧版研究记录，所属项目：{active ? `“${active.name}”` : "当前项目"}。
               </p>
             </>
           )}
         </div>
       ) : visible.length === 0 ? (
         <div className="card text-center text-sm text-text-muted">
-          No sessions match this filter on this page.
+          本页没有符合筛选条件的旧版研究记录。
         </div>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2" aria-busy={isFetching}>
@@ -229,10 +229,10 @@ export function SessionHistory() {
             disabled={page <= 1 || isFetching}
             onClick={() => setPage((p) => Math.max(1, p - 1))}
           >
-            ← Prev
+            ← 上一页
           </button>
           <span className="text-sm text-text-muted tabular-nums">
-            Page {page} of {totalPages}
+            第 {page} 页，共 {totalPages} 页
           </span>
           <button
             type="button"
@@ -240,7 +240,7 @@ export function SessionHistory() {
             disabled={page >= totalPages || isFetching}
             onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
           >
-            Next →
+            下一页 →
           </button>
         </div>
       )}

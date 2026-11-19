@@ -67,9 +67,9 @@ describe("CitedPassage", () => {
     respond("paper.pdf");
     renderPassage(3);
 
-    await userEvent.click(await screen.findByRole("button", { name: "Open the PDF at page 3 →" }));
+    await userEvent.click(await screen.findByRole("button", { name: "打开 PDF 第 3 页 →" }));
 
-    const object = await screen.findByLabelText("paper.pdf (PDF preview)");
+    const object = await screen.findByLabelText("paper.pdf（PDF 预览）");
     expect(object.getAttribute("data")).toBe("blob:cited#page=3");
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/runs/r1/cited-documents/doc-1/download"),
@@ -81,6 +81,6 @@ describe("CitedPassage", () => {
     respond("notes.docx");
     renderPassage(null);
     await screen.findByText("The cited sentence is here.");
-    expect(screen.queryByRole("button", { name: /Open the PDF/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /打开 PDF/ })).toBeNull();
   });
 });

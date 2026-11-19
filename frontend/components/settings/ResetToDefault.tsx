@@ -1,11 +1,6 @@
 "use client";
 
-/**
- * Per-setting revert (internal/07 Phase 3) — "as much customization as possible"
- * survives only if every knob has a visible way back. Shown only when the current
- * value differs from the default; a reset link next to an already-default field is
- * noise with nothing to do.
- */
+/** 逐项恢复默认（internal/07 Phase 3）。自定义设置必须有清晰可见的还原路径；仅当当前值不同于默认值时显示，避免无意义的重置入口。 */
 export function ResetToDefault({
   isDefault,
   onReset,
@@ -20,7 +15,7 @@ export function ResetToDefault({
       onClick={onReset}
       className="font-mono text-[0.6875rem] text-accent hover:underline"
     >
-      Reset to default
+      恢复默认
     </button>
   );
 }

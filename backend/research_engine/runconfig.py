@@ -1,34 +1,10 @@
-"""
-Run-scoped engine configuration (docs/13 §4, docs/12 M6 step 1).
+"""运行范围的引擎配置，见 docs/13 §4、docs/12 M6。
 
-The agent package must not read `app.config` or the process environment. It is being
-extracted into a standalone `research_engine` package that has to run inside a desktop
-app with no Postgres, no Redis, and no `.env` file — see
-docs/architecture/13-local-and-self-hosted.md §2 for the measured coupling this removes.
-
-Everything the graph, the model factory, the retrievers, and the tools used to read
-from `settings` now arrives as a `RunConfig`.
-
-Two levels of installation, mirroring the emitter indirection in `events.py`:
-
-- `set_process_default(cfg)` — one baseline per process, installed by the host
-  (`app.runtime.install_process_default` for the API/worker/eval processes; the
-  desktop build will install one built from local config + OS keychain).
-- `set_run_config(cfg)` — a `ContextVar` override scoped to one run, so concurrent
-  runs in the same worker process can carry different model routing or budgets
-  (needed by docs/12 M8's per-session model picker).
-
-A `ContextVar` is used rather than threading config through `AgentState` because
-tools are invoked by LangGraph without access to state, and `retrievers.search()`
-is called from inside a tool — so state-threading cannot reach the retriever chain.
-This matches the two existing precedents in this package (`events._emitter` and
-`llm_factory._user_keys`).
-
-`get_run_config()` resolves override → process default → module defaults. The module
-defaults deliberately mirror `app/config.py`'s own field defaults exactly, so a host
-that forgets to install one degrades to today's out-of-the-box behaviour rather than
-to something subtly different. `tests/test_engine_boundary.py` pins that equivalence.
-"""
+引擎不读取 app.config 或进程环境，所需设置统一由宿主传入 RunConfig。
+set_process_default 安装进程基线；set_run_config 用 ContextVar 设置单轮覆盖，
+让同一进程中的并发运行可使用不同路由与预算。
+工具内部无法获得图状态，因此使用上下文配置而不是把设置塞进 AgentState。
+读取优先级为本轮覆盖、进程默认、模块默认；模块默认与服务端保持一致。"""
 
 from __future__ import annotations
 
@@ -37,10 +13,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal
 
-# Agent roles that resolve to a model. Keep in sync with `_ROLE_CONFIG` in llm_factory.
+# 需要模型路由的代理角色，与 llm_factory._ROLE_CONFIG 对应。
 ROLES: tuple[str, ...] = ("planner", "executor", "critic", "synthesizer", "chat")
 
-# Mirrors the MODEL_* defaults in app/config.py.
+# 与 app/config.py 的 MODEL_* 默认值一致。
 DEFAULT_MODELS: Mapping[str, str] = {
     "planner": "google:gemini-2.5-pro",
     "executor": "google:gemini-2.5-flash",
@@ -52,117 +28,79 @@ DEFAULT_MODELS: Mapping[str, str] = {
 
 @dataclass(frozen=True)
 class RunConfig:
-    """Immutable engine configuration for one process or one run.
+    """进程或单次运行使用的不可变引擎配置。
 
-    Field defaults mirror app/config.py. Provider keys here are the *deployment's*
-    keys; a user's own BYOK key is overlaid per-run by `llm_factory.set_user_keys`
-    and takes precedence (docs/06).
-    """
+    默认值与 app/config.py 一致；此处携带部署密钥，用户 BYOK 密钥由 set_user_keys 逐运行优先覆盖。"""
 
     llm_mode: Literal["real", "fake"] = "real"
-    # Selects the *content* the scripted models produce, not whether they are scripted:
-    # a demo run is `llm_mode="fake", demo=True` (docs/17 §6.1). Deliberately not a third
-    # `llm_mode` value — every `llm_mode == "fake"` comparison in the engine gates a
-    # no-network guard, and a missed one would send a demo run to a real provider. As a
-    # separate flag the worst case is a demo showing test filler, never a surprise call.
+    # 仅选择脚本输出内容，不决定是否脚本运行。演示采用 llm_mode=fake、demo=True。
+    # 不增加第三种 llm_mode，避免漏过现有 fake 网络保护而意外调用真实模型。
     demo: bool = False
     models: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_MODELS))
     provider_keys: Mapping[str, str] = field(default_factory=dict)
 
-    # Retrievers
+    # 检索设置。
     tavily_api_key: str = ""
     brave_api_key: str = ""
 
-    # Corpus-only mode (internal/12 M10): evidence comes ONLY from the installed Corpus
-    # port. `retrievers.search` delegates to it exclusively, `read_webpage` refuses every
-    # non-corpus URL, and the store refuses an embedder that is not local — so retrieval
-    # never leaves the host. The research models are NOT covered: the question and the
-    # excerpts go wherever `models` routes each role, so a local embedder alone does not
-    # make a run offline. A run with this set and no corpus installed fails closed rather
-    # than silently degrading to the web.
+    # 仅资料库模式：检索只走 Corpus，读取只接受 corpus://，嵌入必须本地。
+    # 但代理模型仍按 models 路由，单有本地嵌入并不代表整轮离线。
+    # 未安装资料库时明确失败，不能静默回退外网。
     corpus_mode: bool = False
 
-    # The frozen selection of a selected-files run: the exact corpus document-version ids
-    # it may search and read (internal/rfcs/V3.1-corpus-scope.md §8). `None` means the run
-    # carries no selection — a web run, or a session, which never takes one (§8.3, D-8).
-    # Hosts install `ScopedCorpus` over this set; it is control-plane data, never a
-    # user preference.
+    # 冻结的选中文档版本 ID，控制本轮可检索和读取范围。
+    # None 表示没有指定选择；宿主据此安装 ScopedCorpus。这是控制数据，不是用户偏好。
     corpus_allowed_ids: frozenset[str] | None = None
 
-    # Offline (internal/rfcs/V3.1-corpus-scope.md §6.2): every model call stays on this
-    # machine. Enforced by `research_engine.offline` before the graph starts and again in
-    # `llm_factory._build`; always paired with `corpus_mode`, which keeps out the web.
+    # Offline 要求所有模型调用留在本机；图启动前与模型工厂均检查，且必须配合 corpus_mode。
     offline: bool = False
 
-    # SSRF guard (docs/06). Strict on server, relaxed on desktop (to allow local Ollama).
+    # SSRF 防护，见 docs/06；服务端严格，本地可放宽以允许 Ollama。
     enforce_ssrf_guards: bool = True
 
-    # Where a local Ollama server listens (docs/13 §6). Overridable so the desktop build
-    # can point at a remote box on the LAN instead of the machine it runs on.
+    # Ollama 服务地址，可覆盖为局域网机器地址，见 docs/13 §6。
     ollama_base_url: str = "http://localhost:11434/v1"
 
-    # Budgets (docs/04 §6). **0 means unlimited** for all three, the same convention the
-    # rate limits use. They default to unlimited: a run must not be killed mid-flight by a
-    # ceiling the operator never chose, and the dollar cap cannot serve as a backstop
-    # anyway — `estimate_cost()` returns 0.0 for openrouter/custom, so it never fires
-    # there. Cap spend at the provider; set these when a deployment wants its own stop.
+    # 费用、时间、Token 预算均以 0 表示无限制，默认不私设上限，见 docs/04 §6。
+    # custom/OpenRouter 价格未知时费用限制不起作用，需要供应商侧另设限额。
     max_critic_loops: int = 2
     max_cost_per_session_usd: float = 0.0
     max_wallclock_seconds: int = 0
-    # Cumulative input tokens across the whole session, critic loops and rework included.
-    # Was a hardcoded 1_000_000 inside `graph._over_budget` with no way to raise it, which
-    # killed a real run at 1,003,721 tokens — the only live guard was the untunable one.
+    # 整个会话累计输入 Token，包含评审循环与返工。
+    # 曾硬编码百万上限并终止真实运行，现由部署者明确配置。
     max_input_tokens: int = 0
 
-    # How many research tasks may run at once (docs/12 M7). 1 restores the old strictly
-    # sequential behaviour, which also makes budget overshoot impossible — see
-    # `graph._BudgetGuard` on why concurrency can only bound overshoot, not eliminate it.
+    # 最多同时研究的任务数；1 恢复顺序执行。并发可能造成已发出调用的预算超支，见 graph._BudgetGuard。
     max_parallel_tasks: int = 4
 
-    # ── Customization surface (internal/07 Phase 3) ────────────────────────────
-    # Every default below reproduces today's behaviour exactly — turning this field
-    # into a setting must never change what an account that has not touched Settings
-    # gets. Where a default mirrors a value hardcoded elsewhere, the source of that
-    # value is named so the two cannot silently drift apart.
+    # ── 可配置功能，见 internal/07 Phase 3 ──
+    # 默认值保留已有行为，用户未修改偏好时不应受影响；与其他硬编码值对应时注明来源。
 
-    # Was `web_search`'s hardcoded default (`research_engine/tools.py`).
+    # 沿用 tools.py 中 web_search 原来的默认结果数。
     retrieval_k: int = 5
-    # 0 = unlimited/no floor, matching this codebase's existing "0 = unlimited"
-    # convention (docs/04 §6) — today the critic enforces no minimum at all.
+    # 0 表示不设证据下限，与现有 0 不限额约定一致。
     min_sources_per_task: int = 0
-    # Was `EvidenceChunk.snippet`'s Pydantic `max_length` (`research_engine/schemas.py`)
-    # — that ceiling still applies; this truncates *before* it, so it can only ever
-    # tighten the cap, never loosen the schema's own limit.
+    # 在 EvidenceChunk 校验前截断片段，因此只能收紧，不能放宽数据结构自身的最大长度。
     snippet_max_chars: int = 500
 
-    # Consumed by the plan gate (internal/07 Phase 4). Empty/unset means "no seed
-    # topics, no outline template" — exactly today's unconstrained planner.
+    # 计划关卡使用的主题与大纲配置；为空时保留原有无约束规划行为。
     outline_template: str | None = None
     topic_seeds: tuple[str, ...] = ()
-    # Role → replacement prompt text. No consumer yet; declared so the config path
-    # exists ahead of whichever future phase reads it, rather than adding a fourth
-    # place this contract has to be threaded through later.
+    # 角色对应的替换提示词正文，由统一提示词组装层按用途权限决定是否应用。
     prompt_overrides: Mapping[str, str] = field(default_factory=dict)
 
-    # ── Plan gate (internal/07 Phase 4) ────────────────────────────────────────
-    # A default, not a wall: the planner may still propose fewer, and a user can add
-    # more at the gate. 6 reproduces today's hardcoded PlannerOutput cap exactly.
+    # ── 计划审核关卡，见 internal/07 Phase 4 ──
+    # 这里只限制规划器默认提议数，用户仍可增加；默认 6 保留原 PlannerOutput 上限行为。
     max_planner_tasks: int = 6
-    # True here, not False — this is the bare *engine* default read by every test,
-    # the CLI, and the eval harness that has never heard of this field and has no
-    # way to render or resume a second interrupt. A host that forgets to wire this
-    # must degrade to today's exact behaviour (AGENTS.md — module defaults mirror
-    # settings defaults exactly, so an unconfigured host is never surprised).
+    # 引擎默认 True，让现有测试、CLI 和无人值守评测跳过无法展示的计划审批。
+    # 没有显式配置的宿主必须保持原有行为，不能突然停在第二个人工关卡。
     #
-    # The *product* decision — "second human gate after Planner", opt-out not
-    # opt-in — lives one layer up: `pipeline_runner._run_config_for` and
-    # `sidecar._drive_session` always pass an explicit `skip_plan_gate` sourced from
-    # `Session.skip_plan_gate`, whose own column default is False. A real run
-    # created through either host's API gets the gate; a bare RunConfig() does not.
+    # 产品是否启用计划关卡由宿主明确决定：pipeline_runner 与桌面会话驱动读取 Session.skip_plan_gate。
+    # 数据库列默认 False 与裸引擎默认 True 服务不同场景，不能强行统一。
     skip_plan_gate: bool = True
 
     def model_for(self, role: str) -> str:
-        """The "provider:model" string routed to a role."""
+        """返回角色对应的 provider:model 路由。"""
         try:
             return self.models[role]
         except KeyError:
@@ -173,27 +111,27 @@ class RunConfig:
 
 _MODULE_DEFAULT = RunConfig()
 
-# Process baseline, replaced by the host at startup.
+# 进程基线，由宿主启动时替换。
 _process_default: RunConfig = _MODULE_DEFAULT
 
-# Per-run override; None means "use the process default".
+# 本轮覆盖；None 表示使用进程默认值。
 _override: ContextVar[RunConfig | None] = ContextVar("engine_run_config", default=None)
 
 
 def set_process_default(cfg: RunConfig) -> None:
-    """Install the process-wide baseline config. Called once by the host at startup."""
+    """由宿主启动时安装进程级基线配置。"""
     global _process_default
     _process_default = cfg
 
 
 def reset_process_default() -> None:
-    """Restore module defaults. For tests that must assert un-hosted behaviour."""
+    """恢复模块默认值，供验证无宿主配置行为的测试使用。"""
     global _process_default
     _process_default = _MODULE_DEFAULT
 
 
 def set_run_config(cfg: RunConfig):
-    """Install a config for the current context. Returns a token for `reset_run_config`."""
+    """为当前上下文安装配置，返回用于 reset_run_config 的令牌。"""
     return _override.set(cfg)
 
 
@@ -202,5 +140,5 @@ def reset_run_config(token) -> None:
 
 
 def get_run_config() -> RunConfig:
-    """The active config: run override, else process default, else module defaults."""
+    """返回生效配置：本轮覆盖优先，其次进程默认，最后模块默认。"""
     return _override.get() or _process_default

@@ -25,9 +25,9 @@ export function StatusBar({
   running: boolean;
 }) {
   const start = new Date(session.created_at).getTime();
-  // Seed deterministic (= created_at) so SSR and first client render match. The clock
-  // is advanced only from async callbacks (timeout/interval), never synchronously in
-  // the effect body — that keeps the render pure and avoids cascading-render lint.
+  // 使用 created_at 作为确定的初始时间，保持服务端与客户端首次渲染一致；
+  // 时钟只在异步定时回调中推进，不在副作用函数体内同步更新，
+  // 以保持渲染纯粹，避免级联渲染检查报错。
   const [now, setNow] = useState(start);
 
   useEffect(() => {
@@ -49,9 +49,9 @@ export function StatusBar({
 
   return (
     <div className="card flex flex-wrap items-center gap-x-8 gap-y-3 py-3">
-      <Stat label="Elapsed" value={formatDuration(elapsed)} />
-      <Stat label="Cost" value={formatCost(session.total_cost_usd)} />
-      <Stat label="Tasks" value={total ? `${done}/${total}` : done ? String(done) : "—"} />
+      <Stat label="已用时间" value={formatDuration(elapsed)} />
+      <Stat label="费用" value={formatCost(session.total_cost_usd)} />
+      <Stat label="任务" value={total ? `${done}/${total}` : done ? String(done) : "—"} />
     </div>
   );
 }

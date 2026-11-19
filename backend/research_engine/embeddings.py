@@ -1,26 +1,9 @@
-"""
-The fail-closed default for the Embeddings port (docs/14 §4).
+"""Embeddings 端口的保守默认实现，见 docs/14 §4。
 
-`ports.Embeddings` states the shape; this module supplies what every host needs
-regardless of which client it wraps — the error type, and a stand-in that refuses.
-
-**Why there is no ContextVar here, unlike `cache.py` and `events.py`.** Those two are
-ambient because engine *nodes* reach for them mid-graph, so there is nowhere to pass
-them. Nothing in the graph embeds: ingestion happens in the host after approval
-(docs/14 §2) and retrieval is a SQL query in the host (docs/14 §5). An ambient holder
-for a port the engine never reads would be indirection with no reader, so hosts
-construct an adapter and pass it to the two functions that use it. docs/14 §4 records
-this as a deliberate departure from the "injected alongside event_sink/cache" sketch
-written before the call sites existed.
-
-**Why the absent case raises instead of no-opping.** `NullCache` caches nothing and that
-is correct — every cache touch in the retriever chain is advisory, so an absent cache
-costs a re-fetch. An equivalent `NullEmbeddings` returning empty vectors would be a
-silent catastrophe: ingestion would write nothing, retrieval would match nothing, and
-project chat would answer "not in this project's knowledge" about research the user is
-looking at. That failure surfaces weeks later as "memory doesn't work", with no error
-anywhere. Fail closed (docs/00 ground rules).
-"""
+端口定义在 ports 中，这里提供错误类型和未配置时明确拒绝的实现。
+调用方直接传入适配器，不另设没有必要的全局 ContextVar。
+缺少缓存可以重新抓取，但缺少嵌入若静默返回空向量，会让导入和检索无声失效，
+最后误导聊天认为项目没有知识，因此必须在调用处明确报错。"""
 
 from __future__ import annotations
 
@@ -31,50 +14,39 @@ import httpx
 
 _EMBED_TIMEOUT_SECONDS = 60.0
 
-# Hosts that mean "this machine". `host.docker.internal` is included because
-# `llm_factory.map_local_host` rewrites `localhost` to it inside a container, so a
-# genuinely local Ollama presents under that name and must not read as remote.
+# 本机地址集合包含 host.docker.internal，因为容器内 localhost 会经 map_local_host 改写为该地址。
 _LOCAL_HOSTS = frozenset(
     {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "host.docker.internal"}
 )
 
 
 def is_local_endpoint(base_url: str) -> bool:
-    """True when `base_url` points at this machine.
+    """判断 base_url 是否指向本机。
 
-    Corpus-only mode promises that retrieval stays on this machine (internal/12 M10). The query
-    embedding is the one model call retrieval makes, so whether that endpoint is local is
-    the whole difference between local retrieval and retrieval that quietly phones a
-    provider. (The agents' own model calls are a separate axis, governed by routing.) One
-    implementation, used by every Embeddings adapter on both hosts — the alternative is
-    the duplicated-predicate failure `AGENTS.md` documents.
-    """
+    仅资料库模式的查询嵌入必须保持本地；代理自身的模型调用由另一套路由配置控制。
+    两个宿主的所有嵌入适配器共用此判断，避免各自实现后不一致。"""
     from urllib.parse import urlsplit
 
     try:
         host = urlsplit(base_url).hostname or ""
-    except ValueError:  # malformed URL — treat as remote, i.e. fail closed
+    except ValueError:  # URL 格式错误按远程处理，不能因解析失败绕过外发限制。
         return False
     return host.lower() in _LOCAL_HOSTS
 
 
 class EmbeddingsUnavailable(RuntimeError):
-    """No embeddings provider is configured, or the configured one could not be reached.
+    """嵌入提供方未配置或无法访问。
 
-    Raised at the call site so each caller decides what it means: ingestion logs it and
-    leaves the report un-indexed — the run itself already succeeded and must not be
-    failed retroactively — while chat refuses to answer rather than implying the project
-    holds no matching knowledge.
-    """
+    调用方决定后果：导入记录未索引，但不回溯否定已完成研究；
+    聊天则拒绝回答，不能把嵌入故障说成项目没有相关知识。"""
 
 
 class NoEmbeddings:
-    """The stand-in a host gets when it configured no provider. Refuses, loudly."""
+    """没有配置嵌入提供方时使用，调用会明确失败。"""
 
     model_id = "none"
     dimensions = 0
-    # Vacuously true: it raises before any I/O, so it can never egress. Saying so
-    # explicitly keeps the airgap guard from having to special-case the absent provider.
+    # 在任何 I/O 前就抛错，不可能外发；显式声明本地，避免隔离保护错误拦截。
     is_local = True
 
     async def embed(self, texts: list[str]) -> list[list[float]]:  # noqa: ARG002
@@ -87,66 +59,39 @@ class NoEmbeddings:
 
 
 class FakeEmbeddings:
-    """Deterministic in-process embeddings for `llm_mode="fake"` (docs/17 §6.2).
+    """fake 模式的进程内确定性嵌入，见 docs/17 §6.2。
 
-    Fake mode promises a keyless, offline demo, and every model call in the engine is
-    gated on it. Corpus ingestion escaped that gate because embeddings are built by a
-    *host* adapter, so `./start.sh --fake` embedded against whatever provider key was in
-    `.env` — billing a run advertised as free, and dying on a provider 404 when the key
-    was stale. This is the stand-in that closes it.
+    演示承诺无需密钥、无需网络；嵌入也必须使用假实现，避免宿主适配器意外调用付费 API。
+    同一文本始终产生同一向量，跨重启结果稳定。
+    这些向量不具备语义理解，只用于走通真实导入与搜索流程，不能证明检索相关性。"""
 
-    **Deterministic, not random.** The corpus is a retrieval store: the same text must
-    land in the same place across a restart, or a demo's search results shift between
-    launches for no reason a user can see. A seeded hash gives that for free and needs no
-    state on disk.
-
-    The vectors are meaningless as *semantics* — nothing here understands language. What
-    they preserve is the shape retrieval depends on: stable, unit-length, uniform width,
-    and distinct per distinct input. A demo therefore exercises the real ingest→search
-    path rather than a mock of it, while proving nothing about relevance, which is
-    exactly the honest scope for fixture content.
-    """
-
-    #: `local:` because `pipeline_runner` admits corpus mode only for `ollama:`/`local:`
-    #: ids, and this genuinely is in-process. `fake` is in the name because a model id is
-    #: recorded as the thing that actually ran, and this one must never read as real.
+    #: local: 标明进程内执行，fake 标明实际使用脚本实现，不能冒充真实模型。
     model_id = "local:fake-deterministic"
-    #: 768 to match `memory_chunks.embedding`, which is a `vector(768)` column. A narrower
-    #: vector would work fine for the corpus (SQLite blobs, any width) and then fail at
-    #: project-memory ingestion — inside the handler that deliberately never raises, so a
-    #: demo would log a warning nobody reads and quietly index nothing.
+    #: 使用 768 维以匹配 memory_chunks.embedding；否则资料库可写入，项目记忆却会静默索引失败。
     dimensions = 768
-    #: No I/O at all, so nothing can egress. The airgap guard defaults to *remote* for
-    #: anything that does not declare itself (AGENTS.md), and refusing an embedder that
-    #: cannot reach the network would be the guard firing at the wrong target.
+    #: 不进行任何 I/O，显式声明本地，避免被默认按远程处理的隔离保护误拦。
     is_local = True
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(t) for t in texts]
 
     def _vector(self, text: str) -> list[float]:
-        # blake2b over the text, expanded to `dimensions` floats. Hashing per-index
-        # rather than slicing one digest keeps the width independent of the digest size.
+        # 对文本按各维索引计算 blake2b，扩展成 dimensions 个浮点数，不受单个摘要长度限制。
         raw = [
             int.from_bytes(hashlib.blake2b(f"{i}:{text}".encode(), digest_size=4).digest(), "big")
             for i in range(self.dimensions)
         ]
-        # Centre on zero so vectors can oppose as well as agree; an all-positive space
-        # makes every pair look similar under cosine.
+        # 以零为中心，让向量既可相近也可相反；全正数会使余弦相似度普遍偏高。
         centred = [v / 2**31 - 1.0 for v in raw]
         norm = math.sqrt(sum(x * x for x in centred)) or 1.0
         return [x / norm for x in centred]
 
 
 class LocalEmbeddings:
-    """Embeddings from a local OpenAI-compatible server — the local-retrieval client.
+    """本地 OpenAI 兼容服务的嵌入客户端。
 
-    The desktop host cannot use the server's `app/adapters.py` implementations (they
-    import `app.config`, and the PyInstaller bundle excludes the redis they drag in),
-    so the engine ships this keyless equivalent: same wire protocol, same ordering
-    guarantee, no host imports. Plain httpx, because the wire format is two fields
-    and this path must not drag a model client into the frozen bundle.
-    """
+    不导入服务端适配器，避免把 app.config 和 Redis 带入桌面包。
+    使用简单 httpx 协议，保持与服务端相同的返回顺序保证。"""
 
     def __init__(self, model: str, base_url: str, dimensions: int = 768) -> None:
         self._model = model
@@ -155,14 +100,12 @@ class LocalEmbeddings:
 
     @property
     def is_local(self) -> bool:
-        # Named "Local" but pointed by config: OLLAMA_BASE_URL can be set to a remote
-        # host, and then this class is a network client wearing a local name.
+        # 名称虽是 Local，配置仍可能指向远程机器，必须检查实际地址。
         return is_local_endpoint(self._base_url)
 
     @property
     def model_id(self) -> str:
-        # Same id scheme as the server's OllamaEmbeddings, so a corpus indexed on one
-        # host reads as "same model" on the other.
+        # 与服务端 OllamaEmbeddings 共用模型 ID 格式，保证跨宿主读取时能确认同一嵌入模型。
         return f"ollama:{self._model}"
 
     @property
@@ -170,6 +113,22 @@ class LocalEmbeddings:
         return self._dimensions
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        from research_engine.eval_trace import trace_span
+
+        with trace_span(
+            "embedding.local", kind="embedding", inputs={"texts": texts, "model": self.model_id}
+        ) as span:
+            result = await self._embed(texts)
+            span.observe(
+                output={
+                    "vector_count": len(result),
+                    "dimensions": self._dimensions,
+                    "vectors_omitted": "diagnostic content excludes numerical embedding arrays",
+                }
+            )
+            return result
+
+    async def _embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         try:
@@ -180,14 +139,13 @@ class LocalEmbeddings:
                 )
                 response.raise_for_status()
                 payload = response.json()
-        except Exception as exc:  # noqa: BLE001 — every failure means "cannot embed"
+        except Exception as exc:  # noqa: BLE001 — 各类失败均表示本次无法生成嵌入
             raise EmbeddingsUnavailable(
                 f"Local embedding server at {self._base_url} did not answer: {exc}. "
                 f"Check that Ollama is running and `ollama pull {self._model}` has been run."
             ) from exc
 
-        # Order is by the `index` field, not by arrival — a chunk paired with the wrong
-        # vector is a silent retrieval bug, not a crash.
+        # 按 index 排序，不能依赖到达顺序；文本与向量错配会静默破坏检索。
         rows = sorted(payload.get("data") or [], key=lambda row: row.get("index", 0))
         vectors = [row.get("embedding") or [] for row in rows]
         if len(vectors) != len(texts):

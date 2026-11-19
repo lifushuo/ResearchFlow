@@ -12,13 +12,7 @@ import {
   splitRoute,
 } from "./ProviderPicker";
 
-/**
- * The run form's whole model decision: which backend, and is it up.
- *
- * The behaviour under test is mostly about not lying — showing what a run will really be
- * routed to, marking a dead endpoint dead, and never quietly substituting one backend for
- * another when the chosen one is down.
- */
+/** 研究表单只决定模型后端类型及其可用性。测试要求展示真实路由、明确标记不可用端点，并在选定后端失败时禁止暗中替换提供方。 */
 
 const catalog = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
 const custom = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
@@ -56,7 +50,7 @@ function setUp({ cat = CATALOG, cus = CUSTOM, loc = LOCAL } = {}) {
 
 describe("backend resolution", () => {
   it("prefers the custom endpoint, then local, then API", () => {
-    // The order the user asked for, and the order the buttons are shown in.
+    // 使用用户指定的优先级，也与按钮显示顺序一致。
     expect(defaultKind(CATALOG, CUSTOM, LOCAL)).toBe("custom");
     expect(defaultKind(CATALOG, { ...CUSTOM, reachable: false }, LOCAL)).toBe("local");
     expect(
@@ -65,13 +59,13 @@ describe("backend resolution", () => {
   });
 
   it("returns null while nothing is reachable, rather than guessing", () => {
-    // A button that appears selected and then moves is worse than one that arrives late.
+    // 等待探测完成比先显示选中状态又突然改变更稳妥。
     const bare = { user_routing: null, deployment_routing: null, models: [] };
     expect(defaultKind(bare, { ...CUSTOM, reachable: false }, { models: [] })).toBeNull();
   });
 
   it("honours a model chosen in Settings over the deployment's own default", () => {
-    // Moving model choice into Settings is only real if the run form obeys it.
+    // 模型选择迁移到设置后，研究表单必须确实遵循已保存配置。
     const withSaved = { ...CATALOG, user_routing: routingFor("custom:my/pinned-model") };
     expect(routeForKind("custom", withSaved, CUSTOM, LOCAL)).toBe("custom:my/pinned-model");
   });
@@ -110,7 +104,7 @@ describe("backend resolution", () => {
   it("knows which backends have no measurable cost", () => {
     expect(isUnpricedRoute("custom:auto/best-fast")).toBe(true);
     expect(isUnpricedRoute("openrouter:meta/llama")).toBe(true);
-    // Local is genuinely free — a different statement from unknown.
+    // 本地推理确实免费，与费用未知是不同结论。
     expect(isUnpricedRoute("ollama:qwen2.5:7b")).toBe(false);
     expect(isUnpricedRoute("google:gemini-2.5-pro")).toBe(false);
   });
@@ -121,7 +115,7 @@ describe("ProviderPicker", () => {
     setUp();
     render(<ProviderPicker value="custom" onChange={vi.fn()} />);
     expect(screen.getAllByRole("radio")).toHaveLength(3);
-    for (const label of ["Custom Endpoint", "Local LLM", "API"]) {
+    for (const label of ["自定义端点", "本地大模型", "API"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
   });
@@ -134,19 +128,19 @@ describe("ProviderPicker", () => {
   });
 
   it("marks a stopped endpoint stopped in text, not only in colour", () => {
-    // The dot is decorative; the word is what a screen reader gets.
+    // 圆点仅用于装饰，读屏器依赖状态文字。
     setUp({ cus: { ...CUSTOM, reachable: false } });
     render(<ProviderPicker value="local" onChange={vi.fn()} />);
-    expect(screen.getByText("Custom Endpoint is stopped")).toBeInTheDocument();
-    expect(screen.getByText("Local LLM is running")).toBeInTheDocument();
+    expect(screen.getByText("自定义端点已停止")).toBeInTheDocument();
+    expect(screen.getByText("本地大模型运行中")).toBeInTheDocument();
   });
 
   it("says a chosen dead backend will fail rather than switching provider", () => {
-    // The rule this guards: a silent substitution would make the finished report's
-    // attribution the first place it became visible.
+    // 此规则防止暗中替换提供方，避免最终报告的模型归属
+    // 成为用户首次发现替换发生的位置。
     setUp({ cus: { ...CUSTOM, reachable: false } });
     render(<ProviderPicker value="custom" onChange={vi.fn()} />);
-    expect(screen.getByRole("alert")).toHaveTextContent(/will fail rather than switch/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/启动研究会报错，不会自动切换/i);
   });
 
   it("does not warn when the chosen backend is up", () => {
@@ -159,13 +153,13 @@ describe("ProviderPicker", () => {
     setUp();
     const onChange = vi.fn();
     render(<ProviderPicker value="custom" onChange={onChange} />);
-    await userEvent.click(screen.getByRole("radio", { name: /local llm/i }));
+    await userEvent.click(screen.getByRole("radio", { name: /本地大模型/i }));
     expect(onChange).toHaveBeenCalledWith("local");
   });
 
   it("points at Settings for the model itself", () => {
     setUp();
     render(<ProviderPicker value="custom" onChange={vi.fn()} />);
-    expect(screen.getByText(/Settings → Models/)).toBeInTheDocument();
+    expect(screen.getByText(/设置 → 模型/)).toBeInTheDocument();
   });
 });

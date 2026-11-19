@@ -1,29 +1,11 @@
-"""
-Reading a LangGraph checkpoint with the distinction the production helper cannot express.
+"""读取 LangGraph 检查点，严格区分三种结果。
 
-`app.services.checkpoints.get_thread_state` returns `snapshot.values if snapshot else {}`, so
-a **missing** checkpoint and an **empty** one are indistinguishable. Three outcomes, never
-merged:
+READ：成功解码，证据可以为空；MISSING：线程没有快照；
+UNREADABLE：快照存在但无法按检查点格式读取。只有 READ 才能判断内容是否为空。
 
-    READ        a snapshot was decoded — its evidence may still be empty, which is a
-                *finding*, not a failure
-    MISSING     no snapshot for this thread_id
-    UNREADABLE  a snapshot exists and could not be decoded into a checkpoint
-
-"empty" is not one of these: emptiness is a property of what was read, and only a READ
-outcome can report it.
-
-**Lives in the engine because it is pure** — a saver protocol, `enum`, `dataclass`, nothing
-else. Two callers need it: `migration/` (which is why it was written) and `app/run_execution`,
-which reads the final state of a native run to persist its evidence. A copy in each would be
-the same second-home shape this repository keeps paying for. `migration/checkpoint.py`
-re-exports these names.
-
-**A decode that does not raise is not a decode that succeeded.** Corrupting a real saver's
-stored blob produces a value that still deserialises — to the integer `0` — so the shape is
-checked, not merely the absence of an exception. That defect shipped once and reintroduced the
-collapse one level below where it had been fixed.
-"""
+直接返回 snapshot.values 或空字典会把缺失与空内容混淆。这里通过 saver 协议提供纯读取逻辑，
+供迁移和运行结果持久化共用。还需检查解码后的结构：损坏数据可能解码成整数 0 而不抛异常，
+不能仅凭没有异常就宣称读取成功。"""
 
 from __future__ import annotations
 
@@ -47,8 +29,7 @@ class CheckpointRead:
 
     @property
     def evidence(self) -> list[dict]:
-        """Only meaningful when READ. Empty on MISSING/UNREADABLE — and the caller must
-        branch on `outcome` before reading this, or it reintroduces the collapse."""
+        """只有 outcome 为 READ 时才有意义；缺失或不可读时为空，调用方必须先判断 outcome。"""
         return list(self.values.get("evidence") or [])
 
     @property
@@ -57,15 +38,12 @@ class CheckpointRead:
 
 
 async def read_checkpoint(saver, thread_id: str) -> CheckpointRead:
-    """Read one thread's latest state, distinguishing all three outcomes.
+    """读取线程最新状态，保留读取成功、缺失、不可读三种结果。
 
-    Uses `aget_tuple` rather than `graph.aget_state`: the graph wrapper normalises a
-    missing snapshot into an empty-values StateSnapshot, which is the collapse again one
-    level up. `aget_tuple` returns `None` for "no such thread", unambiguously.
-    """
+    使用 aget_tuple，因为 graph.aget_state 会把不存在的快照正规化成空状态。"""
     try:
         tup = await saver.aget_tuple({"configurable": {"thread_id": thread_id}})
-    except Exception as exc:  # noqa: BLE001 — decode/IO failure is a distinct outcome
+    except Exception as exc:  # noqa: BLE001 — 解码或 I/O 失败需要作为独立读取结果返回
         return CheckpointRead(
             CheckpointOutcome.UNREADABLE, error=f"{type(exc).__name__}: {exc}"[:400]
         )
@@ -73,18 +51,12 @@ async def read_checkpoint(saver, thread_id: str) -> CheckpointRead:
     if tup is None:
         return CheckpointRead(CheckpointOutcome.MISSING)
 
-    # A decode that does not raise is not a decode that succeeded.
+    # 没有抛异常不代表解码结果有效，还必须核对结构。
     #
-    # Found by a dry run against a deliberately corrupted saver's stored blob: the byte
-    # sequence still deserialises — to the integer `0` — and the previous
-    # `(tup.checkpoint or {}).get("channel_values") or {}` turned that into an empty dict
-    # and reported READ. A corrupt checkpoint was therefore indistinguishable from a run
-    # that genuinely gathered nothing, which is precisely the collapse this module exists
-    # to prevent, reintroduced one level below where it was fixed.
+    # 实际损坏的 saver 数据曾解码成整数 0，旧代码又把它转成空字典并报告 READ。
+    # 这样会把读取失败误报为没有证据，因此必须保留不可读状态。
     #
-    # So the shape is checked, not just the absence of an exception. `channel_values`
-    # missing entirely is UNREADABLE rather than empty for the same reason: "a format this
-    # code does not understand" is not "a run with no evidence".
+    # 检查结构及 channel_values 是否存在；未知格式不能当作空证据。
     raw = tup.checkpoint
     if not isinstance(raw, Mapping):
         return CheckpointRead(
@@ -104,7 +76,7 @@ async def read_checkpoint(saver, thread_id: str) -> CheckpointRead:
 
     try:
         values = dict(channels)
-    except Exception as exc:  # noqa: BLE001 — a snapshot that will not unpack
+    except Exception as exc:  # noqa: BLE001 — 快照存在，但无法解包
         return CheckpointRead(
             CheckpointOutcome.UNREADABLE, error=f"{type(exc).__name__}: {exc}"[:400]
         )

@@ -1,26 +1,8 @@
-"""One event loop per Celery worker process, shared by every task the process runs.
+"""每个 Celery Worker 进程只维护一个事件循环，所有任务共用。
 
-Each task used to open and close a loop of its own. The loop closed; what the task had bound
-to it did not. Provider SDKs keep their HTTP client process-wide — `langchain_openai` and
-`langchain_anthropic` each cache one async client per base URL — and the keep-alive
-connections pooled inside it belong to the loop that opened them. The next task in the same
-prefork child then reused or expired one of those connections on a closed loop, so a gated
-run's plan approval, routinely handed to the child that ran its start, failed on its first
-model call with `RuntimeError: Event loop is closed` (openai 3 raises it; 2.x retried it
-away, sending the request twice, as anthropic still does). Keeping the loop for the life of
-the process keeps every such cache valid — including ones in libraries not adopted yet —
-without reaching into any library's private names.
-
-What a per-task loop did besides closing is kept. Anything a task leaves running is cancelled
-and awaited before `run` returns, so nothing outlives the task that spawned it; and each task
-starts from a fresh copy of the caller's context, so one run's bound log identity or run
-config never reaches the next. The per-task `engine.dispose()` and Redis pool lifecycle in
-the task bodies stay as they are — correct on one loop as on many.
-
-The server worker is the only process that runs more than one top-level coroutine. The API
-and the desktop sidecar each live on one uvicorn loop, and the CLI and evals run once per
-process, so none of them needs this.
-"""
+模型 SDK 会在进程内缓存异步 HTTP 客户端，连接属于创建它的循环。若每个任务另建并关闭循环，下个任务复用连接时就可能报 Event loop is closed；某些 SDK 还会用重试掩盖问题，造成重复请求。
+循环与进程同寿命可保护这些缓存。每个任务结束前仍取消并等待其遗留协程，且为每个任务复制独立上下文，避免日志身份或配置串用。
+API、桌面本来就运行在各自的单一循环上；CLI 每个进程只运行一次，无需此适配。"""
 
 from __future__ import annotations
 
@@ -38,17 +20,15 @@ _runner_thread: int | None = None
 
 def _process_runner() -> asyncio.Runner:
     global _runner, _runner_pid, _runner_thread
-    # A runner inherited through fork wraps the parent's selector; the child needs its own.
+    # fork 后不能沿用父进程的 selector，子进程必须创建自己的事件循环。
     if _runner is None or _runner_pid != os.getpid():
-        # `loop_factory` keeps the runner from installing its loop as the thread's current
-        # one — nothing here reads it, and a test process has its own loop management.
+        # 通过 loop_factory 创建循环，但不把它设置为线程默认循环；避免干扰测试进程自己的循环管理。
         _runner = asyncio.Runner(loop_factory=asyncio.new_event_loop)
         _runner_pid = os.getpid()
         _runner_thread = threading.get_ident()
     elif _runner_thread != threading.get_ident():
-        # The provider clients this loop keeps valid are per *process*, so a threaded pool
-        # cannot be served either way: one loop per thread puts several loops on one cached
-        # client — the defect above — and a shared loop driven from two threads is undefined.
+        # 模型客户端缓存属于进程，不能使用线程池驱动这套循环。
+        # 每线程一个循环会共享同一个缓存客户端；多线程共用并驱动同一个循环也不安全。
         raise RuntimeError(
             "app.workers.event_loop.run was called from a second thread; one event loop per "
             "worker process requires Celery's prefork (the default) or solo pool"
@@ -57,11 +37,11 @@ def _process_runner() -> asyncio.Runner:
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Run one Celery task's coroutine to completion on this process's loop."""
+    """在当前进程的固定事件循环上，将一个 Celery 任务的协程运行到结束。"""
     try:
         runner = _process_runner()
     except RuntimeError:
-        coro.close()  # never started; closed so the refusal is the only thing reported
+        coro.close()  # 协程尚未启动；关闭它，避免拒绝操作之外再产生未等待警告。
         raise
     root: list[asyncio.Task] = []
 
@@ -70,8 +50,7 @@ def run[T](coro: Coroutine[Any, Any, T]) -> T:
         return await coro
 
     try:
-        # A fresh copy per task: `asyncio.Runner` otherwise reuses one context for every
-        # call, and the log identity bound just before this call would never be seen.
+        # 每个任务复制一份新上下文；asyncio.Runner 默认会复用上下文，否则本次绑定的日志身份可能无法生效。
         return runner.run(as_root(), context=contextvars.copy_context())
     finally:
         loop = runner.get_loop()
@@ -81,14 +60,9 @@ def run[T](coro: Coroutine[Any, Any, T]) -> T:
 
 
 def _unwind(loop: asyncio.AbstractEventLoop, root: asyncio.Task) -> None:
-    """Cancel an interrupted task's own coroutine and let it unwind before anything else.
+    """任务被中断时，先取消它的主协程，让清理沿正常调用链完成。
 
-    Celery's soft time limit raises out of the loop from a signal handler, leaving the task's
-    coroutine pending mid-await. Cancelling it alone first sends the cancellation down the
-    structured path — the fan-out cancels its children, `emit` lets a shielded event write
-    land, the driver's `finally` releases its lock and closes its session. Cancelling every
-    task at once would also cancel that shielded write directly, cutting a commit in half.
-    """
+    Celery 软时限会从信号处理器跳出循环。先取消主协程，才能让并发子任务有序取消、受保护的事件写入提交完成，最后释放锁和会话。若一次取消所有协程，会直接打断受保护写入，使事务只完成一半。"""
     root.cancel()
     loop.run_until_complete(asyncio.wait([root]))
     if not root.cancelled() and root.exception() is not None:
@@ -102,7 +76,7 @@ def _unwind(loop: asyncio.AbstractEventLoop, root: asyncio.Task) -> None:
 
 
 def _cancel_leftovers(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel and await whatever the task left running, as a per-task loop's close did."""
+    """取消并等待该任务留下的协程，保留原来每任务关闭循环时的清理效果。"""
     leftovers = [task for task in asyncio.all_tasks(loop) if not task.done()]
     if not leftovers:
         return
@@ -121,11 +95,9 @@ def _cancel_leftovers(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def shutdown() -> None:
-    """Close this process's loop; the next `run` opens a new one.
+    """关闭当前进程的事件循环；下次 run 会重新创建。
 
-    Wired to Celery's `worker_process_shutdown` (`celery_app`), so a child's loop has a defined
-    end rather than being abandoned to interpreter exit.
-    """
+    由 Celery 的 worker_process_shutdown 触发，确保子进程退出时显式清理，而不是留给解释器兜底。"""
     global _runner, _runner_pid, _runner_thread
     if _runner is not None and _runner_pid == os.getpid():
         _runner.close()

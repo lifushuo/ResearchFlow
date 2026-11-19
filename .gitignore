@@ -8,6 +8,7 @@ dist/
 .parcel-cache/
 .eslintcache
 .stylelintcache
+*.tsbuildinfo
 
 # Python
 __pycache__/
@@ -57,6 +58,12 @@ Thumbs.db
 *.swp
 *.swo
 *~
+*.bak
+*.bak.*
+*.orig
+*.rej
+~$*
+.~lock.*#
 
 # Logs & Databases
 logs/
@@ -64,9 +71,12 @@ logs/
 data/
 *.sqlite
 *.sqlite-*
+*.sqlite3
+*.sqlite3-*
 # The one exception: a real v2.1.0 install's databases, kept as the upgrade fixture
 # (scripts/make_upgrade_fixture.py). Every other SQLite file is a runtime artifact.
 !backend/tests/fixtures/upgrade/*/*.sqlite
+!backend/tests/fixtures/upgrade/*/*.sqlite3
 # Redis snapshot, written into the working directory by a locally started redis-server.
 *.rdb
 
@@ -83,6 +93,7 @@ future-plans/
 # Editor/agent tool directories. Per-tool config, not project code.
 .qoder/
 .codex/
+.workbuddy-ai/
 
 
 # Personal presentation/interview notes. Kept beside the code so it is easy to open during a
@@ -91,3 +102,57 @@ future-plans/
 # drift from them silently.
 /PRESENTATION.md
 backend/research_engine/_build.py
+
+# 本地面试材料与恢复备份，不作为项目源码发布。
+/internal/interview/
+/internal/recovery/
+
+# 本机验收与部署记录可能包含用户运行信息，完整留在本地。
+# 项目已有的版本化设计文档不受影响；功能源码、测试和数据集位于 backend/frontend。
+/internal/acceptance/
+/internal/agent-evaluation/
+/internal/reliability/
+/internal/localization/
+/internal/deployment/
+/examples/demo-artifacts/
+/SHA256SUMS.txt
+
+# 本地新增的真实评测成绩不默认公开；已版本化的历史证据继续保留。
+/backend/evals/results/eval-2026-11-10-custom-deepseek-chat-judge-kimi-k3-full-run1.json
+/backend/evals/results/eval-2026-11-10-custom-judge-kimi-k3-run1.json
+/backend/evals/results/eval-2026-11-11-custom-kimi-k3-calibration-dev12-run1.json
+/backend/evals/results/eval-2026-11-11-custom-kimi-k3-calibration-dev4-run1.json
+/backend/evals/results/eval-2026-11-11-custom-kimi-k3-calibration-holdout8-run1.json
+
+# 本地验收的完整导出、输入副本和源码快照。只限制 internal，
+# 保留 backend/evals/results、正式数据集、测试夹具及验收脚本/摘要。
+/internal/**/artifacts/
+/internal/**/artifacts-*/
+/internal/**/agent-eval-artifacts/
+/internal/**/source-before/
+/internal/**/source-at-capture/
+/internal/**/.before/
+/internal/**/raw/
+/internal/**/full/
+/internal/**/resume/
+/internal/**/run/
+/internal/**/inputs/
+/internal/**/sources/
+/internal/**/dataset/
+/internal/**/evaluations/
+/internal/**/capture-*/
+/internal/**/authorized-output/
+/internal/**/live/
+/internal/**/live-*.json
+/internal/**/*.jsonl
+/internal/**/*.png
+/internal/**/*.html
+/internal/**/*.env
+/internal/**/*.before
+/internal/**/*.captured
+/internal/**/*.upstream
+/internal/**/*.patch
+/internal/**/*-junit.xml
+/internal/**/junit*.xml
+/internal/**/reference/
+/internal/**/*-reference/

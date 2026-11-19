@@ -1,27 +1,10 @@
-"""
-The read and review surface for a research run.
+"""研究运行的查询、审核和导出接口。
 
-**One aggregate GET, three actions.** The next milestone builds nine UI surfaces — Overview,
-Research, Evidence, Claims, Sources, Contradictions, Review, Artifacts, History — and every
-one of them needs a slice of the same run graph. Nine endpoints would mean nine round trips
-for one page and nine places for the run-scoping predicate to be got wrong; one projection
-means the authorization check happens once, in one place.
+多个页面需要读取同一次研究的数据，因此用一次聚合查询返回完整视图，减少请求次数，也把权限校验集中在一处。字段和三态值直接沿用领域层，不能把“未检查”和“未证实”合并。
 
-The shapes here are deliberately thin over the domain: no field is renamed, nothing is
-flattened, and the three-valued vocabularies (`provenance_state`, `detection_state`,
-`verification_state`) travel as they are stored. A UI that wants to render "⚠ unverified"
-must be able to tell `UNCHECKED` from `UNATTESTED`, and collapsing them here to save a few
-bytes would put the product's central claim behind a translation layer.
+来源的 citation_index 允许为空：这表示找到过该来源，但没有给它分配引用编号。即使有编号，也要看当前修订的 cited_indices，才能知道报告是否实际引用它。
 
-**`citation_index` is nullable and that is load-bearing.** A source with no index was
-retrieved and never cited. The UI must not number it. The converse does not hold: the run
-numbers every source the synthesizer was shown, so whether a revision cites one is that
-revision's `cited_indices`, not this column.
-
-Actions are the two gates and the artifact. `POST /plan-review` and `POST /report-review` go
-through `app.run_lifecycle`, which goes through `app.authorization` — so the rule that only an
-approved report review authorizes an artifact is not restated here.
-"""
+计划审核和报告审核统一经过 app.run_lifecycle 与 app.authorization；只有获批的报告审核能授权生成最终产物，本文件不重复制定授权规则。"""
 
 from __future__ import annotations
 
@@ -58,11 +41,10 @@ from app.models.user import User
 from app.ports import CorpusLocator
 from app.run_dispatch import RunDispatcher
 
-# Request bodies live in app/schemas/runs.py so the desktop sidecar can import the exact
-# same contract without this module's `app.config` chain (#50). Re-exported here: this
-# is where the routes and their tests have always referred to them.
+# 请求结构放在 app/schemas/runs.py，桌面端可以复用，而不用引入服务端配置依赖。
+# 这里继续导出这些结构，兼容既有路由和测试的导入位置。
 from app.schemas.corpus import ExtractedTextResponse
-from app.schemas.runs import (  # noqa: F401  (re-export)
+from app.schemas.runs import (  # noqa: F401  （供其他模块导入）
     CreateRunRequest,
     PlanReviewRequest,
     ReportReviewRequest,
@@ -80,51 +62,30 @@ from research_engine.bundle import render_model_attribution_md, stamp_demo_md
 logger = structlog.get_logger()
 router = APIRouter(prefix="/runs", tags=["Runs"])
 
-#: Events after which the stream closes: two terminals plus the two gates. A graph
-#: suspended at an interrupt publishes nothing more until a human acts, so a connection
-#: held open there waits on no one. Mirrors the session stream's stop-list and
-#: `sidecar._TERMINAL_EVENTS`.
+# 实时事件流收到完成、失败或两个人工关卡事件后关闭。图暂停时要等人操作，继续保持连接不会收到新事件。
+# 此列表与会话事件流及 sidecar._TERMINAL_EVENTS 保持一致。
 _TERMINAL_EVENTS = ("COMPLETED", "FAILED", "HITL_READY", "PLAN_READY")
 
-#: Events after which *replay* stops — only the true terminals, deliberately NOT the gates.
+# 历史事件回放只在真正的终态停止，不在人工关卡处停止。
 #:
-#: The distinction matters and this route originally missed it. `_TERMINAL_EVENTS` is the right
-#: rule for the live tail: a graph suspended at an interrupt publishes nothing more, so
-#: holding the socket open waits on no one. Applying it to the backlog is a different
-#: statement — "stop reading history at the first gate" — and it is wrong. A client that
-#: reconnects without a `Last-Event-ID` (a fresh EventSource, which is what a status
-#: change creates) replays from id 0, hits the `PLAN_READY` row left over from the design
-#: gate, and returns: everything the run did *after* the gate is never delivered, and the
-#: live tail is never reached either. The session stream stops replay on
-#: `("COMPLETED", "FAILED")` only, for exactly this reason; this route copied the tail's list into
-#: both places.
+# 实时监听和历史回放必须使用不同的停止条件。
+# 实时监听遇到人工关卡应关闭；历史回放则必须继续读关卡之后的事件。
+# 客户端重连且未传 Last-Event-ID 时，会从头回放；若在旧 PLAN_READY 处停止，就会漏掉后续执行，也无法进入实时监听。
+# 因此历史回放只在 COMPLETED、FAILED 停止，与会话事件流规则一致。
 _REPLAY_STOP_EVENTS = ("COMPLETED", "FAILED")
 
-#: Run states in which nothing further will be published until a human acts, so the stream
-#: closes after replaying the backlog instead of tailing.
+# 这些状态表示当前正在等人处理；回放完已有事件后直接关闭，不再监听。
 #:
-#: This is the check that `_TERMINAL_EVENTS` used to perform accidentally, by stopping the
-#: *replay* at a gate. Doing it on the run's current status instead separates the two
-#: questions properly: "has history moved past a gate" (it may have, and the client needs
-#: what came after) versus "is the run sitting at one right now" (then there is nobody to
-#: wait for). Without this, removing the gates from the replay rule would leave a client
-#: reconnecting to a gate-parked run holding a socket nothing will ever write to.
+# 是否继续监听要看运行当前的状态，而不是历史中是否出现过人工关卡。
+# 这样既能完整回放已经越过关卡的任务，也不会让仍停在关卡的任务一直占用连接。
 _SUSPENDED_STATUSES = ("COMPLETED", "FAILED", "CANCELLED", "AWAITING_PLAN", "AWAITING_REVIEW")
 
 
 async def _run_or_404(db: AsyncSession, run_id: uuid.UUID, owner_id: uuid.UUID) -> ResearchRun:
-    """Ownership is a single-table predicate, which is why `owner_id` is denormalised.
+    """检查运行是否属于当前用户，同时绑定请求的日志关联标识。
 
-    A run belonging to someone else is a 404 rather than a 403: the difference between
-    "does not exist" and "exists and is not yours" is itself information.
-
-    **This is also where a request acquires its correlation identity**, and it binds here
-    rather than in a `Depends` because the sidecar wraps these handlers in its own routes
-    with its own dependencies — a dependency-based binder would bind on the server and
-    silently not on the desktop. Twelve of the fourteen run routes resolve ownership
-    through this function, so one line covers them on both hosts. A request that does not
-    resolve a run binds nothing: there is no identity to correlate to.
-    """
+    owner_id 直接存于运行表，因此不必跨表检查归属。别人的运行也返回 404，避免通过 403 泄露它确实存在。
+    绑定放在共享函数里，而不是服务端 Depends 中，因为桌面端会直接调用这些处理函数；否则桌面日志会缺少关联标识。未解析具体运行的请求不绑定运行标识。"""
     run = (
         await db.execute(
             select(ResearchRun).where(ResearchRun.id == run_id, ResearchRun.owner_id == owner_id)
@@ -137,7 +98,7 @@ async def _run_or_404(db: AsyncSession, run_id: uuid.UUID, owner_id: uuid.UUID) 
 
 
 async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
-    """The whole run graph, host-agnostic so the desktop sidecar serves the same shape."""
+    """返回完整研究视图；服务端和桌面端共用同一种返回结构。"""
     plans = (
         (
             await db.execute(
@@ -154,8 +115,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
             await db.execute(
                 select(Source)
                 .where(Source.run_id == run.id)
-                # Uncited sources sort last rather than being hidden: "retrieved but not
-                # cited" is a state the UI should be able to show.
+                # 未引用来源排在最后，但仍展示，便于用户区分“检索到”和“实际引用”。
                 .order_by(Source.citation_index.is_(None), Source.citation_index.asc())
             )
         )
@@ -222,15 +182,15 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
             "status": run.status,
             "depth": run.depth,
             "corpus_mode": run.corpus_mode,
-            # What the run was allowed to read and which corpus state it opened. Written at
-            # creation and at start; NULL on a web run and on runs predating selections, which
-            # read their project's whole corpus (internal/rfcs/V3.1-corpus-scope.md §8.6).
+            # 记录本次允许读取的范围及实际打开的语料库状态。创建和开始执行时分别保存。
+            # 网页研究及早期版本的运行可能为空；早期运行默认读取项目全部语料。
+            # 参见 internal/rfcs/V3.1-corpus-scope.md §8.6。
             "corpus_selection": run.corpus_selection,
             "corpus_id": run.corpus_id,
             "corpus_version": run.corpus_version,
             "offline": run.offline,
-            # A selected-files run's claim-level grounding record: what was checked, what was
-            # rejected or repaired out, and what could not be measured (RFC V3.1 §9.6).
+            # 按所选文件研究时，保留逐条结论的证据核验结果：哪些通过、哪些被拒绝或修复、哪些无法测量。
+            # 参见 RFC V3.1 §9.6。
             "grounding_report": run.grounding_report,
             "demo": run.demo,
             "skip_plan_gate": run.skip_plan_gate,
@@ -239,7 +199,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
             "tokens_input": run.tokens_input,
             "tokens_output": run.tokens_output,
             "elapsed_seconds": float(run.elapsed_seconds) if run.elapsed_seconds else None,
-            # NULL means unmeasured. Never rendered as 0 — that distinction is the product.
+            # NULL 表示未测量，不能显示成 0；未知和实测为零是两回事。
             "citation_resolution_rate": (
                 float(run.citation_resolution_rate)
                 if run.citation_resolution_rate is not None
@@ -268,7 +228,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
                 "title": s.title,
                 "kind": s.kind,
                 "retrieval_status": s.retrieval_status,
-                # None means "retrieved but never cited". The UI must not number it.
+                # None 表示检索过但未引用，前端不能自行补编号。
                 "citation_index": s.citation_index,
                 "corpus_document_id": s.corpus_document_id,
             }
@@ -283,7 +243,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
                 "snippet": e.snippet,
                 "content_hash": e.content_hash,
                 "key_fact": e.key_fact,
-                # Three-valued and passed through: UNCHECKED is not UNATTESTED.
+                # 保留原始三态：UNCHECKED（未检查）不同于 UNATTESTED（未证实）。
                 "provenance_state": e.provenance_state,
                 "attested_against": e.attested_against,
                 "attestation_run_at": (
@@ -298,14 +258,12 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
                 "version": r.version,
                 "report_markdown": r.report_markdown,
                 "report_hash": r.report_hash,
-                # The typed view, additive and NULL on revisions predating it. A read
-                # surface, not a dependency: `report_markdown` above remains what every
-                # existing client — and the frontend's citation renderer — reads.
+                # 结构化视图是补充字段；旧修订可以为空。
+                # 既有客户端和前端引用渲染仍读取 report_markdown，不依赖这个新视图。
                 "report_document": r.report_document,
                 "evidence_watermark": r.evidence_watermark,
-                # What this revision cites (module docstring: not `citation_index`). Cut
-                # where the resolution rate cuts — a reference list naming a source is not
-                # a citation of it.
+                # 这里只统计当前修订正文实际引用的来源，不根据 citation_index 推断。
+                # 与引用解析率使用相同边界：参考文献列表提到来源，不等于正文引用了它。
                 "cited_indices": sorted(
                     set(
                         citation_rate.cited_indices(
@@ -343,8 +301,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
         "contradictions": [
             {
                 "id": str(c.id),
-                # Source anchors are what a detection means; evidence anchors are a
-                # refinement and are often NULL.
+                # 来源锚点决定这是不是有效冲突；证据锚点只是进一步定位，允许为空。
                 "source_a_id": str(c.source_a_id) if c.source_a_id else None,
                 "source_b_id": str(c.source_b_id) if c.source_b_id else None,
                 "evidence_a_id": str(c.evidence_a_id) if c.evidence_a_id else None,
@@ -393,11 +350,9 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
 
 
 def grounding_refusal(run: ResearchRun, report_text: str) -> str | None:
-    """Why a selected-files report may not be approved, decided on the row (RFC V3.1 §9.6).
+    """根据已保存记录，判断所选文件报告为何不能获批（RFC V3.1 §9.6）。
 
-    The engine refuses to pause such a draft for approval; this is the same rule at the
-    approval route, so a client cannot approve a revision the validation never covered.
-    """
+    引擎已经阻止未经校验的草稿进入审批；接口也执行同一限制，避免客户端绕过它。"""
     if run.corpus_selection is None:
         return None
     report = run.grounding_report or {}
@@ -417,11 +372,10 @@ async def create_run(
     dispatcher: RunDispatcher = Depends(get_run_dispatcher),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Open a run.
+    """打开一次研究运行。
 
-    Creates the domain row only. Execution is still the existing pipeline — this milestone
-    changes where a run's results are *persisted*, not how research is performed, so there
-    is deliberately no second executor here.
+    仅创建领域对象行。执行仍沿用现有流水线——这个里程碑修改的是运行结果
+    *持久化的位置*，而不是研究本身的执行方式，因此这里故意不额外引入第二个执行器。
     """
     project = (
         await db.execute(
@@ -433,11 +387,10 @@ async def create_run(
     if body.depth not in RESEARCH_DEPTHS:
         raise Unprocessable("Unknown depth.")
 
-    # Refused here rather than repaired: a routing that survives `validate` is startable,
-    # so a run cannot die halfway through on a model that was never routable. Stamping the
-    # snapshot at creation is what makes the choice durable — `run_config_for_run` treats a
-    # present `model_routing` as authoritative, so every role, every resume and the report's
-    # own model attribution read the models this request named.
+    # 在这里拒绝而不是修复：只有通过 `validate` 校验后才允许启动，
+    # 因此一条运行不能在模型根本不可路由的情况下半途中失败。创建时为快照打上
+    # 标记是为了让选择持久化——`run_config_for_run` 会将存在的 `model_routing` 视为
+    # 权威来源，因此每个角色、每次恢复，以及报告自身的模型归属都会读取该请求命名的模型。
     routing = None
     if body.model_routing is not None:
         try:
@@ -445,9 +398,9 @@ async def create_run(
         except model_routing.InvalidRouting as exc:
             raise Unprocessable(str(exc)) from exc
 
-    # A corpus-only run reads a frozen set of document versions, resolved here and never
-    # again (internal/rfcs/V3.1-corpus-scope.md §8.2). Refused before the row exists: an
-    # empty or unresolvable selection must never start, and must never widen to the corpus.
+    # 仅语料库运行会读取一组冻结的文档版本，并在这里解析后永远不再重新解析
+    # （internal/rfcs/V3.1-corpus-scope.md §8.2）。在记录行创建之前就拒绝：
+    # 空的或无法解析的选择绝不能启动，也绝不能扩大到整个语料库。
     corpus_mode = body.corpus_mode or body.corpus_selection is not None or body.offline
     if body.corpus_selection is not None and "corpus_mode" in body.model_fields_set:
         if not body.corpus_mode:
@@ -483,13 +436,12 @@ async def create_run(
         outline_template=body.outline_template,
         model_routing=routing,
     )
-    # Committed BEFORE dispatch: a worker that picks the message up first and cannot find
-    # the row would fail a run that was about to exist.
+    # 在分发前提交：如果 worker 最先拿到消息却找不到该行记录，
+    # 那么本来即将创建的运行会失败。
     await db.commit()
 
-    # The one run route that does not go through `_run_or_404` — it creates the run rather
-    # than resolving one — so it binds its own identity, and does so before dispatch so the
-    # handoff is logged under the run it hands off.
+    # 这是唯一一条不经过 `_run_or_404` 的运行路由——它创建运行而不是解析已有运行——
+    # 因此会在这里绑定自己的身份，并且在分发前绑定，确保交接日志记录在该运行自身下。
     bind_research_run_context(str(run.id), user_id=str(current_user.id))
 
     if body.dispatch:
@@ -505,10 +457,10 @@ async def list_runs(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """This owner's runs, newest first, optionally scoped to one project.
+    """当前用户的运行记录，按创建时间倒序排列，可按项目单独筛选。
 
-    A summary rather than the graph: History renders a list, and shipping the full
-    projection per row would carry every report's markdown to draw a table.
+    这是一个摘要而非完整图谱：历史页面只展示列表，
+    若每条记录都返回完整投影数据，会携带每份报告的 markdown 内容来绘制表格。
     """
     query = select(ResearchRun).where(ResearchRun.owner_id == current_user.id)
     if project_id is not None:
@@ -562,7 +514,7 @@ async def get_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """The whole run graph in one response — see the module docstring for why."""
+    """一次返回完整研究视图，避免多个页面分别请求同一批数据。"""
     return await project_run(db, await _run_or_404(db, run_id, current_user.id))
 
 
@@ -574,7 +526,7 @@ async def submit_plan_review(
     current_user: User = Depends(get_current_user),
     dispatcher: RunDispatcher = Depends(get_run_dispatcher),
 ):
-    """A decision about the latest plan version. It authorizes no artifact, ever."""
+    """审核最新计划版本；批准计划不等于批准报告，也不能授权生成最终产物。"""
     run = await _run_or_404(db, run_id, current_user.id)
     plan = (
         (
@@ -589,30 +541,24 @@ async def submit_plan_review(
     )
     if plan is None:
         raise Conflict("This run has no plan to review.")
-    # `None` means "unedited, use the proposal" — not the same as `[]`, which is a reviewer
-    # who excluded everything and gets the 422 below.
+    # None 表示未编辑、沿用提案；空列表 [] 则表示审核者排除了全部任务，应返回 422。
     proposed = plan.tasks or []
     tasks = body.tasks if body.tasks is not None else proposed
     kept = [t for t in tasks if t.get("include", True)]
 
-    # Refused before the decision is recorded, not after: an approval that selects nothing
-    # authorizes a run that can only produce an evidence-free report, and a recorded
-    # APPROVED review is evidence in its own right.
+    # 在保存审核决定前拒绝空计划，避免留下“已批准”但根本无法收集证据的记录。
+    # 审核记录本身也是需要可信保存的证据。
     #
-    # The session gate (`research.submit_plan`) has always enforced this; this one shipped without it,
-    # which is how a run whose four subtopics were *all* proposed `include: false` was
-    # approved, searched nothing, and still reached the report gate with eleven claims and
-    # zero evidence. One rule, one wording, both paths — the desktop host imports this same
-    # handler, so it is fixed there by construction (AGENTS.md, "two hosts, one contract").
+    # 这里与会话入口 research.submit_plan 共用同一限制和提示。
+    # 此前全部任务 include=false 的计划也能获批，导致没有证据却生成报告。
+    # 桌面端直接复用本处理函数，所以也受同一规则保护。
     if body.decision == "APPROVED" and not kept:
         raise Unprocessable(
             "Keep at least one task — a plan with nothing in it researches nothing."
         )
 
-    # An edit becomes its own plan version rather than overwriting the proposal, so the
-    # design a run actually executed stays readable next to what the model suggested —
-    # `origin` is what tells those two apart, and a single overwritten plan column never could. The
-    # review is then recorded against the version it approved, not the one it replaced.
+    # 人工编辑会新增计划版本，不覆盖模型提案，便于对照原建议与实际执行内容。
+    # origin 标记来源；审核绑定实际批准的版本，而不是被替换的旧版本。
     if body.decision == "APPROVED" and body.tasks is not None and kept != proposed:
         plan = await run_lifecycle.record_plan(
             db,
@@ -626,21 +572,15 @@ async def submit_plan_review(
         db, run, plan, reviewer_id=current_user.id, decision=body.decision, feedback=body.feedback
     )
     if body.decision == "APPROVED" and body.dispatch:
-        # Move to RUNNING in the SAME transaction as the decision, before the task is
-        # queued. The worker sets it too, but a client that refetches on the mutation's
-        # success would otherwise read AWAITING_PLAN, conclude nothing is live, keep its
-        # event stream closed and never learn the run had resumed — a workspace that goes
-        # stale the moment you approve a plan. Found by the plan-gate journey.
+        # 在同一事务中同时保存批准决定并将运行改为 RUNNING，然后才入队。
+        # 否则客户端提交后立即查询，可能仍看到 AWAITING_PLAN，误以为任务没有继续，进而关闭事件流。
         await run_lifecycle.set_status(db, run, "RUNNING")
     await db.commit()
 
-    # An approved plan resumes the suspended graph from the design gate — the same
-    # `runner.resume(plan=…)` the session path uses, so research the user already paid for is
-    # not re-run.
+    # 通过 runner.resume(plan=…) 从计划关卡继续，复用已暂停的图，不重跑用户已付费的研究步骤。
     if body.decision == "APPROVED" and body.dispatch:
-        # `kept`, not `plan.tasks`: the executor is handed exactly what was approved. The
-        # graph filters `include: false` again at the gate, but relying on that would mean
-        # the resume payload and the recorded plan disagreed about what the run is doing.
+        # 交给执行器的是实际获批的 kept，而非未筛选的 plan.tasks。
+        # 图内还会过滤 include=false，但这里也必须保证恢复参数与审核记录一致。
         await dispatcher.resume_plan(
             str(run.id),
             str(current_user.id),
@@ -657,15 +597,10 @@ async def submit_report_review(
     current_user: User = Depends(get_current_user),
     dispatcher: RunDispatcher = Depends(get_run_dispatcher),
 ):
-    """A decision about a revision. On APPROVED, the artifact is frozen in the same
-    transaction — so an approval that cannot produce a verifiable artifact is not recorded
-    as an approval at all."""
+    """审核报告修订。批准和冻结产物放在同一事务；如果无法生成可验证产物，就不能留下批准成功的记录。"""
     run = await _run_or_404(db, run_id, current_user.id)
-    # Read here, before the transaction and before any best-effort step that could expire
-    # the row. `was_completed` observes the transition this endpoint already performs —
-    # `!= COMPLETED` → `COMPLETED` — so a repeat approval, which the lifecycle has always
-    # accepted, is not counted as a second terminal event. Nothing is refused, no state is
-    # added, and the endpoint behaves exactly as it did.
+    # 在事务与尽力执行的步骤之前读取状态，避免后续回滚使 ORM 对象失效。
+    # was_completed 用来识别首次完成；重复批准沿用原行为，但不能重复增加完成计数。
     was_completed = run.status == "COMPLETED"
     spend = (run.cost_usd, run.tokens_input, run.tokens_output, run.model_routing)
     query = select(Revision).where(Revision.run_id == run.id)
@@ -691,8 +626,7 @@ async def submit_report_review(
         artifact_id = None
         if body.decision == "APPROVED":
             run.status = "COMPLETED"
-            # Measured before the artifact is frozen, and in the same transaction as the
-            # approval: it is a statement about the exact bytes this reviewer approved.
+            # 先测量再冻结产物，与批准处于同一事务，确保指标对应审核者批准的那份正文。
             await run_lifecycle.measure_citation_resolution(db, run, revision)
             artifact = await run_lifecycle.create_artifact(db, run)
             artifact_id = str(artifact.id)
@@ -700,18 +634,14 @@ async def submit_report_review(
             run.status = "RUNNING"
         await db.commit()
         if body.decision == "REWORK_REQUESTED" and body.dispatch:
-            # `route_after_gate` sends a rejected draft back to the SYNTHESIZER, not the
-            # executor — the same evidence, resynthesized — so the next revision costs one
-            # synthesis rather than a whole run.
+            # 拒绝草稿后只回到 SYNTHESIZER，使用已有证据重新写作，不重跑整个检索执行流程。
             await dispatcher.rework(str(run.id), str(current_user.id), body.feedback)
     except run_lifecycle.LifecycleError as exc:
         await db.rollback()
         raise Conflict(str(exc)) from exc
 
-    # Read off the ORM rows *before* the ingest attempts. Either may fail and roll back,
-    # and a rollback expires every object in the identity map — so a response assembled
-    # afterwards would lazily reload `review` outside the greenlet and turn a best-effort
-    # indexing failure into a 500 on an approval that has already been committed.
+    # 在索引写入之前从 ORM 对象取出响应所需数据。
+    # 索引写入失败可能回滚并使全部对象失效；此后才读取 review 会触发异步上下文错误，让已经提交的批准请求返回 500。
     response = {
         "review_id": str(review.id),
         "gate": "REPORT",
@@ -720,10 +650,8 @@ async def submit_report_review(
     }
 
     if body.decision == "APPROVED" and not was_completed:
-        # **This is where a run terminates.** The engine is never resumed with
-        # `approved=True` — `RunDispatcher.rework` passes `False` on both hosts — so
-        # `persist_outcome` sees this run pause at the report gate and never sees it
-        # finish. Observing completion there would leave the counter permanently zero.
+        # 运行在这里正式完成。
+        # 报告批准后不会再以 approved=True 恢复引擎，所以 persist_outcome 只看到审核暂停，看不到最终完成；完成计数必须在此记录。
         cost_usd, tokens_input, tokens_output, model_routing = spend
         metrics.observe_completed_run(
             cost_usd=cost_usd,
@@ -733,9 +661,8 @@ async def submit_report_review(
         )
 
     if body.decision == "APPROVED":
-        # Both stores, after the commit and never inside the approval transaction:
-        # embedding cost and provider availability must not be able to fail an approval
-        # that has already been recorded. Neither call raises.
+        # 两个索引都在批准事务提交后写入，不能让向量化费用或供应商故障影响已经批准的报告。
+        # 这两次调用都自行处理异常，不向外抛出。
         await _ingest_report_into_corpus(db, run, revision.report_markdown)
         await _ingest_report_into_memory(db, run, revision.report_markdown)
 
@@ -743,8 +670,7 @@ async def submit_report_review(
 
 
 async def _ingest_report_into_corpus(db: AsyncSession, run, report_markdown: str) -> None:
-    """Auto-save an approved report into its project's corpus. Best-effort; never
-    raises — see report_corpus.ingest_report's own docstring for why."""
+    """尽力把已批准报告保存进项目语料库；失败不向外抛出，原因见 report_corpus.ingest_report。"""
     try:
         from app import adapters
         from app.run_execution import provider_keys_for
@@ -754,30 +680,21 @@ async def _ingest_report_into_corpus(db: AsyncSession, run, report_markdown: str
             run.project_id, keys=await provider_keys_for(db, run.owner_id)
         )
         await ingest_report(store, report_id=str(run.id), report_markdown=report_markdown)
-    except Exception as e:  # noqa: BLE001 — see report_corpus.ingest_report's own docstring
+    except Exception as e:  # noqa: BLE001 — 保存失败的处理原则见 report_corpus.ingest_report
         logger.warning("report_corpus_ingest_setup_failed", run_id=str(run.id), error=str(e))
 
 
 async def _ingest_report_into_memory(db: AsyncSession, run, report_markdown: str) -> None:
-    """Add an approved report to its project's memory — the store project chat reads.
+    """把获批报告加入项目记忆，供项目聊天检索。
 
-    Approval is the quality filter that makes retrieval trustworthy, so this sits on the
-    approval transition and nowhere else. Best-effort by the same rule as the corpus write:
-    the run has already succeeded and committed, and failing it retroactively because an
-    embedding provider was down would destroy work in order to report a gap. The gap is
-    reported instead, by `memory/status`, which counts approved reports against indexed
-    ones and self-heals on the next re-index.
-    """
+    只有批准时才建立索引，以审核作为内容质量边界。向量化服务故障不能推翻已经成功提交的研究；缺口由 memory/status 披露，并在下次重建索引时修复。"""
     from app.services import memory
 
     if not memory.is_available(db):
-        # Absent on the desktop host by design, which the parity tables and the UI both
-        # already state. Skipping quietly is correct there; warning on every approval
-        # would report a decision as a gap.
+        # 桌面端按设计不支持项目记忆，接口契约和界面都已说明；这里跳过即可，不应把正常差异当成故障报警。
         return
-    # Read before the step, not in its handler: the rollback below expires `run`, and
-    # reloading an attribute after it raises MissingGreenlet — which turned an embeddings
-    # provider being absent into a 500 on an approval that had already been committed.
+    # 在索引步骤之前读取运行属性。
+    # 下面可能回滚，使 run 失效；之后再取属性会触发 MissingGreenlet，误把向量化故障变成批准接口的 500。
     run_id = str(run.id)
     try:
         from app import adapters
@@ -787,7 +704,7 @@ async def _ingest_report_into_memory(db: AsyncSession, run, report_markdown: str
         result = await memory.ingest_run(db, run, report_markdown, embedder)
         if result.skipped:
             logger.info("memory_ingest_skipped", run_id=run_id, reason=result.reason)
-    except Exception as e:  # noqa: BLE001 — see docstring: never fail a committed run
+    except Exception as e:  # noqa: BLE001 — 按函数说明，不能让索引故障影响已提交的运行
         await db.rollback()
         logger.warning("memory_ingest_failed", run_id=run_id, error=str(e))
 
@@ -798,12 +715,9 @@ async def get_bundle(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """The verifiable bundle. Served from the frozen artifact once one exists.
+    """返回可验证证据包；存在冻结产物时直接读取它。
 
-    Before approval it is assembled live, which is the honest answer to "what would be
-    frozen if I approved this?". After approval the artifact's `payload` is authoritative:
-    re-assembling would silently pick up anything that changed since.
-    """
+    批准前实时组装，让用户检查将被批准的内容；批准后以产物 payload 为准，避免重新组装时混入后来变化的数据。"""
     run = await _run_or_404(db, run_id, current_user.id)
     artifact = (
         await db.execute(select(ResearchArtifact).where(ResearchArtifact.run_id == run.id))
@@ -830,12 +744,9 @@ async def get_verification(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Run the **shipped standalone verifier** over this run's bundle and report every check.
+    """调用随项目发布的独立校验器，返回每项检查结果。
 
-    Not a summary boolean: a reader who is told "verified" learns less than one who is told
-    which of the six checks passed. `assembled=false` means the verifier was not run, which
-    is not the same as a failure.
-    """
+    不能只给一个布尔值：用户需要知道哪些检查通过。assembled=false 表示没有执行校验，不能当成校验失败。"""
     run = await _run_or_404(db, run_id, current_user.id)
     artifact = (
         await db.execute(select(ResearchArtifact).where(ResearchArtifact.run_id == run.id))
@@ -857,10 +768,8 @@ async def get_verification(
         "bundle_hash": manifest.bundle_hash,
         "frozen": artifact is not None,
         "checks": [{"name": c.name, "passed": c.passed, "detail": c.detail} for c in result.checks],
-        # The same provenance the standalone verifier prints, so the in-app answer and the
-        # file a third party runs cannot disagree about what a run was instructed to do.
-        # Hashes only: the prompts themselves are in the bundle for whoever downloads it,
-        # and this endpoint is a verdict, not an export.
+        # 与独立校验器展示同一份来源记录，保证页面和离线校验对运行指令的解释一致。
+        # 这里只返回哈希；完整提示词由证据包导出提供。
         "bundle_version": manifest.bundle_version,
         "prompt_overrides_status": result.prompt_overrides_status,
         "prompt_provenance": [
@@ -876,7 +785,7 @@ async def get_verification(
     }
 
 
-# ── SSE ───────────────────────────────────────────────────────────────────────────
+# 实时事件流（SSE）
 
 
 async def _cited_store(db, run_id, document_id, current_user, corpus, also_in):
@@ -906,8 +815,8 @@ async def get_cited_document_text(
     corpus: CorpusLocator = Depends(get_corpus_locator),
     also_in: list[uuid.UUID] = Depends(cited_documents.no_other_projects),
 ):
-    """The extracted text of one document version this run cited, wherever it lives now
-    (RFC V3.1 §7.3; `app/services/cited_documents.py` holds the rules)."""
+    """读取本次引用的特定文档版本的提取正文，无论它现在存放在哪里。
+    具体规则见 app/services/cited_documents.py 与 RFC V3.1 §7.3。"""
     store = await _cited_store(db, run_id, document_id, current_user, corpus, also_in)
     found = await store.extracted(document_id)
     if found is None:
@@ -924,7 +833,7 @@ async def download_cited_document(
     corpus: CorpusLocator = Depends(get_corpus_locator),
     also_in: list[uuid.UUID] = Depends(cited_documents.no_other_projects),
 ):
-    """The original file of one document version this run cited, under the same rules."""
+    """按相同的版本与权限规则，返回本次引用文档的原始文件。"""
     store = await _cited_store(db, run_id, document_id, current_user, corpus, also_in)
     found = await store.blob(document_id)
     if found is None:
@@ -943,31 +852,22 @@ async def stream_run(
     current_user: User = Depends(get_current_user),
     redis=Depends(get_redis),
 ):
-    """Live run events. **The same bus, the same channel shape, the same replay rule.**
+    """研究运行的实时事件流，复用会话流的通道与回放规则。
 
-    Not a second event architecture: `agent_logs` rows are the durable backlog and the
-    Redis channel is the live tail, exactly as the session stream works — the worker writes
-    through `adapters.agent_log_sink`, which is why `agent_logs.session_id` had to become
-    polymorphic. `Last-Event-ID` therefore replays a run from a durable id the same way.
-
-    The stop-list is the session stream's plus nothing: a stream held open on a suspended graph waits
-    on no one, so it closes at `PLAN_READY` and `HITL_READY` as well as the two terminals.
-    """
+    agent_logs 保存历史，Redis 提供实时消息；worker 通过 adapters.agent_log_sink 写入，所以 agent_logs.session_id 允许指向会话或研究运行。重连依靠 Last-Event-ID 回放。
+    实时流在 PLAN_READY、HITL_READY 及完成、失败事件处关闭，避免图等待人工操作时一直空等。"""
     run = await _run_or_404(db, run_id, current_user.id)
     last_event_id = request.headers.get("last-event-id")
     after_id = int(last_event_id) if last_event_id and last_event_id.isdigit() else 0
 
     async def gen() -> AsyncGenerator[str]:
-        # Deferred, like the two other uses of `adapters` in this module: it reaches
-        # `app.config` and `app.db.redis`, and the desktop imports this file at request
-        # time. Module scope here would put the server's data plane in the desktop's
-        # import tree for a route that host does not even mount.
+        # 延迟导入 adapters，避免桌面端导入共享路由时，连带加载服务端配置和 Redis。
+        # 桌面并不挂载这个实时接口，不能因此被迫安装服务端依赖。
         from app import adapters
 
         channel = f"session:{run_id}:events"
         pubsub = redis.pubsub()
-        # Subscribe BEFORE snapshotting the backlog, so an event published in the gap is
-        # queued rather than lost from both — the trap the session stream already documents.
+        # 先订阅再读取历史快照，确保两步之间发生的事件进入订阅队列，不会两边都漏掉。
         await pubsub.subscribe(channel)
         try:
             async with AsyncSessionLocal() as sdb:
@@ -983,9 +883,8 @@ async def stream_run(
                     .all()
                 )
 
-            # The loop itself is `app/services/event_stream.py`, shared with the session
-            # stream and both desktop streams. What stays here is the half that genuinely
-            # differs: where the backlog is read and what the live feed is.
+            # 监听循环统一由 app/services/event_stream.py 实现，供两个主机的运行与会话流复用。
+            # 这里只负责各入口确实不同的部分：历史从哪里读、实时消息从哪里来。
             async for frame in sse_frames(
                 connected={"type": "connected", "run_id": str(run_id)},
                 backlog=[(row.id, row.payload) for row in backlog],
@@ -1003,7 +902,7 @@ async def stream_run(
     return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
-# ── Exports ───────────────────────────────────────────────────────────────────────
+# 报告导出
 
 
 async def _latest_revision(db: AsyncSession, run: ResearchRun, version: int | None):
@@ -1017,8 +916,7 @@ async def _latest_revision(db: AsyncSession, run: ResearchRun, version: int | No
 
 
 async def _source_dicts(db: AsyncSession, run_id) -> list[dict]:
-    """The numbered source list an export renders. Uncited sources are excluded — they
-    have no `[n]` to render against, and inventing one is the thing this product exists to refuse."""
+    """生成导出报告所需的编号来源列表；未引用来源没有 [n]，必须排除，不能凭空编造编号。"""
     rows = (
         (
             await db.execute(
@@ -1040,7 +938,7 @@ async def export_markdown(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """The approved bytes, plus the model-attribution footer both hosts already share."""
+    """输出已批准的正文，并追加两个主机共用的模型署名页脚。"""
     run = await _run_or_404(db, run_id, current_user.id)
     revision = await _latest_revision(db, run, revision_version)
     body = _demo_stamped(run, revision.report_markdown) + render_model_attribution_md(
@@ -1060,7 +958,7 @@ async def export_pdf(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Reuses `app.services.export.render_pdf` — one PDF pipeline, not two."""
+    """复用 app.services.export.render_pdf，避免维护两套 PDF 生成流程。"""
     run = await _run_or_404(db, run_id, current_user.id)
     revision = await _latest_revision(db, run, revision_version)
     from app.services import export
@@ -1080,32 +978,21 @@ async def export_pdf(
 
 
 def _checker_accuracy(run: ResearchRun) -> dict | None:
-    """The D-24 label a selected-files run recorded; absent on any other run."""
+    """读取所选文件运行记录的 D-24 标记；其他运行没有该标记。"""
     return (run.grounding_report or {}).get("checker_accuracy")
 
 
 def _demo_stamped(run: ResearchRun, report: str) -> str:
-    """Prose exports of a demo run say so; the bundle does not.
+    """演示运行的文字导出需要演示标记，但证据包正文不能追加该标记。
 
-    Same split the session exports make: `report_hash` is checked against the hash a human
-    approved, so injecting a banner into the bundle's report body would break verification
-    for a reason that has nothing to do with the artifact's integrity. The bundle carries
-    `demo` as a hash-covered field instead.
-    """
-    # Straight to the engine's own stamper, which is where this rule lives for both hosts
-    # (`tests/test_demo_stamp_parity.py`). This used to reach it through
-    # `app.api.v1.research._DEMO_STAMP`, a one-line alias of the same constant — and
-    # deferring that import to call time did not make it safe, it only moved the cost to
-    # the first export: `app/api/v1/research.py` imports `app.workers.tasks` at module
-    # scope, so on the packaged desktop app this raised
-    # `ModuleNotFoundError: No module named 'celery'` and every Markdown export answered
-    # 500. It was unreachable until the desktop could complete a run, which is the kind of
-    # latent break that ships. `research_engine` imports no host packages at all, so there
-    # is nothing to defer.
+    正文哈希必须与人工批准时一致，否则会破坏校验。证据包改用受哈希保护的 demo 字段说明演示身份，与会话导出保持一致。"""
+    # 直接调用引擎提供的演示标记函数（tests/test_demo_stamp_parity.py）。
+    # 此前经 app.api.v1.research 间接读取常量，会连带导入 Celery，使未打包 Celery 的桌面端导出时报错。
+    # 延迟导入只能推迟这个错误，不能解决依赖问题；引擎本身不依赖主机包，因此可直接使用。
     return stamp_demo_md(report, demo=bool(run.demo))
 
 
-# ── Cancel ────────────────────────────────────────────────────────────────────────
+# 取消运行
 
 
 @router.post("/{run_id}/cancel")
@@ -1114,13 +1001,9 @@ async def cancel_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Record that cancellation was requested. **Advisory, and the response says so.**
+    """持久化用户的取消请求，但不承诺执行立即停止。
 
-    The engine does not check this between nodes, so an in-flight run continues to its next
-    stop. What this does guarantee is durable: the run is marked CANCELLED with a timestamp
-    and an actor, and the UI must not claim the work stopped immediately. Strengthening the
-    engine's cancellation is a separate change and is not made here.
-    """
+    当前引擎不会在每个节点之间检查取消，在途运行可能继续到下一个暂停点。这里保证保存 CANCELLED、取消时间和操作者；界面不能声称所有工作已立即终止。引擎抢占式取消属于另一项改造。"""
     run = await _run_or_404(db, run_id, current_user.id)
     if run.status in ("COMPLETED", "FAILED", "CANCELLED"):
         raise Conflict(f"This run is already {run.status}.")
@@ -1129,7 +1012,7 @@ async def cancel_run(
     return {
         "status": run.status,
         "cancelled_at": run.cancelled_at.isoformat(),
-        # Stated in the payload so a client cannot accidentally promise more than is true.
+        # 在返回数据中明确说明取消的边界，避免客户端作出超出实际能力的承诺。
         "advisory": True,
         "detail": (
             "Cancellation recorded. Work already in flight runs to its next checkpoint; "
@@ -1138,7 +1021,7 @@ async def cancel_run(
     }
 
 
-# ── Archive, Restore & Delete ─────────────────────────────────────────────────────
+# 归档、恢复与删除
 
 
 @router.post("/{run_id}/archive")
@@ -1147,7 +1030,7 @@ async def archive_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Mark a run as archived. Idempotent."""
+    """标记运行已归档；重复请求不会重复产生效果。"""
     run = await _run_or_404(db, run_id, current_user.id)
     await run_lifecycle.archive_run(db, run)
     await db.commit()
@@ -1164,7 +1047,7 @@ async def unarchive_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Restore an archived run to active history. Idempotent."""
+    """恢复已归档运行；重复请求不会重复产生效果。"""
     run = await _run_or_404(db, run_id, current_user.id)
     await run_lifecycle.unarchive_run(db, run)
     await db.commit()
@@ -1181,12 +1064,9 @@ async def delete_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Permanently delete a run and all associated records.
+    """永久删除运行及关联记录。
 
-    Refuses non-terminal runs (409 Conflict). Deletes polymorphic AgentLogs, ResearchArtifact,
-    Review rows, and the ResearchRun row (cascading all dependent tables). Cleans up LangGraph
-    checkpoints via checkpoints.delete_thread.
-    """
+    非终态运行返回 409，避免删除正在工作的任务。显式清理多态代理日志、产物与审核，再删除运行并级联清理依赖表；LangGraph 检查点通过 checkpoints.delete_thread 清理。"""
     run = await _run_or_404(db, run_id, current_user.id)
     try:
         await run_lifecycle.delete_run(db, run)
@@ -1198,7 +1078,7 @@ async def delete_run(
 
     try:
         await checkpoints.delete_thread(str(run_id))
-    except Exception as e:  # noqa: BLE001 — user rows are gone; log and move on
+    except Exception as e:  # noqa: BLE001 — 用户记录已删除；检查点清理失败记日志，不推翻已完成的删除
         logger.warning("checkpoint_cleanup_failed", run_id=str(run_id), error=str(e))
 
     logger.info("run_deleted", run_id=str(run_id))

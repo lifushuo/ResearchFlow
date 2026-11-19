@@ -50,7 +50,7 @@ export function PreviewDrawer({
     <div className="fixed inset-0 z-40 flex justify-end">
       <button
         type="button"
-        aria-label="Close preview"
+        aria-label="关闭预览"
         onClick={onClose}
         className="absolute inset-0 bg-black/40"
       />
@@ -58,7 +58,7 @@ export function PreviewDrawer({
         ref={panelRef}
         role="dialog"
         aria-modal="true"
-        aria-label={`Preview of ${filename}`}
+        aria-label={`预览：${filename}`}
         tabIndex={-1}
         className="relative flex h-full w-full max-w-2xl flex-col border-l border-border bg-bg-surface shadow-xl"
       >
@@ -80,12 +80,12 @@ export function PreviewDrawer({
                   if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
                   e.preventDefault();
                   downloadFile(url, filename).catch((err: Error) =>
-                    toast.error(err instanceof ApiError ? err.message : "Download failed."),
+                    toast.error(err instanceof ApiError ? err.message : "下载失败。"),
                   );
                 }}
                 className="border border-border px-2 py-1 font-mono text-xs text-text-secondary hover:border-accent hover:text-accent"
               >
-                Download
+                下载
               </a>
             )}
             <button
@@ -93,7 +93,7 @@ export function PreviewDrawer({
               onClick={onClose}
               className="border border-border px-2 py-1 font-mono text-xs text-text-secondary hover:border-accent hover:text-accent"
             >
-              Close
+              关闭
             </button>
           </div>
         </div>

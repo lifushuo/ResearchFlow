@@ -1,18 +1,10 @@
-"""
-Pure report-quality metrics (docs/08 §5). No I/O, no models — unit-tested so the
-numbers in a committed eval run are trustworthy and diffable over time.
+"""报告质量的纯结构指标（docs/08 §5）。不执行 I/O，也不调用模型；单元测试保证已提交的评测数字可信且可纵向比较。
 
-The LLM-judged *citation support rate* (does a cited snippet actually support the
-claim) lives in the harness because it needs a model; everything here is structural
-and deterministic.
+引用支持率需要模型判断片段是否支持主张，因此实现在评测框架中；此模块只做确定性结构计算。
 
-**Claim and citation extraction is not defined here.** It lives in
-`research_engine.claims`, and this module re-exports it. The engine's citation-fidelity
-pass acts on the same sentences this module judges, so a second definition here would let
-the pipeline and its own measurement rule on different claims. The re-exports below are
-the *same objects*, not copies — `tests/test_claim_extraction_parity.py` asserts that by
-identity, so a future copy-paste back into this file fails the suite.
-"""
+主张和引用的提取统一定义在 research_engine.claims，本模块仅重新导出。
+引擎的引用忠实度检查与评测必须处理同一组句子，否则测量对象会发生偏差。
+重新导出的是同一个对象而非副本；tests/test_claim_extraction_parity.py 通过对象身份检查阻止重复实现。"""
 
 from __future__ import annotations
 
@@ -30,9 +22,8 @@ from research_engine.claims import (
     split_sentences,
 )
 
-# Re-exported for callers that import them from here (the harness, the benchmark, and
-# any contributor following the docs). Named explicitly so a linter cannot decide they
-# are unused imports and delete the module's public surface.
+# 为评测框架、基准及文档中的调用方重新导出这些名称。
+# 显式列出公共接口，避免检查器将其误判为未使用的导入并删除。
 __all__ = [
     "CITE_RE",
     "CONFLICTS_HEADING_RE",
@@ -62,14 +53,11 @@ def source_indices(sources: list[dict]) -> set[int]:
 
 
 def citation_stats(text: str, sources: list[dict]) -> dict:
-    """Totals + resolution: how many in-text [n] markers point at a real source.
+    """统计正文 [n] 引用标记的总数，以及能否解析到真实来源。
 
-    `resolution_rate` is delegated to `research_engine.citation_rate`, which is also what
-    the app writes onto a session. Two implementations of one measurement is how the
-    number a benchmark publishes and the number the UI shows drift apart — and the app
-    cannot import this module (see `graph.py`'s inlined uncited-count), so the shared
-    copy has to live in the engine rather than here.
-    """
+    resolution_rate 委托给 research_engine.citation_rate，会话记录也使用这一实现。
+    同一指标若有两套算法，基准数字便会与界面不一致；应用层不能导入评测包，
+    因此共享实现必须放在引擎中，参见 graph.py 中的未引用主张计数。"""
     from research_engine.citation_rate import resolution_rate
 
     cites = extract_citations(body_before_sources(text))
@@ -77,24 +65,21 @@ def citation_stats(text: str, sources: list[dict]) -> dict:
     return {
         "total_citations": len(cites),
         "unresolved_citations": sum(1 for n in cites if n not in valid),
-        # None (not 1.0) when there are no citations — an uncited report isn't "perfect".
+        # 没有引用时返回 None，而不是 1.0：无引用的报告不能算作引用完全正确。
         "resolution_rate": resolution_rate(text, sources),
     }
 
 
 def uncited_claim_count(text: str) -> int:
-    """Assertive lines carrying no [n] citation — a proxy for unsupported claims."""
+    """统计不带 [n] 引用的断言句，作为缺少证据支持的主张数量的近似值。"""
     return sum(1 for c in claim_lines(text) if not CITE_RE.search(c))
 
 
 def contradictions_surfaced(text: str) -> int:
-    """How many conflicting-claim pairs the report surfaces (docs/12 M11).
+    """统计报告明确呈现的冲突主张对数（docs/12 M11）。
 
-    Counts numbered items under the engine-rendered "Conflicting evidence" heading, up
-    to the next heading. Purely structural: it measures what the run SURFACED, which is
-    the honest baseline metric — whether the conflicts were real is what the curated
-    fixture eval (evals/contradiction_eval.py) measures against a model.
-    """
+    计数范围为引擎生成的“Conflicting evidence”标题下的编号项，遇到下一个标题即停止。
+    这里只测量报告展示了多少冲突；冲突是否真实由 evals/contradiction_eval.py 的精选样例和模型评测。"""
     lines = (text or "").splitlines()
     inside = False
     count = 0
@@ -108,23 +93,20 @@ def contradictions_surfaced(text: str) -> int:
     return count
 
 
-# Bumped whenever a metric's *definition* changes, so two committed runs are never
-# silently compared across incompatible definitions. Recorded in every results file.
+# 指标定义变化时递增版本号，并记录到每份结果中，防止不同定义下的历史数字被直接比较。
 #
-#   1 — original: citations matched `[n]` only; claims were raw lines.
-#   2 — grouped markers `[1, 3]` counted as separate citations; claims split on sentences
-#       (docs/12 M5, defect D1). Both enlarge the denominator, so a v2 number is NOT
-#       comparable to a v1 number.
-#   3 — Limitations sentences excluded from claims (D5): they are hedging, not factual
-#       claims. A v3 support rate is not comparable to v2.
-#   4 — Conflicting-evidence block excluded from claims (docs/12 M11): it quotes both
-#       sides of a conflict and is engine-rendered, not authored claims. Adds the
-#       contradictions_surfaced metric.
-METRICS_VERSION = 4
+# 1：原始定义，只识别 [n]，主张按原始行计数。
+# 2：将 [1, 3] 拆分为独立引用，主张改按句子切分（docs/12 M5，缺陷 D1）。
+#    两项变化都会扩大分母，因此 v2 与 v1 不可直接比较。
+# 3：排除 Limitations 中的保留性表述（D5），它们不是事实主张；v3 支持率不可与 v2 比较。
+# 4：排除引擎生成的冲突证据区块（docs/12 M11），其中引用冲突双方，并非作者的主张；
+#    同时新增 contradictions_surfaced 指标。
+# 5：Judge 仅接受当前批次内编号；不再让越界判定污染其他 Claim 或支持率分母。
+METRICS_VERSION = 5
 
 
 def report_metrics(text: str, sources: list[dict]) -> dict:
-    """Structural quality for one report."""
+    """计算一份报告的结构质量指标。"""
     stats = citation_stats(text, sources)
     return {
         "word_count": len((text or "").split()),

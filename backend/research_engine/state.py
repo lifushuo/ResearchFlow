@@ -1,9 +1,6 @@
-"""
-LangGraph pipeline state (docs/architecture/04-agent-architecture.md §2).
+"""LangGraph 流水线状态，见 docs/architecture/04-agent-architecture.md §2。
 
-A plain TypedDict — LangGraph manages it and the Postgres checkpointer persists it
-at every step, so it must stay JSON-serializable (primitives/lists/dicts only).
-"""
+使用普通 TypedDict，由 LangGraph 管理并逐步保存到检查点；只能包含可 JSON 序列化的数据。"""
 
 from __future__ import annotations
 
@@ -11,64 +8,55 @@ from typing import Any, TypedDict
 
 
 class AgentState(TypedDict, total=False):
-    # Identity
+    # 运行身份。
     session_id: str
     user_id: str
 
-    # Input
+    # 输入参数。
     original_query: str
     research_depth: str
 
-    # Planner
+    # 规划阶段。
     tasks: list[dict[str, Any]]
-    # The planner's proposed report structure, editable at the plan gate
-    # (internal/07 Phase 4). Empty when the planner proposed none or the gate was skipped.
+    # 规划器提议的报告结构，可在计划关卡编辑；未提议或跳过时为空。
     proposed_outline: list[dict[str, Any]]
-    # Set by plan_gate_node once the gate has been passed (approved or skipped) — lets
-    # a resumed run tell "never reached the gate" apart from "passed it".
+    # 通过或跳过计划关卡后设为真，使恢复运行能区分尚未到达和已经通过。
     plan_approved: bool | None
 
-    # Executor / Critic rounds. Tasks run concurrently, so progress is tracked per task
-    # rather than by a moving index (docs/12 M7).
+    # 执行与评审轮次；并发任务按各自 ID 追踪进度，不能靠单个移动索引。
     #
-    # `evidence` is rebuilt every round in *task-definition order*, never in completion
-    # order — otherwise the synthesizer would number citations differently on every run.
-    # Each item carries its own `task_id`, so it is also the per-task store.
+    # 每轮按任务定义顺序重建 evidence，不按完成顺序，避免并发速度改变引用编号。
+    # 每项携带 task_id，因此也可用于逐任务追踪。
     #
-    # `verdicts` and `retries` are keyed by `str(task_id)`: the checkpointer serializes
-    # state as JSON, where dict keys are always strings.
+    # verdicts、retries 以字符串任务 ID 作键，因为检查点 JSON 对象键只能是字符串。
     evidence: list[dict[str, Any]]
     verdicts: dict[str, dict[str, Any]]
     retries: dict[str, int]
     research_round: int
-    # Distinct sources retrieval actually delivered text for, across the whole run. Kept
-    # apart from `evidence` because "found nothing to read" and "read plenty and made
-    # nothing of it" are different failures with different remedies, and a run that
-    # gathered no evidence must be able to say which one happened (`_no_research_reason`).
+    # 整个运行实际取得文本的独立来源数。与 evidence 分开，
+    # 用来区分没有读到来源和读到很多来源却没提取出证据，两种故障处理方法不同。
     sources_seen: int
 
-    # Synthesis / HITL
+    # 综合与人工审核。
     draft_report: str | None
     sources: list[dict[str, Any]]
-    # Conflicting-claim pairs found by the contradiction detector (docs/12 M11).
-    # Surfaced in the report block and the gate count; never auto-resolved.
+    # 检测出的冲突观点对，展示到报告和关卡中，不自动裁决，见 docs/12 M11。
     contradictions: list[dict[str, Any]]
     human_feedback: str | None
     rework_count: int
     approved: bool | None
-    # A selected-files run's claim-level grounding record (research_engine/grounding.py):
-    # counts, causes, status, and the sha256 of the text it validated. The route out of the
-    # synthesizer and the gate both decide on it; None on every other run.
+    # 指定文件研究的逐 Claim 核验记录：计数、原因、状态和被核验正文哈希。
+    # 综合路由与人工关卡都据此判断；其他运行保持 None。
     grounding_report: dict[str, Any] | None
 
-    # Output
+    # 最终输出。
     final_report: str | None
 
-    # Telemetry
+    # 用量与耗时统计。
     tokens_input: int
     tokens_output: int
     cost_usd: float
     started_at: float
 
-    # Terminal
+    # 终止状态。
     error: str | None

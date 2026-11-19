@@ -128,6 +128,48 @@ INTENTIONAL_SERVER_ONLY: dict[str, str] = {
         "desktop takes the provider as a path segment: /models/providers/health/{provider}; "
         "the frontend already branches on isDesktop for this one"
     ),
+    # Evaluation is server-only: it needs accounts and isolated worker lanes.
+    # v1.1 Dataset Registry: same server-only gate, but reads the static in-repo manifest
+    # under backend/evals/ instead of the mounted artifact root. Still account-gated, so
+    # the desktop sidecar cannot serve it and must not try.
+    "GET /evaluation/datasets": (
+        "server-only read-only dataset registry; desktop has no accounts or backend/evals manifest"
+    ),
+    "GET /evaluation/datasets/{dataset_id}": (
+        "server-only metadata-safe dataset case paging; desktop has no accounts or evals manifest"
+    ),
+    # v1.3 unified pipeline: one Pipeline ID orchestrating fixed per-dataset adapters.
+    # Creation needs a real account plus the shared evaluation job volume and the
+    # physically separated offline/online worker lanes; the desktop sidecar has none.
+    "GET /evaluation/pipelines/capabilities": (
+        "server-only pipeline capability preflight; desktop has no accounts or worker lanes"
+    ),
+    "POST /evaluation/pipelines": (
+        "server-only unified pipeline creation; desktop has no accounts, job volume or worker lanes"
+    ),
+    "GET /evaluation/pipelines": (
+        "server-only owner-scoped pipeline listing; desktop has no accounts or job volume"
+    ),
+    "GET /evaluation/pipelines/{pipeline_id}": (
+        "server-only owner-scoped pipeline detail; desktop has no accounts or job volume"
+    ),
+    **{
+        route: "server-only evaluation execution diagnostics; desktop has no evaluation workers or shared job volume"
+        for route in (
+            "GET /evaluation/closure/execution-incidents",
+            "GET /evaluation/pipelines/{pipeline_id}/diagnostics/{dataset_id}",
+        )
+    },
+    **{
+        route: "server-only owner-scoped evaluation closure; desktop has no evaluation workers or shared job volume"
+        for route in (
+            "GET /evaluation/closure/runs",
+            "GET /evaluation/closure/bad-cases",
+            "GET /evaluation/closure/bad-cases/{bad_case_id}",
+            "POST /evaluation/closure/runs/{run_id}/gate",
+            "GET /evaluation/closure/compare",
+        )
+    },
 }
 
 #: On the desktop host and deliberately not on the server.

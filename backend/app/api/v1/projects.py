@@ -1,11 +1,6 @@
-"""
-Project endpoints (docs/14 §8).
+"""项目管理接口（docs/14 §8）。
 
-A project is the container research lives in. Deleting one deletes the research inside
-it — sessions cascade at the DB level, and their LangGraph checkpoints are dropped
-explicitly for the same reason session delete does it: those tables carry the full agent
-state, including fetched page content, and are not reachable by a foreign key.
-"""
+删除项目会删除其中研究。会话通过外键级联删除，但 LangGraph 检查点不受外键管理，必须显式清理，否则会残留包含网页正文的完整代理状态。"""
 
 from __future__ import annotations
 
@@ -42,7 +37,7 @@ DEFAULT_PROJECT_NAME = "General"
 
 
 async def _counts(db: AsyncSession, project_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
-    """Session counts for a page of projects — sums across both sessions and runs."""
+    """为本页项目统计研究数量，同时计入会话与运行。"""
     if not project_ids:
         return {}
     norm_ids = [uuid.UUID(str(pid)) for pid in project_ids]
@@ -80,12 +75,9 @@ def _to_response(project: Project, session_count: int = 0) -> ProjectResponse:
 
 
 async def get_or_create_default_project(db: AsyncSession, user_id: uuid.UUID) -> Project:
-    """This user's fallback project, created on demand.
+    """获取用户默认项目，缺少时创建。
 
-    New accounts have no projects, and a user must never be blocked from starting
-    research just because they haven't made one. Mirrors the "General" project the
-    backfill migration created for pre-existing accounts.
-    """
+    新账号无需先建项目就能研究；行为与历史数据迁移创建的 General 项目一致。"""
     existing = (
         await db.execute(
             select(Project)
@@ -109,7 +101,7 @@ async def get_or_create_default_project(db: AsyncSession, user_id: uuid.UUID) ->
 async def resolve_project(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID | None
 ) -> Project:
-    """The project a request targets: the one asked for, else the default."""
+    """解析请求指定的项目；没有指定则使用用户默认项目。"""
     if project_id is None:
         return await get_or_create_default_project(db, user_id)
     project = (
@@ -160,8 +152,7 @@ async def create_project(
     try:
         await db.commit()
     except IntegrityError:
-        # The unique index is case-insensitive, so this is the only reliable place to
-        # detect a duplicate without racing a pre-check.
+        # 唯一索引不区分大小写；在数据库写入处处理冲突，才能避免先查询再插入的并发竞态。
         await db.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -208,12 +199,9 @@ async def delete_project(
     corpus: CorpusLocator = Depends(get_corpus_locator),
     delete_checkpoint: CheckpointDeleter = Depends(get_checkpoint_deleter),
 ):
-    """Delete a project and every session in it.
+    """删除项目及其中全部会话。
 
-    Refuses while any session is still running, for the same reason session delete
-    does: pulling the row out from under an in-flight worker turns a clean failure
-    into a confusing one.
-    """
+    仍有会话执行时拒绝删除，避免后台 Worker 正使用的数据突然消失，使故障难以解释。"""
     project = await resolve_project(db, current_user.id, project_id)
 
     running_v1 = (
@@ -251,33 +239,27 @@ async def delete_project(
         .all()
     )
     if v2_run_ids:
-        # Polymorphic agent logs (no FK)
+        # 多态代理日志没有外键，需要显式删除。
         await db.execute(delete(AgentLog).where(AgentLog.session_id.in_(v2_run_ids)))
-        # Research artifacts
+        # 研究最终产物
         await db.execute(delete(ResearchArtifact).where(ResearchArtifact.run_id.in_(v2_run_ids)))
-        # Reviews (which have RESTRICT FK to research_runs)
+        # 先删除审核记录，其指向研究运行的外键为 RESTRICT。
         await db.execute(delete(Review).where(Review.run_id.in_(v2_run_ids)))
-        # Research runs
+        # 研究运行记录
         await db.execute(delete(ResearchRun).where(ResearchRun.project_id == project.id))
 
-    await db.delete(project)  # sessions (and their logs/chat/audit) cascade
+    await db.delete(project)  # 级联删除会话及其日志、聊天和审计。
     await db.commit()
 
     for sid in session_ids:
         try:
             await delete_checkpoint(str(sid))
-        except Exception as e:  # noqa: BLE001 — user rows are gone; log and continue
+        except Exception as e:  # noqa: BLE001 — 用户记录已删除，清理异常只记录日志后继续
             logger.warning("checkpoint_cleanup_failed", session_id=str(sid), error=str(e))
 
-    # The project's corpus (docs/12 M10) is a standalone SQLite file keyed by project_id on
-    # both hosts; where it lives is `corpus`'s own `.delete()` to know, not this route's. On the server, left
-    # alone it becomes an orphan that never surfaces again (no route can address a deleted
-    # project's corpus) while still holding every document and embedding that was in it,
-    # contradicting the "no orphan vectors after a delete" standard the project model
-    # itself documents (app/models/project.py) — including the SQLite sidecars, since
-    # removing only `.sqlite` leaves a write-ahead log holding rows that were never
-    # checkpointed. On the desktop there is nothing project-scoped to orphan, so its
-    # locator's `.delete()` is a no-op.
+    # 项目语料是独立 SQLite 文件，由定位器负责删除，不在路由里拼路径（docs/12 M10）。
+    # 若只删业务行，文件及向量会永久成为无法访问的残留；还需清理 SQLite 辅助文件，不能遗漏 WAL。
+    # 桌面使用共用语料库，其定位器按设计不执行项目级文件删除。
     corpus.delete(project_id)
 
     logger.info("project_deleted", project_id=str(project_id), sessions=len(session_ids))

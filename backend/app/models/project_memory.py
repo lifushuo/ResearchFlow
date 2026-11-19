@@ -1,25 +1,8 @@
-"""
-Project memory, with provenance to approved artifacts only.
+"""项目记忆及其指向获批产物的来源关系。
 
-**Created ahead of its writer.** The provenance tables define the boundary; the chunk
-store in `memory_chunk.py` is what retrieval reads today.
-
-**The memory boundary is two foreign keys and a check constraint.** `project_memory_provenance`
-has exactly one artifact-side foreign key, pointing at `research_artifacts` — and an artifact
-cannot exist without an approving review (see `review.py`). So "only approved research becomes
-memory" is structural, not a status comparison in a service. There is no column
-anywhere that could point a memory item at a revision, a run, or a chat message.
-
-**Cardinality is deliberately not fixed**. Provenance is a link table rather than
-an `artifact_id` column, because the justification for one-artifact-per-item is "that is what
-today's chunker does" — an implementation fact, not a domain one. The relationship is
-one-to-many in the model and one-to-one in practice until something justifies otherwise.
-
-Like `memory_chunks`, `project_memory_items` is **Postgres-only**: its embedding column is
-pgvector. Both tables here are excluded from the desktop's `create_all` via
-`POSTGRES_ONLY_TABLES` in `app/models/__init__.py` — provenance to a table that does not
-exist is meaningless, so they are excluded together.
-"""
+来源表只允许引用 ResearchArtifact，而产物必须有报告批准，因此“记忆只来自获批研究”由结构保证，不能指向草稿、运行或聊天消息。
+使用关联表而非单个 artifact_id，允许一条知识将来关联多个产物，不把当前切块方式误当业务约束。
+向量列使用 pgvector，仅 Postgres 提供；桌面通过 POSTGRES_ONLY_TABLES 同时排除记忆和来源表。"""
 
 from __future__ import annotations
 
@@ -45,7 +28,7 @@ from app.models.types import UuidType
 
 
 class ProjectMemoryItem(Base):
-    """One retrievable chunk of approved knowledge. Wholly derived from artifacts."""
+    """可检索的一段获批知识，完全派生自最终产物。"""
 
     __tablename__ = "project_memory_items"
 
@@ -56,11 +39,9 @@ class ProjectMemoryItem(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=False)
-    # Vectors from different models are not comparable even at equal width, so retrieval
-    # filters on the model that produced them — the rule `memory.retrieve` already enforces.
+    # 不同模型向量即使同维度也不能混用，检索按生成模型过滤。
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
-    # SHA-256 over the ordered set of source artifact hashes. Makes re-ingestion idempotent
-    # without a group-by over the link table; recomputable from `project_memory_provenance`.
+    # 对有序的来源产物哈希集合计算 SHA-256，保证重复摄取可识别；也可从来源表重新计算。
     provenance_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -80,13 +61,9 @@ class ProjectMemoryItem(Base):
 
 
 class ProjectMemoryProvenance(Base):
-    """Which approved artifact(s) a memory item derives from.
+    """记录一条记忆派生自哪些获批产物。
 
-    The only artifact-side foreign key in the memory subsystem, and therefore the boundary
-    itself. Every durable memory item must reach at least one approved ResearchArtifact
-    through this table — a rule the database cannot express ("a child row must exist"), so
-    that remainder is application-enforced.
-    """
+    每条持久记忆必须至少关联一个获批 ResearchArtifact；数据库不能直接要求子行存在，这部分由应用层保证。"""
 
     __tablename__ = "project_memory_provenance"
 

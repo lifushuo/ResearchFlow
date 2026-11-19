@@ -1,22 +1,7 @@
-"""
-Assembling the verifiable artifact from the research domain tables.
+"""从研究领域表组装可验证证据包的唯一入口。
 
-One home: `app.run_lifecycle.create_artifact` freezes this into a `ResearchArtifact`.
-`research_engine.bundle` is the schema and `research_engine.verify_bundle` is the checker,
-both untouched — so an artifact this produces verifies with the same standalone script a
-reader can run without the product.
-
-Two refusals are load-bearing:
-
-* **A run whose evidence was never read produces no bundle.** `research_runs.evidence_outcome`
-  says whether the graph's evidence was actually recovered from its checkpoint. `READ` means
-  the `evidence` rows *are* the record, so zero of them is a measured zero. Either failure
-  state means the count is unknown, and a bundle asserting zero evidence there would number
-  every `[n]` against nothing and claim a quality nobody observed.
-* **A plan approval never serializes as `"approved"`.** `verify_bundle` treats that string
-  as report authorization and no database constraint reaches a JSON file, so the guard has
-  to be here.
-"""
+由 run_lifecycle.create_artifact 冻结，结构与独立校验器沿用 research_engine。证据未成功从检查点恢复时拒绝组装，不能把未知数量写成零。
+计划批准绝不能序列化为 approved；校验器将该动作视为报告授权，而数据库约束保护不到导出的 JSON。"""
 
 from __future__ import annotations
 
@@ -31,15 +16,12 @@ from app.services import corpus_selection
 from research_engine import bundle as bundle_mod
 from research_engine import verify_bundle
 
-#: The vocabulary a bundle uses for a review decision, and the only place it is written.
-#: Injective, so a decision and its serialised action determine each other.
+# 审核决定到证据包动作的唯一映射；必须一一对应，才能无歧义还原。
 REVIEW_TO_BUNDLE_ACTION = {
     ("REPORT", "APPROVED"): "approved",
     ("REPORT", "REWORK_REQUESTED"): "rework_requested",
-    # The session exports had no `rejected` action, so this pair has no counterpart there —
-    # but it must still be DISTINCT, or the map stops being injective and the approval chain stops
-    # being comparable. `verify_bundle` counts only `approved`, so an action it does not
-    # know authorizes nothing, which is the correct outcome for a rejection.
+    # 旧会话没有 rejected 动作，但这里仍要为报告拒绝保留独立名称，不能破坏映射的一一对应。
+    # 校验器只认可 approved，因此未知或拒绝动作都不能授权产物。
     ("REPORT", "REJECTED"): "rejected",
     ("PLAN", "APPROVED"): "plan_approved",
     ("PLAN", "REWORK_REQUESTED"): "plan_rework_requested",
@@ -48,7 +30,7 @@ REVIEW_TO_BUNDLE_ACTION = {
 
 
 async def _trace(db: AsyncSession, run_id) -> list[dict]:
-    """`agent_logs` is keyed by the run id on both hosts — one query, either kind of run."""
+    """两个主机的 agent_logs 都按运行 ID 查询，兼容会话与研究运行。"""
     rows = (
         (
             await db.execute(
@@ -62,17 +44,15 @@ async def _trace(db: AsyncSession, run_id) -> list[dict]:
 
 
 def _selection_trace(run: ResearchRun) -> list[dict]:
-    """The frozen selection as the bundle's first trace entry, or nothing for other runs.
+    """将冻结文件选择作为证据包首条轨迹；其他运行不添加。
 
-    `verify_bundle._check_corpus_selection` checks every corpus source against it. Copied
-    from the row, never re-resolved — the bundle states what the run was allowed to read.
-    """
+    从数据库原样复制，不重新解析，供校验器检查每个语料来源是否在当时允许范围内。"""
     if not run.corpus_selection:
         return []
     entries = []
     report = run.grounding_report
     if report:
-        # The counts, causes and status — not the per-claim list, which is the run page's.
+        # 只放数量、原因和状态；逐条结论列表由运行页面展示。
         entries.append(
             {"event": "grounding_validation", **{k: v for k, v in report.items() if k != "claims"}}
         )
@@ -87,29 +67,16 @@ def _selection_trace(run: ResearchRun) -> list[dict]:
 
 
 def _provenance_records(run: ResearchRun) -> list[dict] | None:
-    """This run's captured prompt provenance, or None when it has none to report.
+    """读取执行时保存的提示词来源，没有则返回 None。
 
-    **Read, never recomposed.** The strings come from `research_runs.effective_prompt_
-    provenance`, written while the run was executing. Calling `system_prompt` here would
-    answer what *today's* build composes — for a protected purpose the constant shipped now,
-    not the one that ran — so an upgrade between a run and its export would silently rewrite
-    what the artifact claims about history.
-
-    Ordered by purpose so two assemblies of one run produce byte-identical bundles; the hash
-    covers this list, and dict iteration order is not a contract.
-
-    None for a run predating the column, which keeps it on v1. Its prompts are unrecoverable
-    and inventing them is the failure the column exists to prevent.
-    """
+    不能导出时重新调用 system_prompt，否则升级后的代码会伪造历史模型指令。按用途排序，确保重复组装得到相同字节。旧运行无法补采，继续使用 v1。"""
     stored = run.effective_prompt_provenance
     if not stored:
         return None
     records = []
     for purpose in sorted(stored):
         entry = dict(stored[purpose])
-        # The digest is taken here rather than stored, so it can only ever describe the text
-        # in this bundle: a row edited after the fact yields a hash of the edit, and
-        # `bundle_integrity` compares the two.
+        # 在组装时对本包实际携带的文字计算哈希，不另存猜测值；内容事后被改会由 bundle_integrity 发现。
         entry["effective_prompt_sha256"] = bundle_mod.content_hash(entry["effective_prompt"])
         records.append(entry)
     return records
@@ -118,19 +85,16 @@ def _provenance_records(run: ResearchRun) -> list[dict] | None:
 async def assemble_with_reason(
     db: AsyncSession, run_id
 ) -> tuple[bundle_mod.BundleManifest | None, str | None]:
-    """Assemble the bundle from the research domain tables, or say why it cannot be."""
+    """从领域表组装完整证据包；无法组装时明确说明原因。"""
     run = (
         await db.execute(select(ResearchRun).where(ResearchRun.id == run_id))
     ).scalar_one_or_none()
     if run is None:
         return None, "RUN_ABSENT"
 
-    # A bundle presents an evidence list, so it must not present one for a run whose
-    # evidence was never recovered: `evidence` would be empty, every `[n]` would resolve to
-    # nothing, and the bundle would assert a measured zero it never measured.
+    # 证据未恢复时必须拒绝导出，不能凭空提供空证据列表并把未测量冒充实测零。
     #
-    # Found by measurement, not review: an unreadable checkpoint used to emit a bundle that
-    # failed its own `claim_evidence_linkage` check.
+    # 此限制来自实际缺陷：不可读检查点曾生成无法通过自身结论证据关联检查的包。
     if run.evidence_outcome in {"CHECKPOINT_MISSING", "CHECKPOINT_UNREADABLE"}:
         return None, "EVIDENCE_UNAVAILABLE"
 
@@ -180,15 +144,9 @@ async def assemble_with_reason(
         for e in evidence
     ]
 
-    # The bundle's `sources` shape is what `graph._number_sources` derives from the evidence
-    # list, and the `sources` table does not carry the snippet columns — so it is rebuilt
-    # here by replaying that same derivation over the stored evidence. Reconstruction of a
-    # documented derivation, not a normalisation: if the stored evidence disagrees with what
-    # the run recorded, the rebuilt list differs and the bundle's own checks say so.
-    # A selected-files run records which document version each corpus source is, from the
-    # frozen selection — inside the existing `sources` dicts and one `trace` entry, both
-    # already covered by `bundle_hash`, so the format stays v2 and a 3.0.x verifier still
-    # verifies the bundle (internal/rfcs/V3.1-corpus-scope.md §8.6, D-12).
+    # 按引擎来源编号规则，从已存证据重建 sources，不复制另一套定义。
+    # 若证据与运行原记录不一致，包内检查应揭示差异，而非悄悄修正。
+    # 所选文件运行把文档版本和冻结选择放入既有 sources、trace 并纳入 bundle_hash，保持 v2 格式兼容（RFC V3.1 §8.6，D-12）。
     selected = {
         item["document_id"]: item
         for item in ((run.corpus_selection or {}).get("resolved") or [])
@@ -230,9 +188,7 @@ async def assemble_with_reason(
         .scalars()
         .all()
     )
-    # All seven fields of the exported shape. The pair is
-    # `(claim_a, snippet_a, source_a, claim_b, snippet_b, source_b, nature)` and the domain now
-    # holds every one of them, at the source granularity the detector actually worked in.
+    # 导出冲突的全部七个字段：两侧概括、引文、来源及冲突性质；保持检测器实际提供的来源粒度。
     contradiction_dicts = [
         {
             "claim_a": c.summary_a,
@@ -246,19 +202,15 @@ async def assemble_with_reason(
         for c in contradictions
     ]
 
-    # Run-scoped and ordered by `sequence`, not by revision: a PLAN review has no
-    # `revision_id` at all, so the old single-parent read would silently omit every plan
-    # approval from the chain.
+    # 按运行 sequence 收集审核链，不按 revision_id；计划审核没有修订 ID，按单个修订查询会漏掉计划批准。
     reviews = await approval_chain(db, run_id)
     approval_chain_dicts = []
     for r in reviews:
         action = REVIEW_TO_BUNDLE_ACTION.get((r.gate, r.decision))
-        if action is None:  # pragma: no cover — AUDIT_MAP invertibility is pinned by a test
+        if action is None:  # pragma: no cover — AUDIT_MAP 的可逆性由专门测试保证
             raise ValueError(f"review {r.id} has no serialised action for {r.gate}/{r.decision}")
-        # The serialization layer of the artifact-authorization rule.
-        # `verify_bundle` treats `action == "approved"` as report authorization; emitting
-        # that string for a plan approval would satisfy the verifier's load-bearing check
-        # in a file no database constraint reaches.
+        # 在序列化层执行授权规则。
+        # 只有报告批准能输出 approved，不能让计划批准在 JSON 文件中绕过数据库限制。
         if r.gate == "PLAN" and action == verify_bundle.REPORT_APPROVAL_ACTION:
             raise ValueError(
                 f"review {r.id} is a PLAN approval and would serialize as a report approval"
@@ -293,9 +245,7 @@ async def assemble_with_reason(
             trace_available=True,
             demo=run.demo,
             prompt_provenance=provenance,
-            # Copied from the row, never recomputed: "nothing was configured" and "something
-            # was configured and could not be used" both run on shipped prompts, and only the
-            # row knows which. NULL predates the column and reads as NONE.
+            # 从行记录复制配置状态，不重新计算；未配置与配置不可用虽都回退默认提示词，历史原因不能混淆。旧版 NULL 按 NONE 读取。
             prompt_overrides_status=(run.prompt_overrides_status or "NONE") if provenance else None,
         ),
         None,
@@ -303,15 +253,11 @@ async def assemble_with_reason(
 
 
 async def assemble(db: AsyncSession, run_id) -> bundle_mod.BundleManifest | None:
-    """The manifest, or None when the run has nothing assemblable. Never a half bundle."""
+    """返回完整清单；无法组装就返回 None，绝不输出半个证据包。"""
     manifest, _ = await assemble_with_reason(db, run_id)
     return manifest
 
 
 def verify(manifest: bundle_mod.BundleManifest):
-    """The shipped standalone verifier, imported rather than reimplemented.
-
-    A private copy of the checks would verify a bundle against this module's own idea of validity,
-    which is the one thing this must not do.
-    """
+    """直接导入随项目发布的独立校验器，不私自复制检查，否则只能证明本模块认可自己。"""
     return verify_bundle.verify(manifest)

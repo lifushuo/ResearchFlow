@@ -1,9 +1,6 @@
-"""
-Corpus endpoints (docs/12 M10).
+"""项目语料库接口（docs/12 M10）。
 
-Manages project-scoped local corpora. Each project has its own SQLite database
-for isolating documents and embeddings.
-"""
+每个项目使用独立本地 SQLite 数据库，隔离文档和向量。"""
 
 from __future__ import annotations
 
@@ -19,8 +16,7 @@ from app.dependencies import get_current_user
 from app.models.user import User
 from app.ports import CorpusLocator
 
-# Re-exported, not restated — see `app/schemas/corpus.py` for why the shapes moved, and
-# `app/services/corpus_ingest.py` for the validation and shaping both hosts share.
+# 重新导出共用结构，不复制定义；结构位于 app/schemas/corpus.py，校验和响应转换位于 corpus_ingest。
 from app.schemas.corpus import (
     CorpusStatusResponse,
     CorpusTreeResponse,
@@ -33,10 +29,9 @@ from app.schemas.corpus import (
 )
 from app.services import corpus_ingest
 
-# The download response policy lives in a stdlib-only module so the desktop sidecar can
-# import it without dragging this route's `app.config` chain in with it (#50). Re-exported
-# here because this module is where callers and tests have always found it.
-from app.services.document_headers import (  # noqa: F401  (re-export)
+# 下载策略放在仅依赖标准库的模块，桌面可导入而不引入服务端配置链。
+# 这里继续导出，兼容已有调用方和测试。
+from app.services.document_headers import (  # noqa: F401 — 供其他模块导入
     _MEDIA_TYPES,
     download_headers,
     media_type_for,
@@ -49,14 +44,9 @@ router = APIRouter(prefix="/projects/{project_id}/corpus", tags=["Corpus"])
 
 
 async def _get_corpus_store(project_id: uuid.UUID, corpus: CorpusLocator) -> CorpusStore:
-    """This project's corpus, created if it does not exist yet.
+    """取得项目语料库，不存在时创建。
 
-    Where it lives is the locator's to know — seven modules used to spell out the same
-    filename, and the last time that convention drifted, upload and run stopped seeing
-    the same corpus (AGENTS.md). `corpus` arrives via `Depends(get_corpus_locator)`
-    rather than a hardcoded `ServerCorpusLocator()` so the desktop can delegate to these
-    routes and pass its own locator over its one flat store explicitly.
-    """
+    路径统一由 CorpusLocator 解析，避免上传和研究各自拼路径。通过依赖注入取得定位器，让桌面能传入针对其单库布局的实现。"""
     return await corpus.ensure(project_id)
 
 
@@ -64,25 +54,19 @@ async def _get_corpus_store(project_id: uuid.UUID, corpus: CorpusLocator) -> Cor
 async def upload_document(
     project_id: uuid.UUID,
     file: UploadFile,
-    # Optional and absent by default, so every client that predates document versioning
-    # keeps creating new logical documents exactly as before. Supplying it is the only way
-    # one upload becomes a revision of another: nothing is inferred from the filename,
-    # because two unrelated papers can legitimately share one.
+    # 文档版本标识是可选字段，旧客户端仍按原行为创建新文档。
+    # 只有明确提供标识才作为已有文档的新修订；不能根据文件名猜，因为不同论文可能同名。
     doc_key: str | None = Form(default=None),
-    # The file's path inside a folder upload (`Thesis/Ch2/data.xlsx`). Files it into that
-    # folder path, creating folders as needed; absent, the document sits at the root.
+    # 记录文件在上传文件夹内的相对路径，并按需建目录；未提供则存放在根目录。
     relative_path: str | None = Form(default=None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Ingest a new document into the project's corpus.
+    """将新文档写入项目语料。
 
-    Validation, failure mapping and the response shape come from
-    `app.services.corpus_ingest` — the one home for them, because the desktop serves this
-    same path and each host used to choose its own status codes for the same rejection.
-    """
-    # Enforce isolation: verify the user owns the project
+    校验、错误映射和返回结构共用 app.services.corpus_ingest，保证服务端与桌面拒绝相同输入时返回相同语义。"""
+    # 检查当前用户是否拥有项目，保证项目隔离。
     await resolve_project(db, current_user.id, project_id)
 
     store = await _get_corpus_store(project_id, corpus)
@@ -98,7 +82,7 @@ async def list_documents(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """List all documents in the project's corpus."""
+    """列出项目语料库的全部文档。"""
     await resolve_project(db, current_user.id, project_id)
 
     store = await _get_corpus_store(project_id, corpus)
@@ -113,16 +97,9 @@ async def download_document(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Serve the original uploaded file so it can be opened in its native application.
+    """返回上传原文件，让用户可以用原生应用打开。
 
-    `resolve_project` runs first and is the authorization boundary: document ids are
-    opaque but guessable in principle, and without the project check any authenticated
-    user could read another user's corpus by id.
-
-    Content-Type and disposition come from `download_headers`, which is where the rule
-    that an uploaded document must not render in this origin now lives — along with the
-    single narrow exception (PDF) that in-place preview needs.
-    """
+    必须先由 resolve_project 检查归属，不能只凭文档 ID 放行。download_headers 统一决定类型和下载行为，防止上传内容在本站来源执行；只有 PDF 预览采用有限例外。"""
     await resolve_project(db, current_user.id, project_id)
 
     store = await _get_corpus_store(project_id, corpus)
@@ -149,7 +126,7 @@ async def delete_document(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Delete a document from the project's corpus."""
+    """从项目语料库删除文档。"""
     await resolve_project(db, current_user.id, project_id)
 
     store = await _get_corpus_store(project_id, corpus)
@@ -157,8 +134,7 @@ async def delete_document(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=corpus_ingest.DOCUMENT_NOT_FOUND
         )
-    # Explicit, because returning `None` from a 204 route makes FastAPI send
-    # `content-type: application/json` with an empty body — a response that does not parse.
+    # 明确返回无内容响应；若 204 路由直接返回 None，FastAPI 可能附上 JSON 类型但正文为空，客户端会解析失败。
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -169,14 +145,14 @@ async def get_status(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Get the status of the project's corpus."""
+    """读取项目语料库状态。"""
     await resolve_project(db, current_user.id, project_id)
 
     store = await _get_corpus_store(project_id, corpus)
     return corpus_ingest.status_response(await store.status())
 
 
-# ── Folders (RFC V3.1 §7.1) ───────────────────────────────────────────────────────
+# 文件夹管理（RFC V3.1 §7.1）
 
 
 @router.get("/tree", response_model=CorpusTreeResponse)
@@ -186,7 +162,7 @@ async def get_tree(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Every folder, document and membership of the project's corpus, as flat lists."""
+    """以平铺列表返回项目中的文件夹、文档及归属关系。"""
     await resolve_project(db, current_user.id, project_id)
     store = await _get_corpus_store(project_id, corpus)
     return CorpusTreeResponse(
@@ -224,7 +200,7 @@ async def update_folder(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Rename (`name`) and/or move (`move: true` with `parent_id`, null for the root)."""
+    """重命名或移动：name 为新名称；move=true 时使用 parent_id，空值表示根目录。"""
     await resolve_project(db, current_user.id, project_id)
     store = await _get_corpus_store(project_id, corpus)
     try:
@@ -248,7 +224,7 @@ async def delete_folder(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """Remove a folder and its subfolders. Documents filed only there are deleted with it."""
+    """删除文件夹及子文件夹；只属于这些目录的文档一并删除。"""
     await resolve_project(db, current_user.id, project_id)
     store = await _get_corpus_store(project_id, corpus)
     try:
@@ -265,8 +241,7 @@ async def get_document_text(
     current_user: User = Depends(get_current_user),
     corpus: CorpusLocator = Depends(get_corpus_locator),
 ):
-    """One version's canonical extracted text: what its citations' quotes are verified
-    against, so the preview highlights the cited span in exactly that text (RFC V3.1 §12)."""
+    """返回特定版本的标准提取正文，引用核验与预览高亮都以同一份文本为准（RFC V3.1 §12）。"""
     await resolve_project(db, current_user.id, project_id)
     store = await _get_corpus_store(project_id, corpus)
     found = await store.extracted(doc_id)

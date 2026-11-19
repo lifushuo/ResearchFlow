@@ -1,17 +1,17 @@
 import type { AgentEvent, AgentName } from "./types";
 
-/** Pipeline shape + derivations from the agent event stream (docs/04, docs/35). */
+/** 流水线结构及智能体事件流的派生状态（docs/04，docs/35）。 */
 
 export const AGENTS: AgentName[] = ["planner", "executor", "critic", "synthesizer"];
 
 export const AGENT_LABELS: Record<AgentName, string> = {
-  planner: "Planner",
-  executor: "Executor",
-  critic: "Critic",
-  synthesizer: "Synthesizer",
+  planner: "规划器",
+  executor: "执行器",
+  critic: "评审器",
+  synthesizer: "综合器",
 };
 
-/** CSS token name (without `--`) for each agent's accent color. */
+/** 各智能体强调色的 CSS 设计令牌名称，不包含 --。 */
 export const AGENT_TOKEN: Record<AgentName, string> = {
   planner: "agent-planner",
   executor: "agent-executor",
@@ -19,18 +19,14 @@ export const AGENT_TOKEN: Record<AgentName, string> = {
   synthesizer: "agent-synthesizer",
 };
 
-/**
- * The bare model id from a "provider:model" route, for compact display (docs/04,
- * "truthful per-agent model attribution"). `undefined`/`null` — routing not resolved
- * for this role — renders as "—", never a guessed default (the unmeasured-vs-zero rule).
- */
+/** 从 provider:model 路由中提取模型 ID，供紧凑展示（docs/04，真实模型归属披露）。角色路由尚未解析时返回 —，不能猜测默认模型，遵循未测量不等于零的原则。 */
 export function routeModelLabel(route: string | undefined | null): string {
   if (!route) return "—";
   const i = route.indexOf(":");
   return i === -1 ? route : route.slice(i + 1);
 }
 
-/** Order index of the furthest-along agent seen so far, or -1 if none. */
+/** 返回已观察到的最靠后智能体的顺序索引；尚无事件时返回 -1。 */
 export function latestAgentOrder(events: AgentEvent[]): number {
   let order = -1;
   for (const e of events) {
@@ -42,7 +38,7 @@ export function latestAgentOrder(events: AgentEvent[]): number {
   return order;
 }
 
-/** Research-task progress derived from planner + executor events (rework-safe). */
+/** 根据规划器与执行器事件计算任务进度，重写后仍可正确计算。 */
 export function taskProgress(events: AgentEvent[]): { done: number; total: number } {
   let total = 0;
   const gathered = new Set<string>();

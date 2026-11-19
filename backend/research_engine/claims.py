@@ -1,73 +1,41 @@
-"""
-Claim and citation extraction — the canonical implementation (docs/08 §5, docs/12 M5).
+"""Claim 与引用提取的唯一实现，见 docs/08 §5、docs/12 M5。
 
-Three callers need to agree on *what a claim is* and *what counts as a citation*, because
-they measure and act on the same sentences:
-
-- `graph._verify_citation_fidelity` strips markers from claims their evidence does not back
-- `evals.metrics` / `evals.harness` judge those same claims and publish a support rate
-- `bundle.assemble` records them in the artifact a third party verifies
-
-Two implementations of one definition is how the number a benchmark publishes and the
-claims the pipeline acted on drift apart. This module is the single definition.
-
-**It lives in the engine, not in `evals/`.** `research_engine/` must run inside a desktop
-app with no eval harness installed, and `bundle.py` needs claim extraction — so the import
-used to run engine → evals, which made the "standalone" engine package un-shippable
-without `evals/` and contradicted `graph.py`'s own docstring. The dependency now points
-the other way: `evals.metrics` re-exports from here. Nothing in this module imports
-anything but `re`, which is what keeps `verify_bundle` runnable on a bare machine.
-
-Everything here is pure and stdlib-only. Eval-specific aggregation (`METRICS_VERSION`,
-`report_metrics`, `citation_stats`) stays in `evals.metrics`, because those are properties
-of a measurement run rather than of a claim.
-"""
+图内引用核验、评测 Judge 和证据包必须对 Claim 及引用采用同一定义，
+否则评分测量的就不是流程实际处理的句子。
+本模块放在引擎层，仅依赖标准库，evals 从这里导入，不能反向依赖评测包。
+评测版本与运行聚合仍属于 evals.metrics。"""
 
 from __future__ import annotations
 
 import re
 
-# Matches a citation marker and captures its numbers, including *grouped* markers.
+# 匹配引用标记并提取其中编号，包含 [1, 3] 这样的组合引用。
 #
-# The synthesizer routinely writes `[1, 3]` or `[1, 2, 3, 4, 6]` when a sentence draws on
-# several sources. A single-number-only pattern silently treated those as prose: they
-# counted as neither cited nor unresolved, so a report could be 42% invisible to this
-# module while still reporting a perfect resolution rate (measured on a real run —
-# docs/12 M5). `extract_citations` flattens a group into its individual indices, so
-# `[1, 3]` counts as two citations, exactly as `[1][3]` would.
+# 综合器经常输出组合引用。若只匹配单编号，会漏计引用并虚高解析率。
+# extract_citations 将 [1, 3] 展开成两个编号，与 [1][3] 同等计数。
 CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 HEADING_RE = re.compile(r"^#{1,6}\s")
 SOURCES_HEADING_RE = re.compile(r"^#{1,6}\s*(sources|references|citations|bibliography)\b", re.I)
-# The Limitations section is where the model is INSTRUCTED to write what the evidence
-# does not cover — meta-prose about the evidence, sourced or not. Its sentences are not
-# factual claims, so they are excluded from claim extraction exactly like Sources.
+# Limitations 描述证据未覆盖的范围，并非待证实的事实 Claim，因此与 Sources 一样排除。
 LIMITATIONS_HEADING_RE = re.compile(r"^#{1,6}\s*limitations?\b", re.I)
-# The Conflicting evidence block (docs/12 M11) is rendered deterministically by the
-# engine, not authored by the synthesizer: it QUOTES the incompatible claims from both
-# sides. Its sentences are meta-prose about the evidence — judging them as factual
-# claims would measure the block's existence, not research quality — so they are
-# excluded from claim extraction exactly like Limitations.
+# Conflicting evidence 由引擎确定性生成，引用双方矛盾观点。
+# 它是在说明证据冲突，不能把这种说明当成研究者自己的事实断言评分。
 CONFLICTS_HEADING_RE = re.compile(r"^#{1,6}\s*conflicting evidence\b", re.I)
 LIST_MARKER_RE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)")
-# Sentence boundary: terminator + whitespace, not preceded by a common abbreviation or a
-# bare initial. Deliberately conservative — over-splitting a claim is worse than
-# under-splitting it, because each fragment then gets judged against too little evidence.
+# 句末标点加空白作为边界，但排除常见缩写与单字母姓名。
+# 宁可少切分，也避免把一个 Claim 拆成失去证据上下文的碎片。
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[])")
 ABBREV_TAIL_RE = re.compile(r"\b(?:e\.g|i\.e|vs|etc|Dr|Mr|Ms|Inc|Ltd|Fig|No|approx|cf)\.$", re.I)
 
-#: A sentence shorter than this, or containing no letters, is a fragment rather than a
-#: claim. Named because the graph's fidelity pass applies the same floor and the two must
-#: not drift.
+#: 过短或不含字母的句子视为碎片；图内引用核验使用相同门槛。
 MIN_CLAIM_CHARS = 15
 
 
 def body_before_sources(text: str) -> str:
-    """The report body up to (excluding) the sources/references section.
+    """取参考文献章节之前的报告正文。
 
-    The numbered entries in a reference list are not claims. Counting them would push
-    every report's rate toward 1.0 regardless of what the prose actually cited.
-    """
+    来源列表不是事实 Claim，将它计入会让引用率无故趋近 1。"""
     lines = (text or "").splitlines()
     for i, raw in enumerate(lines):
         if SOURCES_HEADING_RE.match(raw.strip()):
@@ -76,11 +44,7 @@ def body_before_sources(text: str) -> str:
 
 
 def extract_citations(text: str) -> list[int]:
-    """Every cited source index, in order, duplicates kept.
-
-    A grouped marker contributes each of its numbers: `[1, 3]` yields `[1, 3]`, so it is
-    counted and resolution-checked identically to `[1][3]`.
-    """
+    """按顺序返回全部来源编号，保留重复项；组合引用与多个单独引用等价处理。"""
     out: list[int] = []
     for m in CITE_RE.finditer(text or ""):
         out.extend(int(part) for part in m.group(1).split(","))
@@ -88,13 +52,13 @@ def extract_citations(text: str) -> list[int]:
 
 
 def split_sentences(text: str) -> list[str]:
-    """Split a block of prose into sentences, rejoining common abbreviation false splits."""
+    """按句子切分正文，并重新合并被常见缩写误切开的部分。"""
     parts = SENTENCE_SPLIT_RE.split(text)
     if len(parts) < 2:
         return [text]
     merged: list[str] = [parts[0]]
     for part in parts[1:]:
-        # "…supported by Dr. Smith" must not become two sentences.
+        # 例如 Dr. Smith 中的句点不能切出新句子。
         if ABBREV_TAIL_RE.search(merged[-1]):
             merged[-1] = f"{merged[-1]} {part}"
         else:
@@ -103,25 +67,15 @@ def split_sentences(text: str) -> list[str]:
 
 
 def is_claim_sentence(sentence: str) -> bool:
-    """Whether a split fragment is long enough and wordy enough to assert anything."""
+    """判断文本片段是否足够长、是否包含可作为断言的文字。"""
     return len(sentence) >= MIN_CLAIM_CHARS and bool(re.search(r"[A-Za-z]", sentence))
 
 
 def claim_lines(text: str) -> list[str]:
-    """Individually assertable claims from the report body, one per sentence.
+    """从报告正文逐句提取可独立判断的 Claim。
 
-    Sentences, not raw lines. The synthesizer emits each paragraph as a single unwrapped
-    line, so a line-per-claim split made a four-sentence paragraph one "claim" carrying
-    the union of its citations — and the citation-support judge then had to rule on all
-    four assertions against all four sources at once, scoring a NO if any part was
-    unsupported by any snippet. That conflation was measured depressing the support rate
-    independently of the actual research quality (docs/12 M5).
-
-    Headings, list markers, and trivially short fragments are still excluded. So is the
-    Limitations section: it is where the synthesizer is told to write what the evidence
-    does NOT cover, and those hedging sentences are not factual claims the snippets must
-    support — judging them measured report honesty as citation failure (docs/12 M5).
-    """
+    综合器常把多句写在同一行，按行提取会把不同断言与来源混成一个评分对象。
+    排除标题、列表标记、过短碎片及 Limitations，避免把诚实披露证据不足误判成引用失败。"""
     out: list[str] = []
     skipping = False
     for raw in (text or "").splitlines():
@@ -129,7 +83,7 @@ def claim_lines(text: str) -> list[str]:
         if not line:
             continue
         if SOURCES_HEADING_RE.match(line):
-            break  # sources/references section is references, not claims
+            break  # 来源与参考文献章节不属于 Claim。
         if HEADING_RE.match(line):
             skipping = bool(LIMITATIONS_HEADING_RE.match(line)) or bool(
                 CONFLICTS_HEADING_RE.match(line)

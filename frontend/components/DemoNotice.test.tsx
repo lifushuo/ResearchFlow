@@ -9,27 +9,22 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-/**
- * One notice for runs and sessions, so the two cannot drift into saying different things.
- *
- * It must not send someone to Settings as if that were the whole fix: when the *server* runs in
- * demo mode, every run is a demo and a key saved in Settings is never used.
- */
+/** 研究任务和会话共用同一警告，避免文案漂移。不能把去设置当成唯一补救：服务端本身处于演示模式时，全部研究都是演示，设置中的密钥不会被使用。 */
 describe("DemoNotice", () => {
   it("names what did not happen before anything else", () => {
     render(<DemoNotice />);
-    const notice = screen.getByRole("note", { name: /demo run/i });
-    expect(notice).toHaveTextContent("Demo run — no LLM research was performed");
+    const notice = screen.getByRole("note", { name: /演示研究/i });
+    expect(notice).toHaveTextContent("演示研究——未使用大模型进行实际研究");
     expect(notice).toHaveTextContent(
-      "Your question was not sent to a model. This report is a scripted demonstration",
+      "你的问题未发送给模型。本报告是脚本演示",
     );
   });
 
   it("says where demo mode comes from when it is the server, not the user", () => {
     render(<DemoNotice />);
-    expect(screen.getByRole("note", { name: /demo run/i })).toHaveTextContent(
-      /server .* demo mode/i,
+    expect(screen.getByRole("note", { name: /演示研究/i })).toHaveTextContent(
+      /服务端本身处于演示模式/,
     );
-    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
+    expect(screen.getByRole("link", { name: "设置" })).toHaveAttribute("href", "/settings");
   });
 });

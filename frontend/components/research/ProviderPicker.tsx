@@ -3,32 +3,11 @@
 import { useCustomEndpointStatus, useLocalLLMStatus, useModelCatalog } from "@/hooks/queries";
 import type { ModelRouting } from "@/lib/types";
 
-/**
- * Which kind of model backend this run uses. Three buttons, nothing else.
- *
- * **Why the run form only picks a backend.** Choosing an individual model is a setting: it
- * changes rarely, it needs the price and context window next to it, and it belongs beside
- * the keys that make a provider reachable at all. What changes per run is which *kind* of
- * backend to spend on — the gateway, the machine under the desk, or a metered API — so
- * that is the only decision here. Everything else lives in Settings → Models.
- *
- * **The default is the first backend that is actually reachable**, in the order custom →
- * local → API. That order is a *selection* default, resolved once before the run starts
- * and shown on the button. It is deliberately **not** a runtime fallback: nothing
- * substitutes a provider mid-run, because the finished report's attribution would then be
- * the first place a substitution became visible — which is the failure this whole surface
- * exists to prevent. If the chosen backend is down, the run fails saying so.
- */
+/** 为本次研究选择模型后端类型。具体模型属于设置：变化少，且需要价格、上下文窗口和密钥信息；表单只选择自定义网关、本地模型或计费 API。默认按自定义→本地→API 选择当前可达者，在开始前解析并展示。这不是运行中的回退机制；选定后端失败时必须明确失败，不能暗中换提供方后只在最终报告里披露。 */
 
 export type ProviderKind = "custom" | "local" | "api";
 
-/**
- * Only the parts of each source these helpers actually read.
- *
- * Narrower than `ModelCatalog`/`LocalLLMStatus`/`CustomEndpointStatus` on purpose: it says
- * exactly which fields the resolution depends on, and it keeps a caller (or a test) from
- * having to construct a whole catalog to ask one question.
- */
+/** 辅助函数只声明实际读取的字段，比 ModelCatalog、LocalLLMStatus、CustomEndpointStatus 更窄，明确依赖并让调用方及测试无需构造完整目录。 */
 export interface RoutingSource {
   user_routing?: ModelRouting | null;
   deployment_routing?: ModelRouting | null;
@@ -47,26 +26,19 @@ export interface LocalSource {
 
 const ROLE_ORDER = ["planner", "executor", "critic", "synthesizer", "chat"] as const;
 
-/** One route applied to every role — the shape the create-run endpoint validates. */
+/** 全部角色共用一个路由，符合创建研究接口校验的请求形状。 */
 export function routingFor(route: string): ModelRouting {
   return Object.fromEntries(ROLE_ORDER.map((r) => [r, route])) as ModelRouting;
 }
 
-/** `provider:model` split on the FIRST colon — `ollama:qwen2.5:7b` keeps its tag. */
+/** provider:model 只按第一个冒号分割，保留 ollama:qwen2.5:7b 中的版本标签。 */
 export function splitRoute(route: string): { provider: string; model: string } {
   const i = route.indexOf(":");
   if (i < 0) return { provider: route, model: "" };
   return { provider: route.slice(0, i), model: route.slice(i + 1) };
 }
 
-/**
- * Whether a route's spend can be measured at all.
- *
- * The catalog carries no price for these two, so `estimate_cost()` returns 0.0 and a run
- * on one reports `$0.00` whatever it really cost. Naming that is what stops the UI
- * printing an unmeasured zero as a measured total. Ollama is excluded deliberately: local
- * inference is genuinely free, which is a different statement from unknown.
- */
+/** 判断费用是否可测量。目录无法为 custom 和 openrouter 定价，estimate_cost() 返回 0.0 并不代表免费，界面必须说明未计量。Ollama 本地推理确实免费，与未知费用不同，因此不在此列。 */
 export function isUnpricedRoute(route: string | null | undefined): boolean {
   if (!route) return false;
   const { provider } = splitRoute(route);
@@ -74,26 +46,26 @@ export function isUnpricedRoute(route: string | null | undefined): boolean {
 }
 
 export const PROVIDER_LABEL: Record<ProviderKind, string> = {
-  custom: "Custom Endpoint",
-  local: "Local LLM",
+  custom: "自定义端点",
+  local: "本地大模型",
   api: "API",
 };
 
 const PROVIDER_NOTE: Record<ProviderKind, string> = {
-  custom: "OpenAI-compatible gateway",
-  local: "Runs on this machine",
-  api: "Gemini, Claude, OpenAI…",
+  custom: "兼容 OpenAI 的网关",
+  local: "在本机运行",
+  api: "Gemini、Claude、OpenAI 等",
 };
 
-/** The three sources a route for a backend can come from, best first. */
+/** 解析后端路由的三个来源，按优先级排序。 */
 export function routeForKind(
   kind: ProviderKind,
   catalog: RoutingSource | undefined,
   custom: CustomSource | undefined,
   local: LocalSource | undefined,
 ): string | null {
-  // Settings wins wherever it names this backend: the whole point of moving the model
-  // choice there is that the run form then honours it rather than guessing.
+  // 设置指定此后端时优先采用已保存路由，
+  // 使表单尊重模型选择，而不是重新猜测。
   const saved = catalog?.user_routing?.planner ?? null;
   const deployed = catalog?.deployment_routing?.planner ?? null;
   const savedProvider = saved ? splitRoute(saved).provider : null;
@@ -108,12 +80,12 @@ export function routeForKind(
   if (kind === "local") {
     if (savedProvider === "ollama") return saved;
     if (deployedProvider === "ollama") return deployed;
-    // A model Settings marks "chat only" is too small to return citable evidence, so it
-    // is the default only when nothing larger is installed.
+    // 标记为仅适合对话的本地模型通常不足以返回可靠引用，
+    // 只有未安装更大模型时才作为默认选择。
     const chat = (local?.models ?? []).filter((m) => !m.is_embedding && m.route);
     return (chat.find((m) => !m.likely_underpowered) ?? chat[0])?.route ?? null;
   }
-  // API: a catalogued, priced provider the user can actually reach.
+  // API 必须是目录中已定价且用户实际可访问的提供方。
   if (savedProvider && !["custom", "ollama"].includes(savedProvider)) return saved;
   if (deployedProvider && !["custom", "ollama"].includes(deployedProvider)) return deployed;
   const firstApi = (catalog?.models ?? []).find(
@@ -122,7 +94,7 @@ export function routeForKind(
   return firstApi?.route ?? null;
 }
 
-/** Reachable *right now*, which is a different question from "configured". */
+/** 检查当前实际可达性，与仅已配置不同。 */
 export function isKindReady(
   kind: ProviderKind,
   catalog: RoutingSource | undefined,
@@ -134,13 +106,7 @@ export function isKindReady(
   return Boolean(routeForKind("api", catalog, custom, local));
 }
 
-/**
- * The backend a run should start on: custom → local → API, first one that is reachable.
- *
- * `null` while the probes are still in flight, so the caller can wait rather than briefly
- * showing a default it is about to change — a button that moves under the cursor is worse
- * than one that appears a moment late.
- */
+/** 研究开始前按自定义→本地→API 选择首个可达后端。探测尚在进行时返回 null，让调用方等待，避免按钮先显示随后又改变的默认值。 */
 export function defaultKind(
   catalog: RoutingSource | undefined,
   custom: CustomSource | undefined,
@@ -169,7 +135,7 @@ export function ProviderPicker({
 
   return (
     <div>
-      <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Model backend">
+      <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="模型后端">
         {kinds.map((kind) => {
           const ready = isKindReady(kind, catalog.data, custom.data, local.data);
           const route = routeForKind(kind, catalog.data, custom.data, local.data);
@@ -182,16 +148,15 @@ export function ProviderPicker({
               aria-checked={active}
               disabled={disabled}
               onClick={() => onChange(kind)}
-              // `bg-accent-soft` is not a token this theme defines, and a utility naming
-              // one that does not exist is silently dropped rather than failing — so the
-              // selected state is carried by a real token plus `aria-checked`.
+              // bg-accent-soft 并非主题中的有效令牌，
+              // 引用不存在的工具类会被静默丢弃，因此
+              // 选中状态使用真实令牌并辅以 aria-checked。
               className={`min-w-[9rem] flex-1 border p-2.5 text-left ${
                 active ? "border-accent bg-bg-elevated" : "border-border bg-bg-surface"
               }`}
             >
               <span className="flex items-center gap-1.5">
-                {/* Status is a dot AND a word: colour alone carries nothing to a screen
-                    reader, and "running/stopped" is the fact the dot is standing in for. */}
+                {/* 状态同时由圆点与文字表达，确保读屏器无需依赖颜色即可识别。 */}
                 <span
                   aria-hidden
                   className={`inline-block h-2 w-2 shrink-0 rounded-full ${
@@ -201,33 +166,30 @@ export function ProviderPicker({
                 <span className="text-sm font-medium text-text-primary">
                   {PROVIDER_LABEL[kind]}
                 </span>
-                {/* Self-contained rather than a bare " — stopped": a screen reader may
-                    reach this out of order, and "stopped" on its own names nothing. */}
+                {/* 状态说明包含后端名称，避免读屏顺序变化时无法得知哪个服务已停止。 */}
                 <span className="sr-only">
-                  {PROVIDER_LABEL[kind]} is {ready ? "running" : "stopped"}
+                  {PROVIDER_LABEL[kind]}{ready ? "运行中" : "已停止"}
                 </span>
               </span>
               <span className="mt-0.5 block text-xs text-text-muted">{PROVIDER_NOTE[kind]}</span>
               <span className="mt-1 block break-all font-mono text-[length:var(--text-micro)] text-text-secondary">
-                {route ?? "not configured"}
+                {route ?? "尚未配置"}
               </span>
             </button>
           );
         })}
       </div>
 
-      {/* The chosen backend is down. Said plainly, and the choice is left alone — the run
-          will fail naming the provider rather than quietly succeeding on another one. */}
+      {/* 选定后端不可用时明确告知；保留选择并报告失败，不暗中替换提供方。 */}
       {!isKindReady(value, catalog.data, custom.data, local.data) && (
         <p role="alert" className="mt-2 text-xs text-danger">
-          {PROVIDER_LABEL[value]} is not reachable right now. Starting a run on it will fail
-          rather than switch to another provider.
+          {PROVIDER_LABEL[value]} 目前无法连接。使用它启动研究会报错，不会自动切换到其他提供方。
         </p>
       )}
 
       <p className="mt-2 text-xs text-text-secondary">
-        Which models each of these uses is set in{" "}
-        <span className="text-text-primary">Settings → Models</span>.
+        各后端使用的模型可在{" "}
+        <span className="text-text-primary">设置 → 模型</span>中配置。
       </p>
     </div>
   );

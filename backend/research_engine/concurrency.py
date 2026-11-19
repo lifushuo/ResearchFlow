@@ -1,13 +1,7 @@
-"""Fan-out for graph nodes that never outlives the node.
+"""让图节点的并发子任务不会在节点退出后继续运行。
 
-`asyncio.gather` returns the first exception while every other child keeps running. In a
-node that is two defects at once. The orphans keep calling the model for a run that has
-already failed — spend the failed node never returns, so no state update can record it. And
-they keep writing events through the host's sink after the node has raised: on the server
-that sink shares the run driver's database session, which the driver then closes under a
-write in flight, and SQLAlchemy's refusal of that close replaced the provider error as the
-run's recorded failure reason.
-"""
+asyncio.gather 遇到首个异常会返回，但其他任务仍可能调用模型或写事件。
+这既造成失败后的额外费用，也可能与宿主关闭数据库会话冲突，掩盖原始模型异常。"""
 
 from __future__ import annotations
 
@@ -20,21 +14,15 @@ logger = structlog.get_logger()
 
 
 async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
-    """`asyncio.gather`, except a failure cancels the siblings and waits them out first.
+    """并发执行；任一任务失败时取消并等待其余任务清理。
 
-    Results come back in argument order. When a child fails, every unfinished sibling is
-    cancelled and awaited, so nothing this call started is still running when the failure
-    propagates. What propagates is the earliest failure, as the original exception object,
-    since every host records `str(exc)` and a wrapper such as `ExceptionGroup` would put its
-    own text there.
-    """
+    成功结果按参数顺序返回；失败则抛出最早发生的原始异常。
+    不额外包装异常，避免宿主记录到包装文字而非真正原因。"""
     tasks = [asyncio.ensure_future(aw) for aw in aws]
     if not tasks:
         return []
-    # Completion order, because the failure worth reporting is the one that happened first:
-    # a failing child often breaks what its siblings share (the sink's session, its lock), so
-    # a sibling fails as a consequence within the same turn of the loop, and by the time the
-    # wait returns both are done. Argument order would report whichever sits earlier.
+    # 按完成顺序追踪最早故障。一个子任务可能破坏共享状态，继而使其他任务失败；
+    # 按参数顺序挑异常会把后果误报成原因。
     finished: list[asyncio.Task] = []
     for task in tasks:
         task.add_done_callback(finished.append)
@@ -43,7 +31,7 @@ async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
     except asyncio.CancelledError:
         await _cancel_and_wait(tasks)
         raise
-    # A child can be done with its callback not yet run; it finished last, so it goes last.
+    # 任务可能已结束但回调尚未运行；这种任务排在已有完成记录之后。
     ordered = finished + [t for t in tasks if t.done() and t not in finished]
     failed = [t for t in ordered if not t.cancelled() and t.exception() is not None]
     if not failed:
@@ -51,8 +39,7 @@ async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
     await _cancel_and_wait(tasks)
     first = failed[0]
     for other in tasks:
-        # Retrieved so asyncio does not report them as never retrieved, and logged so a
-        # second, different failure in the same round is not silently lost.
+        # 取出并记录其他异常，既避免未读取异常警告，也不静默丢失同轮的其他故障。
         if other is not first and not other.cancelled() and other.exception() is not None:
             logger.warning(
                 "fan_out_sibling_also_failed",
@@ -65,10 +52,8 @@ async def _cancel_and_wait(tasks: Iterable[asyncio.Task]) -> None:
     pending = [t for t in tasks if not t.done()]
     for task in pending:
         task.cancel()
-    # Waited out even if this await is itself cancelled — a worker's soft time limit unwinds
-    # the task exactly then — and only then is that cancellation honoured. Giving up the wait
-    # would leave the cancelled children finishing their cleanup unawaited. `wait`, not
-    # `gather`: it neither re-raises the children's exceptions nor cancels them again.
+    # 即使当前等待被取消，也先等子任务清理结束，再传播取消。
+    # 使用 wait 避免重新抛出子异常或再次取消任务，防止清理过程无人等待。
     interrupted = False
     while pending:
         try:

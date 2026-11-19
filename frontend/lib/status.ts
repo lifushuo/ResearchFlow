@@ -1,40 +1,36 @@
 import type { SessionStatus } from "./types";
 
 /**
- * One status vocabulary, for the list, the card and the detail (internal/07 Phase 7).
+ * 列表、卡片和详情共用一套状态文案（internal/07 Phase 7）。
  *
- * These lived in two places — `StatusBadge`'s CONFIG and the history page's FILTERS —
- * and the second was already wrong: adding `AWAITING_PLAN` in Phase 4 updated the badge
- * and not the filter list, so a session parked at the design gate could be *seen* but
- * never *filtered for*. That is the worst way for this particular gap to fall, because a
- * session waiting on the user is exactly the one they are scanning the list to find.
+ * 此前，`StatusBadge` 的 CONFIG 与历史页的 FILTERS 各维护一份状态。
+ * 新增 `AWAITING_PLAN` 时只更新了徽标，导致等待计划审核的会话能显示却无法筛选；
+ * 而这恰好是用户浏览列表时最需要找到的会话。
  *
- * `Record<SessionStatus, …>` is what makes that impossible to repeat: adding a status to
- * the union without adding it here is a type error, and everything downstream is derived
- * from this object rather than restated.
+ * `Record<SessionStatus, …>` 要求新增联合类型成员时同步补全此处，否则类型检查失败。
+ * 下游均从本对象派生状态信息，避免重复定义。
  */
 export interface StatusMeta {
-  /** CSS token name (without `--`). Colour is never the sole carrier — the label is. */
+  /** CSS 设计令牌名称（不含 `--`）。状态由文字说明，颜色仅作辅助。 */
   token: string;
   label: string;
   pulse?: boolean;
-  /** Whether this status is waiting on the user rather than on the pipeline. */
+  /** 此状态是否在等待用户操作。 */
   needsYou?: boolean;
 }
 
 export const STATUS_META: Record<SessionStatus, StatusMeta> = {
-  PENDING: { token: "text-muted", label: "Queued" },
-  RUNNING: { token: "info", label: "Running", pulse: true },
-  // Both gates are amber: to someone scanning a list they are one urgency class —
-  // "waiting on you" — and the label is what says which decision is owed. A distinct
-  // hue would imply a difference in urgency that does not exist.
-  AWAITING_PLAN: { token: "warning", label: "Plan review", needsYou: true },
-  AWAITING_APPROVAL: { token: "warning", label: "Needs review", needsYou: true },
-  COMPLETED: { token: "success", label: "Completed" },
-  FAILED: { token: "danger", label: "Failed" },
+  PENDING: { token: "text-muted", label: "排队中" },
+  RUNNING: { token: "info", label: "运行中", pulse: true },
+  // 两个人工审核关卡都在等待用户，紧急程度相同，因此统一使用琥珀色；
+  // 具体需要审核什么由文字说明，避免不同颜色暗示并不存在的优先级差异。
+  AWAITING_PLAN: { token: "warning", label: "待审核计划", needsYou: true },
+  AWAITING_APPROVAL: { token: "warning", label: "待审核报告", needsYou: true },
+  COMPLETED: { token: "success", label: "已完成" },
+  FAILED: { token: "danger", label: "失败" },
 };
 
-/** Every status, in pipeline order — the order a run moves through them. */
+/** 按研究流程中的流转顺序排列全部状态。 */
 export const STATUS_ORDER: SessionStatus[] = [
   "PENDING",
   "RUNNING",

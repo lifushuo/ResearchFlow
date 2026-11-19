@@ -17,46 +17,31 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    # ── Profile ────────────────────────────────────────────────────────────────
-    # The public identity. `id` above is the unique user ID shown in the UI.
+    # 公开用户资料；上面的 id 是界面展示的唯一用户标识。
     display_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    # Optional avatar. When absent the UI falls back to derived initials, so this
-    # is never required to render a complete profile.
+    # 头像可选；为空时前端使用姓名首字母，不影响完整展示。
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # ── BYOK provider key (docs/06 §1) ─────────────────────────────────────────
-    # Fernet ciphertext — never plaintext, never returned by any endpoint. The
-    # hint is a display-only tail ("…aB3d") so users can tell which key is stored.
+    # 用户自带密钥以 Fernet 密文存储，接口绝不返回明文。
+    # hint 只保留用于识别的末尾显示片段（docs/06 §1）。
     api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
     api_key_base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_hint: Mapped[str | None] = mapped_column(String(16), nullable=True)
     api_key_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # User-chosen display name for the active connection ("OmniRoute", "Work vLLM") —
-    # distinct from `api_key_provider`, which is the fixed catalog label ("Custom
-    # Endpoint") and stays the same across every gateway a user ever points it at.
-    # NULL means "show the catalog label", the default every account had before this
-    # column existed. Cleared alongside the key in `delete_api_key` — a nickname
-    # describes a connection that no longer exists once the key is gone.
+    # 用户给当前连接起的名称，区别于供应商固定目录标签。
+    # NULL 表示显示目录默认名称；删除密钥时一起清空，因为连接已不存在。
     api_key_label: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
-    # ── Usage limit ────────────────────────────────────────────────────────────
-    # Rolling-month ceiling on total tokens. 0 = unlimited (the default for
-    # self-hosted single-user installs).
+    # 滚动月度总 Token 上限；自托管默认 0 表示不限。
     monthly_token_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # ── Model routing (docs/12 M8) ─────────────────────────────────────────────
-    # Per-role "provider:model" map, e.g. {"planner": "anthropic:claude-opus-5", …}.
-    # NULL means "use the deployment's MODEL_* routing" — the default, and what every
-    # existing user keeps until they choose otherwise. Validated against the catalog
-    # on write, so an unroutable or unpriced model can never be persisted here.
+    # 按角色保存 provider:model 路由（docs/12 M8）。
+    # NULL 表示跟随部署 MODEL_* 默认值；写入前按目录校验，拒绝不可路由或不满足计价要求的选择。
     model_routing: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
 
-    # ── Research/UI preferences (internal/07 Phase 3) ──────────────────────────
-    # Free-form JSON, validated shape-side by `app.schemas.auth.UserPreferences` —
-    # a column per setting would mean a migration for every future knob. NULL means
-    # "every preference is unset", which every reader treats as "use the default",
-    # same convention `model_routing`'s NULL already uses.
+    # 研究和界面偏好使用 JSON，由 UserPreferences 校验结构（internal/07 Phase 3）。
+    # 避免每增加一个选项就迁移表；NULL 表示全部未设置，读取时采用默认值。
     preferences: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
 
     sessions: Mapped[list[Session]] = relationship(  # noqa: F821

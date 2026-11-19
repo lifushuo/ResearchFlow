@@ -9,12 +9,9 @@ from research_engine.prompt_composition import ROLES
 
 
 class ConnectionVerdict(BaseModel):
-    """The API shape of `app.services.provider_health.Verdict` (internal/07 Phase 2a).
+    """供应商连接检查的 API 结构（internal/07 Phase 2a）。
 
-    Three states, never a bare boolean (AGENTS.md, "Honest three-state status"): `ok`,
-    `degraded` (the server answered but rejected the key / hit quota / had an outage —
-    a different fix than "nothing answered"), and `failed` (no response at all).
-    """
+    保留三态：ok 正常；degraded 表示有响应但密钥、配额或服务有问题；failed 表示完全未响应。不能只用布尔值混淆处理方式。"""
 
     state: Literal["ok", "degraded", "failed"]
     reason: str
@@ -24,7 +21,7 @@ class ConnectionVerdict(BaseModel):
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    # Policy enforced in the service (breached-list + byte limit); length floor here.
+    # 此处校验长度下限；泄露密码名单和字节上限由服务层检查。
     password: str = Field(min_length=MIN_LENGTH, max_length=200)
 
 
@@ -33,26 +30,17 @@ class LoginRequest(BaseModel):
     password: str
 
 
-#: Longest replacement prompt a user may store, per role (scope freeze §7, D-2).
+# 每个角色可保存的替换提示词长度上限（范围冻结 §7，D-2）。
 #:
-#: 2,500 because the largest prompt this product ships is `SYNTHESIZER_PROMPT_V2` at 2,431
-#: characters — a user who cannot write something of comparable length cannot really replace
-#: it. Context is not the binding constraint (five roles at this size is ~1.5% of the
-#: smallest catalogue context window); bundle size is, which is why the limit is per role and
-#: there is deliberately no total across the five.
+# 上限 2500，允许用户写出与最长默认提示词 2431 字符相当的内容。
+# 限制主要控制证据包体积，而非上下文窗口，因此逐角色限制，不另设五个角色总长度。
 MAX_PROMPT_OVERRIDE_CHARS = 2500
 
 
 class UserPreferences(BaseModel):
-    """The settings IA's customization surface (internal/07 Phase 3).
+    """用户可调整的研究与界面设置（internal/07 Phase 3）。
 
-    Every field is optional and `None` means "use the default" — the same value
-    today's behaviour already produces, so an account that has never touched Settings
-    is indistinguishable from one with every preference explicitly set to the default.
-    A field declared here with no consumer yet (`density`) is still validated and
-    stored now so Settings has somewhere real to write it; it is not decorative, it is
-    ahead of the UI that reads it.
-    """
+    全部可选，None 表示使用默认值。尚未被界面读取的字段也先校验并保存，保证设置页写入的是真实配置。"""
 
     model_config = {"extra": "forbid"}
 
@@ -63,26 +51,18 @@ class UserPreferences(BaseModel):
     tavily_api_key: str | None = Field(default=None, max_length=200)
     brave_api_key: str | None = Field(default=None, max_length=200)
 
-    #: Replacement system prompts, one per agent role (scope freeze §7). Absent means the
-    #: shipped prompt, which is what every account that never opens the editor gets.
+    # 按角色保存替换系统提示词；缺省使用项目默认值。
     #:
-    #: **Keyed on the five public roles, never on a purpose.** Which of a role's prompts an
-    #: override may actually reach is decided by
-    #: `research_engine.prompt_composition.is_overridable`, and three of `critic`'s prompts
-    #: are protected — so the key space here is the product surface, not the security
-    #: boundary. Nothing reads this field yet.
+    # 键仅允许五个公开角色，不允许填写内部用途。
+    # 具体哪个用途可被覆盖由 prompt_composition.is_overridable 决定，critic 的受保护提示词不会因此开放。
     prompt_overrides: dict[str, str | None] | None = None
 
     @field_validator("prompt_overrides", mode="before")
     @classmethod
     def _validate_prompt_overrides(cls, value: object) -> object:
-        """Reject anything that is not a role a user may edit, with a text they may set.
+        """校验角色名与提示词内容，明确告诉用户错误原因及允许值。
 
-        Hand-rolled rather than left to the annotation because the two hosts must refuse
-        identically: the desktop validates through this same model, and a client that sees
-        pydantic's generic message on one host and a named role list on the other has two
-        contracts. Every refusal below names what was wrong and what is allowed.
-        """
+        两种主机共用此验证器，避免一端给通用错误、另一端给专门提示而形成不同契约。"""
         if value is None:
             return None
         if not isinstance(value, dict):
@@ -91,7 +71,7 @@ class UserPreferences(BaseModel):
             if role not in ROLES:
                 raise ValueError(f"unknown agent role {role!r}; valid roles are {', '.join(ROLES)}")
             if text is None:
-                continue  # the documented reset: the role goes back to its shipped prompt
+                continue  # 重置该角色，恢复项目默认提示词。
             if not isinstance(text, str):
                 raise ValueError(f"prompt override for {role!r} must be a string or null")
             if not text.strip():
@@ -113,20 +93,19 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: datetime
 
-    # ── Profile ────────────────────────────────────────────────────────────────
+    # 公开资料
     display_name: str | None = None
     avatar_url: str | None = None
     monthly_token_limit: int = 0
 
-    # ── BYOK status (never the key itself) ─────────────────────────────────────
+    # 用户自带密钥的状态，不包含密钥原文。
     api_key_provider: str | None = None
     api_key_base_url: str | None = None
     api_key_hint: str | None = None
     api_key_label: str | None = None
     api_key_set_at: datetime | None = None
-    # Set only by `PUT /me/api-key` — saving a key tests it in the same request, so the
-    # UI never shows a stale "connected" for a key nobody has actually probed since it
-    # changed. `None` on every other endpoint returning this schema (internal/07 Phase 2a).
+    # 只有保存密钥接口填写本次探测结果，避免显示未经验证的连接成功。
+    # 其他返回此结构的接口填 None（internal/07 Phase 2a）。
     connection_verdict: ConnectionVerdict | None = None
 
     preferences: UserPreferences = Field(default_factory=UserPreferences)
@@ -136,29 +115,25 @@ class UserResponse(BaseModel):
     @field_validator("preferences", mode="before")
     @classmethod
     def preferences_default_when_unset(cls, v: dict | None) -> dict:
-        """The ORM column is NULL for every account that has never touched Settings —
-        map that to an all-defaults object rather than a validation error, so the
-        response always carries a complete, well-formed `preferences`."""
+        """未修改设置的旧账号在数据库中为 NULL，响应转换成完整默认偏好对象，而不是报结构校验错误。"""
         return v or {}
 
 
 class ProfileUpdate(BaseModel):
-    """Editable profile fields. Omitted fields are left unchanged."""
+    """可编辑资料；请求未提供的字段保持不变。"""
 
     model_config = {"str_strip_whitespace": True}
 
     display_name: str | None = Field(default=None, max_length=80)
     avatar_url: str | None = Field(default=None, max_length=2000)
     monthly_token_limit: int | None = Field(default=None, ge=0)
-    # Merged into the stored preferences, not replaced — a page that only exposes the
-    # "Research" section must not silently blank "Appearance"'s density choice.
+    # 与已保存偏好合并，不能整份替换，避免研究设置覆盖外观设置。
     preferences: UserPreferences | None = None
 
     @field_validator("avatar_url")
     @classmethod
     def avatar_must_be_http(cls, v: str | None) -> str | None:
-        """Avatars are rendered in an <img>; only allow http(s) so a javascript:
-        or data: URL can't be stored and echoed back into the page."""
+        """头像用于 img，只允许 http(s)，拒绝 javascript: 和 data: 地址，避免危险内容被存入后回显。"""
         if v is None or v == "":
             return None
         if not v.startswith(("http://", "https://")):
@@ -167,15 +142,14 @@ class ProfileUpdate(BaseModel):
 
 
 class PasswordChangeRequest(BaseModel):
-    """Change the account password. Proving knowledge of the current one is what
-    stops a stolen session cookie from being escalated into a permanent takeover."""
+    """修改密码需证明知道旧密码，避免被盗会话 Cookie 升级成永久账号接管。"""
 
     current_password: str = Field(min_length=1, max_length=200)
     new_password: str = Field(min_length=MIN_LENGTH, max_length=200)
 
 
 class ApiKeyRequest(BaseModel):
-    """User-supplied provider key (BYOK). Stored encrypted, never returned."""
+    """用户自带供应商密钥，加密存储，响应绝不返回。"""
 
     model_config = {"str_strip_whitespace": True}
 
@@ -185,14 +159,11 @@ class ApiKeyRequest(BaseModel):
 
 
 class ApiKeyLabelRequest(BaseModel):
-    """Rename the active BYOK connection. Separate from `ApiKeyRequest` on purpose —
-    a nickname does not require re-proving the key, and saving one must not re-probe
-    the provider (internal/07 Phase 2a's probe is a "test", not a rename)."""
+    """只重命名连接，不重新验证密钥，也不再次调用供应商探测。与 ApiKeyRequest 明确分开。"""
 
     model_config = {"str_strip_whitespace": True}
 
-    # Blank clears the nickname back to the catalog label ("Custom Endpoint"), the
-    # same convention `ProfileUpdate.avatar_url` uses for "unset this".
+    # 空名称表示恢复目录默认标签，与清空头像使用相同的空值约定。
     label: str | None = Field(default=None, max_length=60)
 
     @field_validator("label")
@@ -210,11 +181,11 @@ class UsageWindow(BaseModel):
 
 
 class UsageResponse(BaseModel):
-    """Token/cost usage for the profile page (docs/07)."""
+    """个人资料页展示的 Token 与费用用量（docs/07）。"""
 
-    month: UsageWindow  # current calendar month — the window the limit applies to
-    week: UsageWindow  # rolling 7 days
-    last_session: UsageWindow  # most recent session only
-    monthly_token_limit: int = 0  # 0 = unlimited
-    limit_remaining: int | None = None  # None when unlimited
+    month: UsageWindow  # 当前自然月，和月度限额使用同一窗口。
+    week: UsageWindow  # 滚动最近 7 天。
+    last_session: UsageWindow  # 只统计最近一次会话。
+    monthly_token_limit: int = 0  # 0 表示不限。
+    limit_remaining: int | None = None  # 不限额时为 None。
     limit_reached: bool = False

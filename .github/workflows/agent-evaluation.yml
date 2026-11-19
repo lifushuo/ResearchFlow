@@ -1,0 +1,139 @@
+name: Agent Evaluation (offline)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-eval:
+    name: Agent evaluation offline gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout candidate source
+        uses: actions/checkout@v7
+
+      - name: Prepare artifacts
+        run: mkdir -p agent-eval-artifacts
+
+      - name: Build existing ResearchFlow worker image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target worker --tag researchflow-agent-eval-ci --file backend/Dockerfile backend \
+            2>&1 | tee agent-eval-artifacts/build.log
+
+      - name: Offline evaluator checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=256m \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e LLM_MODE=fake -e HF_HUB_OFFLINE=1 \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/workspace,readonly" \
+            -w /workspace/backend researchflow-agent-eval-ci sh -c '
+              ruff check --no-cache app/ research_engine/ tests/ evals/ &&
+              ruff format --no-cache --check app/ research_engine/ tests/ evals/ &&
+              python -m pytest -q -p no:cacheprovider --tb=short \
+                tests/task/test_tool_safety.py tests/task/test_agent_evaluation_ci.py \
+                tests/task/test_unified_eval.py tests/task/test_replay_suite.py \
+                tests/task/test_agent_replay.py tests/task/test_interview_closeout.py \
+                tests/task/test_evaluation_closure.py tests/task/test_evaluation_closure_api.py \
+                tests/task/test_evaluation_closure_integration.py \
+                tests/task/test_evaluation_core_scope.py tests/task/test_evaluation_offline_adapters.py \
+                tests/task/test_evaluation_diagnostics.py \
+                tests/task/test_long_run_reliability.py tests/task/test_long_run_acceptance.py tests/task/test_evaluation_process.py \
+                tests/task/test_judge_response_diagnostics.py \
+                tests/task/test_judge_label_bounds.py tests/workflow/test_executor_regression_compiled.py' \
+            2>&1 | tee agent-eval-artifacts/tests.log
+
+      - name: Controlled tool contract gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p agent-eval-artifacts/tools
+          name="rf-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          volume="${name}-output"
+          rc=0
+          docker run --name "$name" --network none --read-only --tmpfs /tmp:rw,size=64m \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e LLM_MODE=fake \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/workspace,readonly" \
+            --mount "type=volume,source=${volume},target=/app/data" \
+            -w /workspace/backend researchflow-agent-eval-ci sh -c '
+              mkdir -p /app/data/tools || exit "$?"
+              python -m evals.agent_eval_ext.tool_safety_cli score \
+                --gold evals/agent_eval_ext/fixtures/tool_gold_v1.json \
+                --observed evals/agent_eval_ext/fixtures/tool_observed_pass_v1.json \
+                --out /app/data/tools/pass.json || exit "$?"
+              python -m evals.agent_eval_ext.tool_safety_cli score \
+                --gold evals/agent_eval_ext/fixtures/tool_gold_v1.json \
+                --observed evals/agent_eval_ext/fixtures/tool_observed_fail_v1.json \
+                --out /app/data/tools/negative-control.json
+              rc=$?
+              test "$rc" -eq 1' \
+            > agent-eval-artifacts/tools.log 2>&1 || rc=$?
+          run_rc=$rc
+          export_rc=0
+          docker cp "$name:/app/data/tools/." agent-eval-artifacts/tools/ || export_rc=$?
+          if [ "$export_rc" -ne 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
+          printf '{"run_exit_code":%s,"export_exit_code":%s,"gate_exit_code":%s}\n' "$run_rc" "$export_rc" "$rc" > agent-eval-artifacts/tool-status.json
+          cat agent-eval-artifacts/tools.log
+          if [ "$export_rc" -eq 0 ]; then
+            docker rm "$name" > /dev/null 2>&1 || true
+            docker volume rm "$volume" > /dev/null 2>&1 || true
+          fi
+          exit "$rc"
+
+      - name: Run compiled-graph Replay quality gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p agent-eval-artifacts/replay
+          name="rf-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          volume="${name}-output"
+          # /app/data inherits the image's appuser ownership; tmpfs /tmp does not survive exit.
+          rc=0
+          docker run --name "$name" --network none --read-only \
+            --tmpfs /tmp:rw,size=384m --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -e LLM_MODE=fake -e HF_HUB_OFFLINE=1 \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/workspace,readonly" \
+            --mount "type=volume,source=${volume},target=/app/data" \
+            -w /workspace/backend researchflow-agent-eval-ci \
+            python -m evals.agent_eval_ext.unified_cli run \
+              --dataset evals/agent_eval_ext/fixtures/unified_dataset_v1.json \
+              --out-dir /app/data/replay --revision "${GITHUB_SHA}" \
+            > agent-eval-artifacts/replay.log 2>&1 || rc=$?
+          run_rc=$rc
+          export_rc=0
+          docker cp "$name:/app/data/replay/." agent-eval-artifacts/replay/ || export_rc=$?
+          if [ "$export_rc" -ne 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
+          if [ "$rc" -eq 0 ] && [ ! -s agent-eval-artifacts/replay/unified.json ]; then
+            echo '::error::Replay exited successfully without its evaluation artifact'
+            rc=1
+          fi
+          if [ "$export_rc" -eq 0 ]; then
+            docker rm "$name" > /dev/null 2>&1 || true
+            docker volume rm "$volume" > /dev/null 2>&1 || true
+          fi
+          printf '{"run_exit_code":%s,"export_exit_code":%s,"gate_exit_code":%s,"source":"candidate_worktree","code_revision_verified":false,"historical_paid_eval":false}\n' \
+            "$run_rc" "$export_rc" "$rc" > agent-eval-artifacts/ci-status.json
+          cat agent-eval-artifacts/replay.log
+          exit "$rc"
+
+      - name: Upload evaluation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-eval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: agent-eval-artifacts/
+          if-no-files-found: error
+          retention-days: 7

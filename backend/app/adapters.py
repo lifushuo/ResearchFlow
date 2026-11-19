@@ -1,16 +1,7 @@
-"""
-The server host's implementations of the engine's ports (docs/13 §4).
+"""服务端对研究引擎端口的实现（docs/13 §4）。
 
-`research_engine` declares shapes in `research_engine/ports.py`; this module supplies the
-Postgres/Redis-backed versions of them, plus the embeddings provider project memory runs
-on (docs/14 §4). The desktop host (docs/12 M9) will have its own counterpart supplying
-SQLite and in-process equivalents, and the engine will not know the difference.
-
-Conformance is structural, not by inheritance — `tests/test_engine_runner.py` asserts it
-with `isinstance` against the runtime-checkable Protocols.
-
-Kept separate from `app/runtime.py`, which maps settings → RunConfig and nothing else.
-"""
+引擎在 ports.py 定义接口，本模块提供 Postgres、Redis 和项目记忆向量化适配；桌面端改用 SQLite 与进程内实现，引擎无需感知。采用结构化协议匹配而非继承，由运行器测试验证。
+与仅负责配置映射的 app/runtime.py 分开。"""
 
 from __future__ import annotations
 
@@ -18,7 +9,7 @@ import asyncio
 import json
 import time
 import uuid
-from pathlib import Path  # noqa: F401  (used in annotations)
+from pathlib import Path  # noqa: F401 — 类型注解需要此导入
 
 import httpx
 import structlog
@@ -39,12 +30,9 @@ logger = structlog.get_logger()
 
 
 class RedisCache:
-    """Search-result cache backed by the shared Redis pool.
+    """基于共用 Redis 池缓存搜索结果。
 
-    Deliberately not defensive: `retrievers.search` treats every cache operation as
-    advisory and swallows failures, which is why an unreachable Redis degrades a run to
-    "uncached" instead of failing it.
-    """
+    缓存只是优化，检索器会处理其异常；Redis 不可用时应退化为无缓存，不能让研究失败。"""
 
     async def get(self, key: str) -> str | None:
         from app.db.redis import get_redis
@@ -58,29 +46,14 @@ class RedisCache:
 
 
 def agent_log_sink(db, session_id: str) -> EventSink:
-    """Event sink that persists to `agent_logs`, then publishes to Redis.
+    """先将事件提交到 agent_logs，再发布到 Redis，并携带数据库事件 ID。
 
-    The row is written and committed *before* the publish, and the row id is attached to
-    the published payload — that is what makes SSE replay with `Last-Event-ID` work
-    (docs/05 §4): a client reconnecting mid-run resumes from a durable id rather than
-    losing whatever was in flight.
-
-    Bound to a caller-supplied DB session so the whole run shares one session scope; the
-    detached-object writes that caused the July 2026 worker bug came from not doing this.
-
-    Serialised by a per-run lock, because an `AsyncSession` is *not* safe for concurrent
-    use. Once M7 gave the executor parallel tasks, two of them could reach `flush()` on
-    this shared session at the same time and the run died with "Session is already
-    flushing" — reliably, on every parallel run, in fake mode as much as real. The lock
-    spans the publish as well as the write so that events reach Redis in the same order
-    they were committed; `Last-Event-ID` replay hands clients a monotonic cursor, and
-    publishing out of order would let a reconnecting client skip an event whose id is
-    lower than one it has already seen.
-    """
+    客户端凭 Last-Event-ID 从持久记录恢复，避免断线丢事件（docs/05 §4）。整个运行使用调用方提供的数据库会话。
+    AsyncSession 不能并发使用，因此每次运行用锁串行完成写入和发布；锁也覆盖发布，确保 Redis 顺序与提交顺序一致，防止重连时游标跨过尚未收到的旧事件。"""
     session_uuid = uuid.UUID(session_id)
     write_lock = asyncio.Lock()
 
-    async def sink(sid: str, event: dict) -> None:  # noqa: ARG001 - port shape
+    async def sink(sid: str, event: dict) -> None:  # noqa: ARG001 - 保留端口要求的参数形式
         row = AgentLog(
             session_id=session_uuid,
             event_type=event.get("type", "agent_log"),
@@ -98,11 +71,9 @@ def agent_log_sink(db, session_id: str) -> EventSink:
 
 
 async def redis_event_stream(pubsub):
-    """The server's live feed as `(id, payload)` pairs — the shape `sse_frames` consumes.
+    """将服务端实时消息转换成 sse_frames 需要的 ID、负载对。
 
-    Malformed frames are skipped rather than raised on: a publisher that wrote something
-    unparsable should not close every listener's connection.
-    """
+    无法解析的消息跳过，不应因某个发布者发错内容而关闭全部监听连接。"""
     async for message in pubsub.listen():
         if message["type"] != "message":
             continue
@@ -114,12 +85,9 @@ async def redis_event_stream(pubsub):
 
 
 class PgVectorMemoryIndex:
-    """`MemoryIndex` over `memory_chunks`, using pgvector's cosine distance.
+    """在 memory_chunks 上实现 MemoryIndex，使用 pgvector 余弦距离。
 
-    The one place that operator appears. It used to sit inline in
-    `app/services/memory.py`, a module both hosts import — so the domain layer carried the
-    most dialect-specific expression in the codebase, and the desktop imported it.
-    """
+    把数据库方言相关表达式集中在适配层，避免共用 memory 服务和桌面端依赖 Postgres。"""
 
     available = True
 
@@ -146,18 +114,12 @@ class PgVectorMemoryIndex:
 
 
 class ServerCorpusLocator:
-    """`CorpusLocator` for the server: one SQLite file per project, under `corpus_path`.
+    """服务端语料定位器：每个项目在 corpus_path 下有独立 SQLite 文件。
 
-    **`corpus_path`, never `corpus_dir`.** The raw setting is relative by default and
-    resolves against the working directory, and the API and the worker are separate
-    processes with different ones — which is how a document uploaded through one became
-    invisible to the run that needed it (`AGENTS.md`). Reading it here, once, is what stops
-    that being seven modules' problem.
-    """
+    必须使用已解析的 corpus_path，不能使用可能相对工作目录的 corpus_dir；API 与 Worker 工作目录不同，否则会出现上传成功但研究找不到文档。"""
 
     def __init__(self, embedder_factory=None) -> None:
-        # Injected so a test can supply a deterministic embedder without reaching a
-        # provider, and so the parity harness can pin the same one on both hosts.
+        # 通过注入向量模型，让测试不访问真实供应商，也便于两种主机使用相同模型验证契约。
         self._embedder_factory = embedder_factory or embeddings_for
 
     def _root(self):
@@ -194,7 +156,7 @@ class ServerCorpusLocator:
         return await self._open(project_id, keys)
 
     def delete(self, project_id) -> None:
-        """Best effort: a corpus that cannot be removed must not fail the project delete."""
+        """尽力删除语料；语料文件清理失败不能推翻项目删除。"""
         for path in self.paths_to_delete(project_id):
             try:
                 path.unlink(missing_ok=True)
@@ -202,12 +164,10 @@ class ServerCorpusLocator:
                 logger.warning("corpus_cleanup_failed", project_id=str(project_id), error=str(e))
 
 
-# ── Embeddings (docs/14 §4) ────────────────────────────────────────────────────────
+# 向量化适配（docs/14 §4）
 #
-# The width of `memory_chunks.embedding`. Every supported provider is configured to
-# produce exactly this, which keeps switching providers a re-index rather than a
-# migration. It does NOT make their vectors interchangeable — equal width is not equal
-# meaning, which is why each chunk records the model that produced it.
+# memory_chunks.embedding 的固定维度。所有供应商按此维度输出，切换时只需重建索引，不必迁移列。
+# 维度相同不代表向量含义相同，因此每条记录还要保存生成它的模型。
 EMBEDDING_DIMENSIONS = 768
 
 _DEFAULT_EMBEDDING_MODELS = {
@@ -216,23 +176,18 @@ _DEFAULT_EMBEDDING_MODELS = {
     "openai": "text-embedding-3-small",
 }
 
-# A local embedding pass is fast, but the first call after a cold start pays for loading
-# the model into memory, which is slow enough to look like a hang at a chat timeout.
+# 本地向量化通常很快，但冷启动要加载模型；首次调用需留出时间，避免被当成聊天卡死。
 _EMBED_TIMEOUT_SECONDS = 60.0
 
-# How long an "is Ollama there?" answer is reused. Without this, every chat message on a
-# deployment with no local server pays the probe timeout before falling back.
+# 短暂缓存 Ollama 可用性探测；本地服务没启动时，不必让每条聊天消息都等一次探测超时。
 _PROBE_CACHE_SECONDS = 300.0
 _probe_cache: tuple[float, str | None] | None = None
 
 
 def _check_width(vectors: list[list[float]], model_id: str) -> list[list[float]]:
-    """Reject vectors the memory column cannot store, with a message that says why.
+    """提前拒绝维度不符合记忆列要求的向量，并报告模型及预期、实际维度。
 
-    Postgres would reject them anyway — `vector(768)` is enforced — but as an opaque
-    write error at ingestion time, long after the misconfiguration. Checking here names
-    the model and both widths.
-    """
+    数据库最终也会拒绝，但在适配层检查能更早指出配置问题，避免只看到模糊的写入失败。"""
     for vector in vectors:
         if len(vector) != EMBEDDING_DIMENSIONS:
             raise EmbeddingsUnavailable(
@@ -245,24 +200,19 @@ def _check_width(vectors: list[list[float]], model_id: str) -> list[list[float]]
 
 
 class OllamaEmbeddings:
-    """Local embeddings over Ollama's OpenAI-compatible endpoint.
+    """通过 Ollama 的 OpenAI 兼容接口获取本地向量。
 
-    Plain httpx for the same reason `services/local_llm.py` uses it: this path should not
-    drag in a model client, and the wire format is two fields.
-    """
+    协议简单，直接使用 httpx，避免为此引入完整模型客户端。"""
 
     def __init__(self, model: str, base_url: str) -> None:
         self._model = model
-        # Same localhost→host.docker.internal rewrite the chat models get. This adapter
-        # talks to Ollama with its own httpx client instead of going through
-        # `llm_factory`, so it never inherited the mapping and dialled the *container*
-        # for every embedding — breaking corpus upload and project-memory ingestion
-        # inside Docker while chat completions worked fine.
+        # 独立 httpx 向量客户端也要复用 localhost→host.docker.internal 的容器地址映射。
+        # 它不经过 llm_factory，不能假定已自动映射；否则聊天正常，语料上传和记忆写入却会连接到容器自身而失败。
         self._base_url = map_local_host(base_url.rstrip("/"))
 
     @property
     def is_local(self) -> bool:
-        # OLLAMA_BASE_URL can point anywhere; only the endpoint decides (docs/12 M10).
+        # OLLAMA_BASE_URL 可配置为远程地址，是否本地必须看实际端点（docs/12 M10）。
         return is_local_endpoint(self._base_url)
 
     @property
@@ -284,14 +234,13 @@ class OllamaEmbeddings:
                 )
                 response.raise_for_status()
                 payload = response.json()
-        except Exception as exc:  # noqa: BLE001 — every failure means "cannot embed"
+        except Exception as exc:  # noqa: BLE001 — 这里任何请求失败都表示本次无法生成向量
             raise EmbeddingsUnavailable(
                 f"Local embedding server at {self._base_url} did not answer: {exc}. "
                 f"Check that Ollama is running and `ollama pull {self._model}` has been run."
             ) from exc
 
-        # Order is by the `index` field, not by arrival — a chunk paired with the wrong
-        # vector is a silent retrieval bug, not a crash.
+        # 按照响应 index 对齐，不按返回先后配对；错配向量会悄悄损坏检索结果。
         rows = sorted(payload.get("data") or [], key=lambda row: row.get("index", 0))
         vectors = [row.get("embedding") or [] for row in rows]
         if len(vectors) != len(texts):
@@ -302,22 +251,17 @@ class OllamaEmbeddings:
 
 
 class HostedEmbeddings:
-    """Embeddings from a hosted provider, on the user's key or the deployment's.
+    """使用用户自带密钥或部署密钥调用远程向量模型。
 
-    Wraps the LangChain client rather than the REST API because the provider SDKs already
-    handle batching limits and retries, and this path runs rarely enough (once per
-    approved report, once per chat message) that the dependency weight is irrelevant.
-    """
+    包装 LangChain 客户端，复用供应商 SDK 的批量限制和重试机制。"""
 
     def __init__(self, provider: str, model: str, api_key: str) -> None:
         self._provider = provider
         self._model = model
         self._api_key = api_key
 
-    # A hosted provider is a network call by definition. This is the adapter that made
-    # corpus-only mode's no-egress claim untrue whenever a deployment set
-    # EMBEDDINGS_PROVIDER=google|openai: the query embedding at corpus.py::search left the
-    # machine on every corpus search. The airgap guard now refuses it outright.
+    # 远程向量化必然外发数据。
+    # 仅语料库模式即使不搜索网页，查询向量也可能访问 google/openai，所以隔离模式必须直接拒绝此适配器。
     is_local = False
 
     @property
@@ -332,15 +276,13 @@ class HostedEmbeddings:
         if self._provider == "google":
             from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-            # The API names embedding models under `models/`; accept either form so the
-            # setting can be written the way the provider's docs show it.
+            # Google 模型名称可能带 models/ 前缀，两种写法都接受，兼容供应商文档中的配置形式。
             name = self._model if self._model.startswith("models/") else f"models/{self._model}"
             return GoogleGenerativeAIEmbeddings(model=name, google_api_key=self._api_key)
 
         from langchain_openai import OpenAIEmbeddings
 
-        # text-embedding-3-* support Matryoshka truncation, so one setting keeps every
-        # provider at the stored width instead of forcing a wider column for one of them.
+        # text-embedding-3 系列支持维度截取，统一输出存储列所需维度，无需为它单独扩列。
         return OpenAIEmbeddings(
             model=self._model, api_key=self._api_key, dimensions=EMBEDDING_DIMENSIONS
         )
@@ -358,11 +300,9 @@ class HostedEmbeddings:
 
 
 async def _local_embedding_model() -> str | None:
-    """The embedding model installed on the local Ollama server, if one is.
+    """探测本地 Ollama 是否安装向量模型。
 
-    Cached briefly: this is called on every chat turn, and on a deployment with no local
-    server the probe would otherwise spend its full timeout before every fallback.
-    """
+    结果短暂缓存；没有本地服务的部署不应在每轮聊天前都承担完整探测超时。"""
     global _probe_cache
     now = time.monotonic()
     if _probe_cache is not None and _probe_cache[0] > now:
@@ -373,8 +313,7 @@ async def _local_embedding_model() -> str | None:
     status = await local_llm.probe()
     configured = settings.embeddings_model
     installed = [m.name for m in status.models if m.is_embedding]
-    # An explicitly configured model wins if it is actually there; otherwise take the
-    # first embedding model the server reports.
+    # 明确配置的模型确实存在时优先使用，否则取服务端报告的第一个向量模型。
     chosen = None
     if status.reachable:
         if configured and any(
@@ -389,26 +328,20 @@ async def _local_embedding_model() -> str | None:
 
 
 def reset_embeddings_probe_cache() -> None:
-    """Forget the cached Ollama probe. For tests and for a settings change."""
+    """清空 Ollama 探测缓存，用于测试或配置变更。"""
     global _probe_cache
     _probe_cache = None
 
 
 async def embeddings_for(provider_keys: dict[str, str] | None = None) -> Embeddings:
-    """Build this deployment's embeddings provider, honouring the caller's BYOK keys.
+    """构建部署的向量模型，优先使用调用方的自带密钥。
 
-    `provider_keys` is the same `{provider: key}` mapping the pipeline gets, so a BYOK
-    user's memory is embedded on their own key exactly as their research was. Returns
-    `NoEmbeddings` when nothing is configured — the caller decides whether that is fatal.
-    """
+    provider_keys 与研究流程格式一致，保证用户的记忆向量化也使用其自己的密钥。无可用配置时返回 NoEmbeddings，是否终止由调用方决定。"""
     keys = provider_keys or {}
     choice = settings.embeddings_provider
 
-    # Checked before anything else, including `embeddings_provider`: fake mode is a
-    # promise about the whole run, not a provider preference (docs/17 §6.2). This branch
-    # was missing entirely, so `./start.sh --fake` — "keyless demo mode, no API key
-    # needed" — embedded a corpus upload against the real key in `.env`, spending money
-    # on a run the product said was free and 404-ing when that key was stale.
+    # 先检查 fake 模式，再检查供应商配置；演示承诺适用于整次运行（docs/17 §6.2）。
+    # 否则即使研究使用脚本模型，上传向量化仍可能读取 .env 的真密钥并收费。
     if settings.llm_mode == "fake":
         return FakeEmbeddings()
 
@@ -431,8 +364,7 @@ async def embeddings_for(provider_keys: dict[str, str] | None = None) -> Embeddi
     if choice in ("google", "openai"):
         return hosted(choice) or NoEmbeddings()
 
-    # auto: local first — free, private, and the whole point of the local-first tier —
-    # then whichever hosted provider the user or the deployment has a key for.
+    # 自动选择时优先本地，再选择用户或部署配置了密钥的远程供应商。
     local = await _local_embedding_model()
     if local:
         return OllamaEmbeddings(local, settings.ollama_base_url)

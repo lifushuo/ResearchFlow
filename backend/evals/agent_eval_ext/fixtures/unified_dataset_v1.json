@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "dataset_id": "rf-interview-regression",
+  "dataset_version": 1,
+  "split": "regression",
+  "replay_manifest": "replay_suite_v1.json"
+}

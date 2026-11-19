@@ -1,15 +1,4 @@
-"""
-The canonical application runtime: one implementation of each product operation.
+"""共用应用层：每项产品操作只有一个标准实现。
 
-Empty on purpose. The layer is declared before anything moves into it, because a boundary
-drawn after the fact is a boundary drawn around whatever the code already does.
-
-What belongs here: plain `async` functions, one per product-visible operation, taking their
-collaborators as arguments — a database session, the caller's identity, a port. What does
-not: FastAPI (`Depends`, `HTTPException`, `UploadFile`, `StreamingResponse`), the server's
-configuration or engine, Celery, Redis, the keychain, or anything under `desktop/`.
-
-Each host wraps these in a thin router. `tests/workflow/test_layer_boundaries.py` enforces
-the direction; `app/api/v1/runs.py` is the worked example of the shape, from before the
-rule existed.
-"""
+这里存放普通 async 函数，通过参数接收数据库、用户身份和端口。禁止依赖 FastAPI、服务器配置、Celery、Redis、系统密钥库或 desktop。
+两种主机只包装轻量路由，依赖方向由 test_layer_boundaries 验证。"""

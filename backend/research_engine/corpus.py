@@ -1,28 +1,11 @@
-"""
-The local corpus: a closed document set as the run's only evidence source
-(internal/12 M10, docs/13 "Three privacy tiers").
+"""本地资料库，可作为研究唯一证据源，见 internal/12 M10、docs/13 隐私分层。
 
-Two things live here:
+通过 ContextVar 安装 Corpus 端口，供工具内部获取。corpus_mode 开启后，
+检索只走此端口，read_webpage 只允许 corpus://，无需修改图内搜索与读取步骤。
 
-1. **The installation seam.** A `Corpus` port held in a `ContextVar`, exactly like
-   `cache.py` and `events.py` — because `retrievers.search` and `read_webpage` reach
-   for it from inside tools, where no state-threading can arrive. When
-   `RunConfig.corpus_mode` is set, `retrievers.search` delegates here exclusively and
-   `read_webpage` refuses everything that is not a `corpus://` URL. The graph does not
-   change; the executor still just searches and reads.
-
-2. **The reference implementation.** `CorpusStore`: ingest (PDF/MD/TXT) → extract →
-   chunk with exact offsets → embed through the `Embeddings` port → brute-force cosine
-   over a SQLite file. SQLite + numpy rather than a vector extension because the
-   desktop host has no pgvector and a laptop corpus (the M10 DoD is 500 documents)
-   scans in milliseconds — an index would be complexity without a customer.
-
-The location contract is the point of the whole milestone: every chunk stores the
-verbatim span `[start, end)` of its document's extracted text, search results carry
-`corpus://<doc-id>#page=N&chars=S-E` URLs, and `read` resolves one back to the text at
-exactly that spot. "Every citation resolves to an exact document location" (DoD) is
-therefore enforced by the schema, not by the model's behaviour.
-"""
+CorpusStore 负责 PDF/MD/TXT 提取、精确偏移切块、嵌入和 SQLite 余弦检索。
+桌面端没有 pgvector，本地规模使用 SQLite 与 numpy 即可。
+每块保存原文 [start,end)，URL 携带文档、页码和字符区间，读取时精确还原位置。"""
 
 from __future__ import annotations
 
@@ -50,26 +33,21 @@ logger = structlog.get_logger()
 
 _CORPUS_SCHEME = "corpus"
 
-# One document, one embedding batch: keep peak memory flat by never holding more than
-# this many chunk vectors at once during ingestion (M10 DoD: no OOM at 500 documents).
+# 逐文档分批嵌入，限制同时持有的向量数量，避免导入大量文档时内存峰值失控。
 _EMBED_BATCH = 32
 
-# How much context `read` returns around the cited span — enough to see the sentence
-# the quote sits in, small enough to stay a cheap tool observation.
+# 读取引用附近的适量上下文，兼顾句子完整与工具返回成本。
 _READ_CONTEXT_CHARS = 600
 _READ_MAX_CHARS = 8000
 
 
-# ── The seam ─────────────────────────────────────────────────────────────────────
+# ── 端口安装 ──
 
 
 class NoCorpus:
-    """The default: no corpus is installed. Refuses, loudly.
+    """未安装资料库的默认实现，明确拒绝调用。
 
-    In corpus-only mode a silent empty result set would produce a report with no
-    sources — the exact "confident nonsense" failure the Embeddings port documents.
-    Raising lets `web_search` surface the misconfiguration to the agent and the log.
-    """
+    仅资料库模式下静默返回空结果会导致无来源报告；抛错才能让代理与日志看到配置问题。"""
 
     async def search(self, query: str, max_results: int) -> list[dict]:  # noqa: ARG002
         raise RuntimeError(
@@ -87,7 +65,7 @@ _corpus: ContextVar[Corpus] = ContextVar("engine_corpus", default=_NO_CORPUS)
 
 
 def set_corpus(corpus: Corpus):
-    """Install a corpus for the current context. Returns a token for `reset_corpus`."""
+    """为当前上下文安装资料库，返回可供 reset_corpus 恢复的令牌。"""
     return _corpus.set(corpus)
 
 
@@ -100,19 +78,14 @@ def get_corpus() -> Corpus:
 
 
 class ScopedCorpus:
-    """A corpus that answers only for one run's frozen selection of document versions.
+    """仅允许访问本轮冻结的文档版本选择。
 
-    The selection is enforced here, at the port, rather than by filtering results after
-    the fact or by telling the model which files it may use: every search and every read
-    the engine makes goes through this object, so nothing outside the selection can be
-    retrieved, read, or become evidence — including a `corpus://` URL the model invented
-    or a document's own text tried to inject (internal/rfcs/V3.1-corpus-scope.md §8.4).
-    """
+    限制在端口处强制执行，而非事后过滤或仅告知模型；因此检索、读取以及模型编造的
+    corpus:// 地址都不能越过选择范围，见 RFC V3.1 §8.4。"""
 
     def __init__(self, inner: CorpusStore, allowed_ids: frozenset[str]):
         if not allowed_ids:
-            # An empty selection is refused before execution (§8.2); reaching here with
-            # one is a bug, and widening to the whole corpus would be the silent failure.
+            # 空选择应在运行前被拒绝；若仍到这里说明存在缺陷，不能退回全库检索。
             raise ValueError("a scoped corpus needs at least one selected document")
         self._inner = inner
         self._allowed = frozenset(allowed_ids)
@@ -122,9 +95,8 @@ class ScopedCorpus:
         return self._allowed
 
     async def search(self, query: str, max_results: int) -> list[dict]:
-        # max(1, ceil(k / n)) hits per selected file: a two-file selection searching for five
-        # passages may take three from one file. A retrieval change, measured before and
-        # after by the §17 eval rather than assumed to help (docs/08).
+        # 每个选中文件最多取 max(1, ceil(k/n)) 条，避免单文件独占结果。
+        # 检索策略变化需用 §17 评测验证，不能假定一定改善。
         per_document = max(1, -(-max_results // len(self._allowed)))
         return await self._inner.search(
             query, max_results, document_ids=self._allowed, per_document=per_document
@@ -135,8 +107,7 @@ class ScopedCorpus:
         if location is None:
             return {"url": url, "title": "", "text": "", "error": "not a valid corpus URL"}
         if location.doc_id not in self._allowed:
-            # Same shape as every refused read, with nothing in `text` that could be
-            # quoted. Deliberately does not say whether the document exists.
+            # 拒绝读取时不提供可引用正文，也不透露文档是否存在。
             return {"url": url, "title": "", "text": "", "error": OUTSIDE_SELECTION}
         return await self._inner.read(url)
 
@@ -144,14 +115,12 @@ class ScopedCorpus:
 OUTSIDE_SELECTION = "outside_selection: this document is not one of the run's selected files"
 
 
-# ── The URL scheme ───────────────────────────────────────────────────────────────
+# ── 资料库 URL 格式 ──
 #
 # corpus://<document-id>#chars=<start>-<end>[&page=<n>]
 #
-# The fragment is the exact location: offsets into the document's extracted text,
-# plus the page when the document has pages. Deliberately NOT an http(s) URL — a
-# scheme the SSRF guard and any browser would refuse keeps corpus locations from
-# ever being fetched, fetched-against, or spoofed by an injected web result.
+# URL 片段表示提取文本中的精确偏移和可选页码。
+# 使用 corpus:// 而非 HTTP，避免资料库位置被当作网络地址抓取或被网页结果冒充。
 
 
 def corpus_url(doc_id: str, *, start: int, end: int, page: int | None) -> str:
@@ -163,7 +132,7 @@ def corpus_url(doc_id: str, *, start: int, end: int, page: int | None) -> str:
 
 @dataclass(frozen=True)
 class CorpusLocation:
-    """A parsed corpus URL: which document, which span, which page (if any)."""
+    """解析后的资料库位置：文档、字符区间及可选页码。"""
 
     doc_id: str
     start: int
@@ -172,7 +141,7 @@ class CorpusLocation:
 
 
 def parse_corpus_url(url: str) -> CorpusLocation | None:
-    """Parse a corpus URL, or None when the string is not one (fail closed)."""
+    """解析资料库 URL；格式不符时返回 None，不能放宽接受范围。"""
     parts = urlsplit(url)
     if parts.scheme != _CORPUS_SCHEME or not parts.netloc:
         return None
@@ -187,9 +156,7 @@ def parse_corpus_url(url: str) -> CorpusLocation | None:
 
 
 def segment_label(segments: list, start: int, end: int) -> str:
-    """The human-readable location of `[start, end)`: the segment it starts in, and the one
-    it ends in when that differs ("row 14", "rows 14–22"). Empty when there are no segments.
-    """
+    """把 [start,end) 转成人可读位置；跨区段时显示起止范围，没有区段时返回空文本。"""
     first = last = ""
     for seg_start, label in segments:
         if seg_start <= start:
@@ -208,11 +175,11 @@ def segment_label(segments: list, start: int, end: int) -> str:
 
 
 class FolderNotFound(LookupError):
-    """A folder id that is not in this corpus."""
+    """请求的文件夹 ID 不属于本资料库。"""
 
 
 def _folder_name(name: str) -> str:
-    """A folder name as stored: trimmed, NFC, one path component, and not empty."""
+    """规范化文件夹名称：去首尾空白、NFC、仅单层路径且不能为空。"""
     import unicodedata
 
     cleaned = unicodedata.normalize("NFC", (name or "").strip())
@@ -229,7 +196,7 @@ def _folder_name(name: str) -> str:
     return cleaned
 
 
-# ── The store ────────────────────────────────────────────────────────────────────
+# ── SQLite 存储 ──
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS corpus_documents (
@@ -270,15 +237,11 @@ CREATE TABLE IF NOT EXISTS corpus_chunks (
 CREATE INDEX IF NOT EXISTS idx_corpus_chunks_doc ON corpus_chunks (document_id);
 """
 
-#: Who this corpus is, and how much has happened to it. One row.
+#: 单行保存资料库身份及变更版本。
 #:
-#: Identity used to be the *file path* — host-specific, and on the desktop one flat file for
-#: the whole app until 3.1 — which meant a bundle could cite a corpus document without being
-#: able to name the corpus it came from. Identity that lives in the data is the same on both
-#: hosts, and survives the desktop's 3.1 move of that file into a project of its own.
+#: 身份保存在数据中而非依赖文件路径，这样跨宿主或移动文件后仍能确认来源资料库。
 #:
-#: `version` is monotonic and bumped by anything that changes what retrieval can see. It is
-#: what a run records so "reproduce this research" can say which corpus state produced it.
+#: 任何影响检索内容的变更都递增 version，运行可据此记录其使用的资料库状态。
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS corpus_meta (
     corpus_id      TEXT PRIMARY KEY,
@@ -288,10 +251,8 @@ CREATE TABLE IF NOT EXISTS corpus_meta (
 );
 """
 
-#: Folders and which documents are in them (RFC V3.1 §7.1). Membership binds to `doc_key`,
-#: the logical document, so a new version keeps its folders; the same document may sit in
-#: several folders, which is one document and several memberships. A document with no
-#: membership is listed at the root — every document from before folders existed.
+#: 文件夹成员关系绑定逻辑文档 doc_key；新版本继承文件夹，同一文档可属于多个文件夹。
+#: 没有成员关系的文档显示在根目录。
 _FOLDER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS corpus_folders (
     id         TEXT PRIMARY KEY,
@@ -314,47 +275,36 @@ CREATE TABLE IF NOT EXISTS corpus_memberships (
 CREATE INDEX IF NOT EXISTS idx_corpus_membership_doc ON corpus_memberships (doc_key);
 """
 
-#: Corpus file schema this build writes. Bumped when `_migrate` gains a step.
+#: 当前写入的资料库文件结构版本；_migrate 增加步骤时同步递增。
 _SCHEMA_VERSION = 3
 
 
 class UnknownDocumentKey(LookupError):
-    """A caller asked to supersede a logical document this corpus does not hold.
+    """替换请求指向的逻辑文档不存在。
 
-    Its own type because the alternative is silence: falling back to "create a new logical
-    document" would answer 201 to a request that meant "replace", and the caller would
-    discover months later that a corrected paper never superseded anything.
-    """
+    必须明确报错，不能静默创建新文档，否则用户会误以为旧版本已被替代。"""
 
 
 @dataclass(frozen=True)
 class Ingested:
-    """What one ingestion attempt did. `skipped` is a success, not a failure."""
+    """一次导入的实际结果；skipped 表示已存在而跳过，属于成功。"""
 
     doc_id: str | None = None
     filename: str = ""
     chunks_written: int = 0
     skipped: bool = False
     reason: str | None = None
-    #: The logical document this version belongs to, and which revision it is. Returned so
-    #: a caller can supersede this document later — `doc_key` is opaque and unguessable by
-    #: design, so it has to come back out.
+    #: 返回逻辑文档 doc_key 与版本，供调用方以后明确替换；不要求调用方猜测不透明 ID。
     doc_key: str | None = None
     version: int | None = None
 
 
 class CorpusStore:
-    """SQLite vector store + retrieval connector (the `Corpus` port, implemented).
+    """Corpus 端口的 SQLite 向量存储实现。
 
-    SQLite access follows `local.SqliteCache`'s pattern: stdlib `sqlite3`, a fresh
-    short-lived connection per operation, blocking work on a worker thread. One file,
-    WAL mode, foreign keys ON so deleting a document deletes its chunks.
-
-    Vectors are stored as little-endian float32 blobs and compared by brute-force
-    cosine. Retrieval filters on `embedding_model` for the same reason project memory
-    does: vectors from different models are not comparable, and ranking them together
-    would return confident nonsense rather than an obvious error.
-    """
+    每次操作使用短连接，阻塞工作放在线程中；启用 WAL 和外键，使删除文档同时删除块。
+    向量按小端 float32 保存，以余弦相似度扫描。按 embedding_model 过滤，
+    因为不同模型的向量不可混排，否则会产生看似可信但无意义的结果。"""
 
     def __init__(self, path: str | Path, embedder: Embeddings) -> None:
         self.path = Path(path)
@@ -366,13 +316,10 @@ class CorpusStore:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Bring an existing corpus file up to the current schema.
+        """把现有资料库文件迁移到当前结构。
 
-        `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already has the table,
-        so a new column never reaches corpora created before it existed. Each corpus is a
-        standalone SQLite file owned by one project, with no Alembic equivalent — this is
-        the migration seam for them. Additive and idempotent: check, then add.
-        """
+        CREATE TABLE IF NOT EXISTS 不会给旧表加列；每项目独立 SQLite 文件没有 Alembic，
+        因此在这里按需检查并增加字段，保持增量、幂等。"""
         have = {row[1] for row in conn.execute("PRAGMA table_info(corpus_documents)")}
         if "blob" not in have:
             conn.execute("ALTER TABLE corpus_documents ADD COLUMN blob BLOB")
@@ -381,11 +328,9 @@ class CorpusStore:
                 "ALTER TABLE corpus_documents ADD COLUMN origin TEXT NOT NULL DEFAULT 'uploaded'"
             )
 
-        # ── Schema 2: logical documents and versions ──────────────────────────────
+        # ── 结构版本 2：逻辑文档与版本 ──
         #
-        # Order matters and is the whole migration: identity, then columns, then backfill,
-        # then the uniqueness that backfill makes satisfiable. Creating the index first
-        # would fail on any corpus that already holds rows.
+        # 依次建身份表、加列、回填、建唯一索引；旧数据回填前不能先加唯一约束。
         conn.executescript(_META_SCHEMA)
         if not conn.execute("SELECT 1 FROM corpus_meta").fetchone():
             conn.execute(
@@ -398,15 +343,10 @@ class CorpusStore:
             conn.execute("ALTER TABLE corpus_documents ADD COLUMN version INTEGER")
             conn.execute("ALTER TABLE corpus_documents ADD COLUMN superseded_at TEXT")
 
-        # Backfill: every pre-A4 row becomes its own logical document at version 1.
+        # 旧行各自成为独立逻辑文档的第 1 版。
         #
-        # Deliberately NOT grouped by filename. Two rows sharing a name may be revisions of
-        # one paper or two unrelated papers, and nothing stored can tell them apart —
-        # guessing would be exactly the identity inference this model exists to refuse. So
-        # history is preserved as it actually is, no supersession is invented, and
-        # retrieval returns precisely what it returned before. A user who knows two rows
-        # are related expresses that by superseding one, which is intent rather than
-        # inference.
+        # 不能按同名文件推断版本关系：同名可能是不同论文。
+        # 保留原历史，不编造替代关系；只有用户明确 supersede 才建立版本联系。
         for (row_id,) in conn.execute(
             "SELECT id FROM corpus_documents WHERE doc_key IS NULL ORDER BY ingested_at, id"
         ).fetchall():
@@ -419,16 +359,13 @@ class CorpusStore:
             "ON corpus_documents (doc_key, version)"
         )
 
-        # ── Schema 3 (RFC V3.1 §7.1): where each sheet/row/slide/cell starts, and whether
-        # the text is the document's own or a rendering of its structure. Nullable and
-        # read as "no segments" / "verbatim", so legacy rows need no backfill and a 3.0.x
-        # binary opening this file simply ignores both columns.
+        # ── 结构版本 3：记录工作表、行、幻灯片、单元格等区段及文本模式。
+        # 新列可空，旧数据按无区段、原文模式读取；旧版本程序可以忽略。
         if "segments" not in have:
             conn.execute("ALTER TABLE corpus_documents ADD COLUMN segments TEXT")
         if "extraction_mode" not in have:
             conn.execute("ALTER TABLE corpus_documents ADD COLUMN extraction_mode TEXT")
-        # New tables only, so a 3.0.x binary opening this file never reads them, and the
-        # two unique indexes it re-creates on every open are untouched (RFC §7.1).
+        # 仅增加新表，不动旧程序每次打开时重建的两个唯一索引，见 RFC §7.1。
         conn.executescript(_FOLDER_SCHEMA)
 
     @property
@@ -438,11 +375,11 @@ class CorpusStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
-        # OFF by default in SQLite; the cascade on corpus_chunks needs this ON.
+        # SQLite 默认关闭外键，必须开启才能级联删除 corpus_chunks。
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
-    # -- ingestion ---------------------------------------------------------------
+    # ── 文档导入 ──
 
     async def ingest(
         self,
@@ -452,26 +389,14 @@ class CorpusStore:
         origin: str = "uploaded",
         doc_key: str | None = None,
     ) -> Ingested:
-        """Extract, chunk, embed, and store one document version. Idempotent per content.
+        """提取、切块、嵌入并保存文档版本，对相同内容保持幂等。
 
-        `doc_key` is the only way one upload becomes a revision of another. Omitted — which
-        is every caller that predates this — the upload is a **new logical document**, so
-        two unrelated papers that happen to share a filename stay two documents. Supplied,
-        the upload becomes the next version of that document and supersedes its
-        predecessor. Nothing is inferred from the filename, the content, or anything in it:
-        `filename` is version-level display metadata and may legitimately change between
-        revisions of the same document.
-
-        Phase split matters: extraction and the dedupe check run on a worker thread
-        (a 25 MB PDF parse must not block the loop), embedding runs on the CALLER'S
-        loop (an async httpx client cannot live inside a `to_thread`), and the write
-        goes back to a thread.
-
-        `origin` distinguishes a human upload from this project's own auto-saved report
-        (`app/services/report_corpus.py`) — see the column comment in `_SCHEMA`.
-        """
+        只有明确传入 doc_key 才表示替换已有逻辑文档；省略时创建新文档。
+        文件名只是版本展示信息，不能据此推断同一文档。
+        提取和去重在线程中运行，避免大 PDF 阻塞事件循环；异步嵌入留在调用方循环；写入再回线程。
+        origin 区分人工上传和自动保存的生成报告。"""
         prepared = await asyncio.to_thread(self._prepare_sync, filename, data, doc_key)
-        if isinstance(prepared, Ingested):  # skipped (duplicate) — nothing to embed
+        if isinstance(prepared, Ingested):  # 重复内容已跳过，无需再生成嵌入。
             return prepared
         doc_id, text, page_starts, kind, digest, chunks, extraction = prepared
 
@@ -520,15 +445,12 @@ class CorpusStore:
 
         with self._connect() as conn:
             if doc_key is not None:
-                # Refuse before spending anything on embeddings. An unknown key means the
-                # caller believes it is replacing something that is not here.
+                # 先确认被替换文档存在，再花费嵌入成本；未知 doc_key 不能当作新文档。
                 if not conn.execute(
                     "SELECT 1 FROM corpus_documents WHERE doc_key = ?", (doc_key,)
                 ).fetchone():
                     raise UnknownDocumentKey(doc_key)
-                # Content identity is the sha, and it is scoped to this document: the same
-                # bytes already standing as its current version are not a new revision,
-                # whatever the file is called this time.
+                # 内容身份由文档范围内的 SHA 决定；当前版本字节相同就不是新版本，与此次文件名无关。
                 existing = conn.execute(
                     "SELECT id FROM corpus_documents "
                     "WHERE doc_key = ? AND sha256 = ? AND superseded_at IS NULL",
@@ -540,8 +462,7 @@ class CorpusStore:
                     (filename, digest),
                 ).fetchone()
         if existing:
-            # Same bytes: re-ingesting would double the corpus and the embedding spend for
-            # zero new information, and would mint a version number recording no change.
+            # 相同字节不重复导入，避免增加无信息的版本、块和嵌入费用。
             return Ingested(
                 doc_id=existing[0],
                 filename=filename,
@@ -570,26 +491,19 @@ class CorpusStore:
         segments: list | None = None,
         extraction_mode: str | None = None,
     ) -> tuple[str, int]:
-        # One transaction for the whole state change: the version number, the predecessor's
-        # supersession, the chunks, and the corpus counter. Anything less and a reader could
-        # observe two current versions of one document, or a counter that disagrees with
-        # what retrieval can see.
+        # 版本分配、旧版替代、块写入和资料库计数在同一事务完成，
+        # 避免读取者看到两个当前版本或与检索内容不符的计数。
         with self._connect() as conn:
             now = datetime.now(UTC).isoformat()
             key = doc_key or str(uuid.uuid4())
             if doc_key is not None:
-                # At most one current version per document, and it stops being current at
-                # the moment its successor exists — not before, and not in another
-                # transaction.
+                # 每文档至多一个当前版本；新版本存在时才在同一事务将旧版标为已替代。
                 conn.execute(
                     "UPDATE corpus_documents SET superseded_at = ? "
                     "WHERE doc_key = ? AND superseded_at IS NULL",
                     (now, doc_key),
                 )
-            # Allocated in the INSERT rather than read and then written, so two concurrent
-            # ingests cannot both see the same MAX and mint the same number. The unique
-            # index on (doc_key, version) is the backstop that turns a lost race into a
-            # loud failure instead of a duplicate.
+            # 在 INSERT 内分配版本号，避免并发先读 MAX 再写得到相同编号；唯一索引作为最终保护。
             conn.execute(
                 "INSERT INTO corpus_documents "
                 "(id, filename, kind, sha256, text, page_starts, chunk_count, ingested_at, "
@@ -632,16 +546,14 @@ class CorpusStore:
                 ],
             )
             conn.execute("UPDATE corpus_meta SET version = version + 1")
-            # Read back rather than recomputed: the number that landed is the one the
-            # INSERT allocated, and a second guess at it would be a second source of
-            # truth for the identity a caller later uses to supersede this document.
+            # 读取实际写入的版本号，不再自行计算，保持身份只有一个事实来源。
             version = conn.execute(
                 "SELECT version FROM corpus_documents WHERE id = ?", (doc_id,)
             ).fetchone()[0]
         return (key, int(version))
 
     async def _embed_chunks(self, texts: list[str]) -> list[list[float]]:
-        """Batched embedding; a width mismatch or count mismatch fails the ingestion."""
+        """分批生成嵌入；向量宽度或数量不符时让导入失败。"""
         vectors: list[list[float]] = []
         for start in range(0, len(texts), _EMBED_BATCH):
             batch = await self._embedder.embed(texts[start : start + _EMBED_BATCH])
@@ -653,7 +565,7 @@ class CorpusStore:
             vectors.extend(batch)
         return vectors
 
-    # -- retrieval (the Corpus port) ────────────────────────────────────────────
+    # ── 检索：Corpus 端口实现 ──
 
     async def search(
         self,
@@ -663,25 +575,32 @@ class CorpusStore:
         document_ids: frozenset[str] | None = None,
         per_document: int = 1,
     ) -> list[dict]:
-        # The query embedding is the ONLY model call retrieval makes — the store itself
-        # never opens a socket. That made corpus mode's zero-egress claim rest entirely on
-        # the host having configured a *local* embedder, and nothing checked: with
-        # EMBEDDINGS_PROVIDER=google|openai the server embedded every corpus query through
-        # a hosted API while internal/12 M10 advertised a run with no egress at all, "verified by
-        # test". The test could not catch it either — it injects a FakeEmbeddings, so the
-        # one call that egresses was the one call stubbed out. Enforce, don't trust.
-        self._require_local_embedder_in_corpus_mode()
-        query_vector = (await self._embedder.embed([query]))[0]
-        return await asyncio.to_thread(
-            self._search_sync, query_vector, max_results, document_ids, per_document
-        )
+        # 查询嵌入是检索唯一的模型调用。仅资料库模式承诺本地处理时，
+        # 必须检查嵌入器是否本地，不能依赖宿主配置或被 FakeEmbeddings 替换的测试来证明没有外发。
+        from research_engine.eval_trace import trace_span
+
+        with trace_span(
+            "corpus.search",
+            kind="retrieval",
+            inputs={
+                "query": query,
+                "max_results": max_results,
+                "document_ids": sorted(document_ids) if document_ids else None,
+                "per_document": per_document,
+            },
+        ) as span:
+            self._require_local_embedder_in_corpus_mode()
+            query_vector = (await self._embedder.embed([query]))[0]
+            result = await asyncio.to_thread(
+                self._search_sync, query_vector, max_results, document_ids, per_document
+            )
+            span.observe(output=result)
+            return result
 
     def _require_local_embedder_in_corpus_mode(self) -> None:
-        """Refuse to embed off-machine while promising local retrieval (internal/12 M10).
+        """在承诺本地检索的仅资料库模式中拒绝远程嵌入，见 internal/12 M10。
 
-        Only corpus-only mode promises local retrieval, so this is silent otherwise:
-        a hosted embedder is perfectly correct for ordinary project memory.
-        """
+        普通项目记忆允许使用托管嵌入，不受此限制。"""
         if not get_run_config().corpus_mode:
             return
         if getattr(self._embedder, "is_local", False):
@@ -712,32 +631,16 @@ class CorpusStore:
                 'SELECT c.id, c.document_id, c.start, c."end", c.page, c.text, c.embedding, '
                 "d.filename "
                 "FROM corpus_chunks c JOIN corpus_documents d ON d.id = c.document_id "
-                # Unconditional, not a caller-chosen filter: a generated report resolving as
-                # a clean citation for the next report is exactly the false-measurement bug
-                # this store exists to refuse (see the `origin` column comment above).
-                # `superseded_at IS NULL` is a visibility filter, not a ranking one:
-                # scoring, ordering and the relevance cutoff below are untouched. A
-                # superseded version stays readable through `read()` so citations made
-                # against it keep resolving; it simply stops being offered as new evidence,
-                # or a corrected document would be cited alongside the version it corrects.
+                # 始终排除自动生成报告，避免下一轮把本项目的输出当作独立证据。
+                # 已替代版本不参与新检索，但保留 read 能力，使历史引用继续可定位；排序和相关性阈值不变。
                 "WHERE c.embedding_model = ? AND d.origin != 'generated' "
                 "AND d.superseded_at IS NULL",
                 (self._embedder.model_id,),
             ).fetchall()
 
         if not rows:
-            # Distinguish "empty corpus", "wrong model", and "nothing but auto-saved
-            # reports" — all three fail the run, but the remedy differs (ingest documents,
-            # re-index after a model change, or upload a real source). Each diagnostic
-            # query below repeats the same `origin != 'generated'` exclusion as the main
-            # query above, or a corpus holding only generated reports would misreport
-            # itself as "wrong embedding model" instead of the true reason.
-            # Supersession first, or the checks below misread it. Each diagnostic query
-            # repeats the main query's filters except the one it is testing — so without
-            # this branch a corpus whose documents have all been superseded matches the
-            # embedding-model check against itself and reports "indexed with a different
-            # embedding model (X); current model is 'X'", which is both untrue and
-            # unactionable. Fail closed and say what actually happened.
+            # 分别诊断空库、嵌入模型不匹配、仅含生成报告或仅含已替代文档。
+            # 诊断查询沿用主查询的其他过滤条件，仅放开正在检查的条件，避免给出自相矛盾的原因。
             with self._connect() as conn:
                 superseded = conn.execute(
                     "SELECT COUNT(*) FROM corpus_chunks c "
@@ -780,21 +683,11 @@ class CorpusStore:
         return self._rank(query_vector, max_results, rows, np)
 
     def _selected_rows(self, document_ids: frozenset[str]) -> list[tuple]:
-        """The chunks of exactly these document versions, or a named failure.
+        """读取指定文档版本的块，或返回明确失败原因。
 
-        A selection names document *versions*, frozen when the run was created, so the
-        `superseded_at IS NULL` filter of a whole-corpus search does not apply: a selected
-        version superseded mid-run is still the version the run was allowed to read
-        (internal/rfcs/V3.1-corpus-scope.md §8.7). Generated reports stay excluded even if
-        a selection names one — they are never evidence.
-
-        The ids travel as one JSON parameter through `json_each`, never as an
-        `IN (?, ?, …)` list, so a large selection cannot hit SQLite's parameter limit.
-
-        The diagnostics are the selection's own. Falling through to the whole-corpus ones
-        would describe documents the run was never allowed to see — "the corpus is empty"
-        for a selection whose files exist but were indexed with another model.
-        """
+        选择在运行开始时冻结版本，不能因为途中出现新版而排除旧选中版；生成报告始终不可作证据。
+        ID 通过 json_each 单参数传递，避免大选择触发 SQLite 参数数量上限。
+        诊断也只基于该选择，不拿用户无权读取的全库状态解释失败。"""
         ids = json.dumps(sorted(document_ids))
         with self._connect() as conn:
             rows = conn.execute(
@@ -843,8 +736,7 @@ class CorpusStore:
                 f"{len(query_vector)} dimensions — the embedding model changed."
             )
 
-        # Cosine similarity. Distance 1.0 is the memory-service cutoff's mirror:
-        # orthogonal-or-worse matches are noise, not evidence.
+        # 按余弦相似度比较；正交或更差的结果没有证据价值，距离阈值与记忆服务对应。
         q = np.asarray(query_vector, dtype=np.float32)
         q_norm = q / (np.linalg.norm(q) or 1.0)
         norms = np.linalg.norm(matrix, axis=1)
@@ -859,10 +751,8 @@ class CorpusStore:
                 break
             row = rows[int(idx)]
             doc_id = row[1]
-            # One hit per document per search by default: two chunks from the same file are
-            # not two independent sources, and the synthesizer counts URLs as sources. A small
-            # selection raises the cap (`ScopedCorpus`), or a one-file selection could never
-            # surface more than one passage of the only file it has (RFC V3.1 §9.8).
+            # 默认每文件每次搜索只取一块，避免把同文件多块当成独立来源；
+            # 小范围选择可提高上限，否则单文件选择永远只能读到一段，见 RFC V3.1 §9.8。
             if hits_per_doc.get(doc_id, 0) >= per_document:
                 continue
             hits_per_doc[doc_id] = hits_per_doc.get(doc_id, 0) + 1
@@ -878,7 +768,7 @@ class CorpusStore:
         return results
 
     async def search_generated_reports(self, query: str, max_results: int) -> list[dict]:
-        """Search auto-saved generated reports in this project's corpus for chat grounding."""
+        """检索项目自动保存的生成报告，仅用于聊天依据。"""
         query_vector = (await self._embedder.embed([query]))[0]
         return await asyncio.to_thread(self._search_generated_sync, query_vector, max_results)
 
@@ -943,11 +833,10 @@ class CorpusStore:
 
         filename, text, segments, kind = row
         if location.start >= len(text) or location.end > len(text):
-            # The span no longer fits its document — refuse rather than returning a
-            # shifted window that would look right but cite the wrong place.
+            # 引用区间已不适合该文档时拒绝读取，不能移位返回看似合理却引用错位置的文本。
             return {"url": url, "title": filename, "text": "", "error": "location out of range"}
 
-        # Expand to surrounding context on whole-word boundaries.
+        # 沿完整词边界扩展上下文。
         lo = max(location.start - _READ_CONTEXT_CHARS, 0)
         hi = min(location.end + _READ_CONTEXT_CHARS, len(text))
         while lo > 0 and not text[lo - 1].isspace():
@@ -962,8 +851,7 @@ class CorpusStore:
             json.loads(segments) if segments else [], location.start, location.end
         )
         if not label and kind == "code":
-            # Source files carry no stored segments: their location is the line, which the
-            # text itself says. Counted here rather than stored per line.
+            # 源码文件的行号由文本现场计算，无需逐行存储区段。
             first = text.count("\n", 0, location.start) + 1
             last = text.count("\n", 0, max(location.start, location.end - 1)) + 1
             label = f"line {first}" if first == last else f"lines {first}–{last}"
@@ -981,15 +869,12 @@ class CorpusStore:
             "error": None,
         }
 
-    # -- management ----------------------------------------------------------------
+    # ── 资料库管理 ──
 
     async def identity(self) -> tuple[str, int]:
-        """`(corpus_id, corpus_version)` — which corpus this is, and its state right now.
+        """返回 corpus_id 和 corpus_version，表示资料库身份及当前状态。
 
-        The one source for both hosts. A run records the pair at the moment it opens the
-        corpus, which is what lets a finished run say which corpus state produced its
-        evidence rather than merely which documents it happened to cite.
-        """
+        两个宿主共用此来源；运行打开资料库时记录该组合，以便追溯证据来自哪个资料库状态。"""
         return await asyncio.to_thread(self._identity_sync)
 
     def _identity_sync(self) -> tuple[str, int]:
@@ -1001,13 +886,10 @@ class CorpusStore:
         return await asyncio.to_thread(self._documents_sync)
 
     async def current_versions(self, doc_keys: list[str] | None = None) -> list[dict]:
-        """The current, non-generated version of each named logical document.
+        """返回指定逻辑文档的当前非生成版本。
 
-        `None` names every one — the whole corpus, as a corpus-only run without an explicit
-        selection reads it. A key that has no current uploaded version is simply absent
-        from the result; the caller decides whether that is an error. Shape is the
-        selection record's (internal/rfcs/V3.1-corpus-scope.md §8.2).
-        """
+        None 表示全库；没有当前上传版本的键不出现在结果中，由调用方决定是否报错。
+        结构与冻结选择记录一致，见 RFC V3.1 §8.2。"""
         return await asyncio.to_thread(self._current_versions_sync, doc_keys)
 
     def _current_versions_sync(self, doc_keys: list[str] | None) -> list[dict]:
@@ -1038,10 +920,8 @@ class CorpusStore:
             rows = conn.execute(
                 "SELECT id, filename, kind, chunk_count, ingested_at, "
                 "       doc_key, version, superseded_at, "
-                # length() on a BLOB reads its size without loading the bytes, so listing
-                # a corpus of 25 MB PDFs stays cheap. `downloadable` is derived rather
-                # than assumed: documents ingested before the blob column existed have
-                # NULL here, and the UI must offer Open only where a file really exists.
+                # BLOB 的 length() 只读大小，不加载大文件。downloadable 由实际原件是否存在派生，
+                # 旧版未保存原件的行不能显示可打开。
                 "       length(blob), origin FROM corpus_documents "
                 "ORDER BY ingested_at"
             ).fetchall()
@@ -1054,9 +934,7 @@ class CorpusStore:
                 "ingested_at": row[4],
                 "doc_key": row[5],
                 "version": row[6],
-                # Derived rather than stored: "is this the one retrieval can see" is a
-                # question about `superseded_at`, and a second column recording the same
-                # fact is a second thing that can disagree with it.
+                # 是否当前可检索直接由 superseded_at 推导，不再存一个可能不一致的冗余状态。
                 "is_current": row[7] is None,
                 "size_bytes": row[8],
                 "downloadable": row[8] is not None,
@@ -1066,12 +944,9 @@ class CorpusStore:
         ]
 
     async def blob(self, doc_id: str) -> tuple[bytes, str, str] | None:
-        """The original upload as `(bytes, filename, kind)`, or None.
+        """返回原上传文件的字节、名称和类型；不存在或旧数据未保留原件时返回 None。
 
-        None covers both "no such document" and "stored before originals were kept" —
-        the caller cannot serve a file in either case, and distinguishing them would only
-        leak whether an id exists.
-        """
+        不区分这两种缺失，避免泄露某个 ID 是否存在。"""
         return await asyncio.to_thread(self._blob_sync, doc_id)
 
     def _blob_sync(self, doc_id: str) -> tuple[bytes, str, str] | None:
@@ -1087,16 +962,10 @@ class CorpusStore:
         return await asyncio.to_thread(self._delete_sync, doc_id)
 
     def _delete_sync(self, doc_id: str) -> bool:
-        """Remove one *version*. Deliberately not a logical-document operation.
+        """仅删除一个版本，不代表删除整个逻辑文档。
 
-        Three things this does not do, each of which would be a defensible-looking mistake.
-        It does not renumber later versions — a version number is a historical identifier
-        and a citation may name it. It does not resurrect the predecessor when the current
-        version is deleted: the document is then left with no current version, which is the
-        honest state, where un-superseding one would silently republish content the user
-        removed. And it does not cascade to siblings — deleting one revision is not
-        deleting the document.
-        """
+        不重编号后续版本，不自动恢复前版，也不级联删除其他版本。
+        版本号可能被历史引用使用；自动恢复旧版会重新发布用户已经移除的内容。"""
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM corpus_documents WHERE id = ?", (doc_id,))
             if cursor.rowcount:
@@ -1104,7 +973,7 @@ class CorpusStore:
         return cursor.rowcount > 0
 
     async def extracted(self, doc_id: str) -> dict | None:
-        """One version's canonical text, segments and mode — what its citations quote."""
+        """返回版本的标准文本、区段和模式，即引用实际核对的内容。"""
         return await asyncio.to_thread(self._extracted_sync, doc_id)
 
     def _extracted_sync(self, doc_id: str) -> dict | None:
@@ -1124,7 +993,7 @@ class CorpusStore:
             "extraction_mode": row[4] or "verbatim",
         }
 
-    # -- folders (RFC V3.1 §7.1) ------------------------------------------------------
+    # ── 文件夹，见 RFC V3.1 §7.1 ──
 
     async def folders(self) -> list[dict]:
         return await asyncio.to_thread(self._folders_sync)
@@ -1174,7 +1043,7 @@ class CorpusStore:
         return folder_id
 
     async def ensure_folder_path(self, components: list[str]) -> str | None:
-        """The folder at `components` (creating any that are missing), or None for the root."""
+        """返回 components 指定的文件夹，缺失则逐级创建；根目录返回 None。"""
         parent: str | None = None
         for component in components:
             parent = await self.create_folder(component, parent)
@@ -1221,7 +1090,7 @@ class CorpusStore:
 
     @staticmethod
     def _descendants(conn, folder_ids: list[str]) -> set[str]:
-        """The folders and every folder beneath them."""
+        """返回指定文件夹及全部后代文件夹。"""
         if not folder_ids:
             return set()
         rows = conn.execute(
@@ -1237,14 +1106,10 @@ class CorpusStore:
         return await asyncio.to_thread(self._delete_folder_sync, folder_id)
 
     def _delete_folder_sync(self, folder_id: str) -> dict:
-        """Remove a folder, its subfolders and their memberships, in one transaction.
+        """在同一事务中移除文件夹、子文件夹及成员关系。
 
-        A document that was in one of them and is now in no folder at all is deleted with
-        every version — it was only ever filed there. A document still in another folder
-        stays, and a document that was never in any folder is never touched. Runs that cited
-        a deleted document keep their persisted evidence; reopening it answers
-        `document_unavailable` (RFC §7.1).
-        """
+        仅属于这些文件夹、移除后不再归属任何文件夹的文档连同所有版本删除。
+        仍属其他文件夹或原本在根目录的文档不受影响；历史运行保留已存证据，再打开已删文档时报不可用。"""
         with self._connect() as conn:
             if not conn.execute(
                 "SELECT 1 FROM corpus_folders WHERE id = ?", (folder_id,)
@@ -1308,7 +1173,7 @@ class CorpusStore:
         return row[0] if row else None
 
     async def sha256_of(self, doc_id: str) -> str | None:
-        """The stored hash of one version, or `None` if this store has no such version."""
+        """返回指定版本存储的哈希；不存在时返回 None。"""
         return await asyncio.to_thread(self._sha256_of_sync, doc_id)
 
     def _sha256_of_sync(self, doc_id: str) -> str | None:
@@ -1319,7 +1184,7 @@ class CorpusStore:
         return row[0] if row else None
 
     async def folder_doc_keys(self, folder_ids: list[str]) -> set[str] | None:
-        """Every logical document in these folders or beneath them; None if one is unknown."""
+        """返回这些文件夹及后代包含的逻辑文档；任一文件夹未知时返回 None。"""
         return await asyncio.to_thread(self._folder_doc_keys_sync, folder_ids)
 
     def _folder_doc_keys_sync(self, folder_ids: list[str]) -> set[str] | None:

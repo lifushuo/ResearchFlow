@@ -1,10 +1,6 @@
-"""
-Projects — the container a user's research lives in (docs/14 §3).
+"""项目是用户研究的容器（docs/14 §3）。
 
-A project owns sessions today and will own chat threads and memory in M17. Deleting
-one deletes the research inside it, which is why the API treats it as a destructive
-action rather than a tidy-up.
-"""
+删除会同时删除所属研究，因此属于破坏性操作，不能当成简单整理列表。"""
 
 import uuid
 from datetime import datetime
@@ -18,9 +14,7 @@ from app.models.types import UuidType
 
 class Project(Base):
     __tablename__ = "projects"
-    # Names are unique per user. "Thesis" and "thesis" as two separate projects would be
-    # a UI trap rather than a feature, so the migration enforces this case-insensitively
-    # with a functional index; this constraint documents the intent on the model.
+    # 同一用户的项目名不区分大小写。迁移用函数索引强制保证，避免界面出现仅大小写不同的重复项目。
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_projects_user_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
@@ -32,7 +26,7 @@ class Project(Base):
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Same reversible-vs-destructive split as sessions: archive hides, delete removes.
+    # 归档只隐藏、可恢复；删除真正移除数据。
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -46,9 +40,7 @@ class Project(Base):
         passive_deletes=True,
         lazy="select",
     )
-    # Memory follows the project it belongs to. The database enforces this too (0007's
-    # ON DELETE CASCADE); "no orphan vectors after a delete" is a DoD item, so it is
-    # guaranteed in both layers rather than trusted to either.
+    # 项目记忆随项目一起删除，ORM 和数据库级联双重保证，不留下孤立向量。
     memory_chunks: Mapped[list[MemoryChunk]] = relationship(  # noqa: F821
         "MemoryChunk",
         back_populates="project",

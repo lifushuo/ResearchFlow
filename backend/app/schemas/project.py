@@ -1,4 +1,4 @@
-"""API contracts for projects (docs/14 §8)."""
+"""项目 API 数据契约（docs/14 §8）。"""
 
 from datetime import datetime
 from uuid import UUID
@@ -15,8 +15,7 @@ class ProjectCreateRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def _not_blank(cls, v: str) -> str:
-        # str_strip_whitespace runs first, so a whitespace-only name arrives empty and
-        # would otherwise slip past min_length on the raw input.
+        # 先去掉首尾空白，再校验最小长度，避免纯空格名称漏过检查。
         if not v.strip():
             raise ValueError("Project name cannot be blank.")
         return v
@@ -36,8 +35,7 @@ class ProjectResponse(BaseModel):
     description: str | None = None
     archived_at: datetime | None = None
     created_at: datetime
-    # Denormalized for the switcher and the projects list — the alternative is the
-    # client issuing one count query per project.
+    # 列表中附带项目统计，避免客户端为每个项目额外请求一次计数。
     session_count: int = 0
 
     model_config = {"from_attributes": True}

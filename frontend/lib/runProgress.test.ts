@@ -3,13 +3,7 @@ import { describe, expect, it } from "vitest";
 import { deriveStages } from "./runProgress";
 import type { AgentEvent } from "./types";
 
-/**
- * The progress checklist is the one place a research UI is most tempted to lie: a bar that
- * creeps forward reads as knowledge the backend never supplied. These tests are about the
- * two things that keeps honest — that a stage is only "done" when something observed it,
- * and that the single number on the list comes from counted events rather than from a
- * guess at how long a run takes.
- */
+/** 研究界面的进度必须来自后端事实，不能用缓慢推进的进度条虚构完成度。本测试要求阶段只有被观察到完成后才标为完成，且唯一的数量来自事件计数，而非预计研究时长。 */
 
 const ev = (agent: AgentEvent["agent"], message?: string, detail?: Record<string, unknown>) =>
   ({ type: "agent_log", agent, message, detail }) as AgentEvent;
@@ -60,8 +54,8 @@ describe("deriveStages", () => {
   });
 
   it("trusts the gate status over the event backlog", () => {
-    // A reconnect replays every prior event, so the furthest-along agent in the backlog can
-    // be well past the point the run is actually parked at. The status is authoritative.
+    // 重连会回放全部历史事件，积压事件中最靠后的智能体可能
+    // 已经超出研究实际暂停的位置，因此以当前状态为准。
     const stages = deriveStages({
       ...base,
       status: "AWAITING_PLAN",
@@ -88,7 +82,7 @@ describe("deriveStages", () => {
       events: [ev("planner"), ev("executor")],
     });
     expect(state(stages, "planner")).toBe("done");
-    // The executor was the furthest-along agent when it died: it did not finish.
+    // 执行器是失败前最后运行的智能体，但并未完成。
     expect(state(stages, "executor")).toBe("stopped");
     expect(state(stages, "synthesizer")).toBe("stopped");
     expect(state(stages, "review")).toBe("stopped");
@@ -111,7 +105,7 @@ describe("deriveStages", () => {
       ],
     });
     expect(withTotal.find((s) => s.id === "executor")?.detail).toBe(
-      "1 of 3 research tasks gathered",
+      "已收集 1 / 3 项研究任务的证据",
     );
   });
 
@@ -125,7 +119,7 @@ describe("deriveStages", () => {
         ev("executor", "Gathered b", { task_id: "2" }),
       ],
     });
-    expect(stages.find((s) => s.id === "executor")?.detail).toBe("1 of 1 research tasks gathered");
+    expect(stages.find((s) => s.id === "executor")?.detail).toBe("已收集 1 / 1 项研究任务的证据");
   });
 
   it("treats a decided plan gate as passed even after the run moves on", () => {

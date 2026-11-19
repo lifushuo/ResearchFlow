@@ -9,19 +9,15 @@ from app.models.types import JsonType, UuidType
 
 
 class ChatMessage(Base):
-    """One turn of chat, belonging to either a report or a project thread — never both.
+    """聊天消息只能归属于报告会话或项目线程之一。
 
-    Per-report chat (`session_id`) predates projects and still works unchanged; project
-    threads (`thread_id`) arrived with memory in M17. A CHECK constraint in migration
-    0008 enforces exactly one parent, because "both nullable" would silently allow a
-    message that appears in no history at all.
-    """
+    0008 迁移的 CHECK 要求恰好一个父对象，避免两者皆空时出现不在任何历史列表中的消息。"""
 
     __tablename__ = "chat_messages"
     __table_args__ = (
         CheckConstraint(
             "(session_id IS NOT NULL) <> (thread_id IS NOT NULL)",
-            name="one_parent",  # rendered as ck_chat_messages_one_parent by the convention
+            name="one_parent",  # 命名约定会将此约束生成为 ck_chat_messages_one_parent。
         ),
     )
 
@@ -38,15 +34,16 @@ class ChatMessage(Base):
         nullable=True,
         index=True,
     )
-    role: Mapped[str] = mapped_column(String(50), nullable=False)  # 'user' or 'assistant'
+    role: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # 角色为 user（用户）或 assistant（助手）。
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    # For thread messages: the reports this answer cited, as [{marker, session_id, title,
-    # created_at}]. Resolved at write time so the citation chips still work after the
-    # retrieval that produced them is long gone (docs/14 §5).
+    # 项目线程消息保存回答实际引用的报告信息，写入时解析完成。
+    # 即使原始检索早已结束，引用标记仍能定位报告（docs/14 §5）。
     citations: Mapped[list | None] = mapped_column(JsonType, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    # Relationships
+    # ORM 关系
     session: Mapped[Session | None] = relationship("Session", back_populates="chat_messages")  # noqa: F821
     thread: Mapped[ChatThread | None] = relationship("ChatThread", back_populates="messages")  # noqa: F821
 

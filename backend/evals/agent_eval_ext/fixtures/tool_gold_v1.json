@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "dataset_id": "researchflow-tool-interview-fixtures",
+  "dataset_version": 1,
+  "cases": [
+    {
+      "case_id": "search-read",
+      "match_mode": "strict",
+      "allowed_tools": [
+        "web_search",
+        "read_webpage",
+        "submit_evidence"
+      ],
+      "forbidden_tools": [
+        "shell_exec",
+        "delete_file"
+      ],
+      "expected_calls": [
+        {
+          "name": "web_search",
+          "args": {
+            "query": "AI agent memory"
+          }
+        },
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/article"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "parallel-page-reads",
+      "match_mode": "unordered",
+      "allowed_tools": [
+        "read_webpage"
+      ],
+      "forbidden_tools": [
+        "shell_exec"
+      ],
+      "expected_calls": [
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/a"
+          }
+        },
+        {
+          "name": "read_webpage",
+          "args": {
+            "url": "https://example.org/b"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "permitted-extra",
+      "match_mode": "subset",
+      "allowed_tools": [
+        "web_search",
+        "calculate"
+      ],
+      "forbidden_tools": [
+        "delete_file"
+      ],
+      "expected_calls": [
+        {
+          "name": "web_search",
+          "args": {
+            "query": "VRP"
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "no-tool-needed",
+      "match_mode": "strict",
+      "allowed_tools": [
+        "calculate"
+      ],
+      "forbidden_tools": [
+        "shell_exec"
+      ],
+      "expected_calls": []
+    }
+  ]
+}

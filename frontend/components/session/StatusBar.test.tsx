@@ -5,14 +5,7 @@ import type { SessionDetail } from "@/lib/types";
 
 import { StatusBar } from "./StatusBar";
 
-/**
- * The session status bar is not a description list, and must not use its parts.
- *
- * An audit listed it with the run page as having `dt`/`dd` outside a `dl`. It does not: its
- * own `Stat` is built from `div` and `span`, unlike the run workspace's `Stat` primitive,
- * which renders a `dt`/`dd` pair for callers that wrap it in a `dl`. This pins that, so a
- * later swap to the primitive cannot bring the invalid structure in unnoticed.
- */
+/** 会话状态栏不是描述列表，不能直接使用 dt/dd。其 Stat 由 div/span 构成；工作区的同名基础组件则要求调用方提供 dl。本测试固定这一差异，避免日后替换组件时悄悄引入无效结构。 */
 
 const session = {
   created_at: "2026-09-27T00:00:00Z",
@@ -23,7 +16,7 @@ const session = {
 describe("StatusBar", () => {
   it("shows its three figures", () => {
     render(<StatusBar session={session} events={[]} running={false} />);
-    for (const label of ["Elapsed", "Cost", "Tasks"]) {
+    for (const label of ["已用时间", "费用", "任务"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
   });

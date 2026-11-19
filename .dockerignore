@@ -45,6 +45,7 @@ venv
 docs/deep-dive/04_Interview_Defense.md
 
 # Runtime data — corpus databases are user content, never image content
+internal/recovery/
 data
 **/data/corpus
 *.sqlite

@@ -23,66 +23,33 @@ import { useStartV2Research } from "@/hooks/runs";
 import { ApiError } from "@/lib/api";
 import type { ResearchDepth } from "@/lib/types";
 
-/**
- * Asking the question.
- *
- * The page is the question. Everything else is a setting, and settings live behind a
- * disclosure that names its own state when closed — the pattern the earlier run form arrived at
- * after the same lesson: four decisions at equal visual weight meant asking a question
- * required first resolving three that almost never change.
- *
- * This form previously had *no* settings at all: a textarea and a button, posting the
- * API's defaults. That is not simpler, it is less capable — depth, corpus mode and the
- * design gate are all real fields on `POST /runs`, so the run form was the only surface
- * in the product that could not reach them.
- *
- * **Only fields the endpoint accepts appear here.** `POST /runs` takes `project_id`,
- * `question`, `depth`, `corpus_mode`, `skip_plan_gate` and `model_routing`. It does not
- * take `demo`, so that is not offered — a control that posts a field the server drops is
- * worse than a missing one.
- *
- * **The model is chosen here because the alternative was choosing it invisibly.** Routing
- * lived only in Settings, and a saved preference outranks the deployment's own
- * configuration, so a machine whose `.env` routed through a gateway still ran on whatever
- * was picked once in Settings — with nothing on this page saying so. The picker shows the
- * *resolved* route even when you change nothing, which is the only version of "use my
- * settings" a person can actually consent to.
- */
+/** 问题输入是本页核心，较少变化的选项放入折叠区，关闭时仍说明已选状态。表单只提交 POST /runs 接受的 project_id、question、depth、corpus_mode、skip_plan_gate 和 model_routing，不提供接口不接受的 demo。模型类型需在此明确显示，因为已保存偏好会覆盖部署配置；展示解析后的路由可避免用户不知情地沿用旧选择。 */
 
-/** The API accepts 1–2000. Ten is this form's own floor: a three-word question produces a
- *  plan nobody wants, and saying so before the run costs nothing. */
+/** API 接受 1–2000 字符；本表单将最小值设为 10，提前提示过短问题，避免生成无用计划。 */
 const MIN_QUERY = 10;
 const MAX_QUERY = 2000;
 
-/**
- * What each depth actually buys, in the terms that decide the wait.
- *
- * A run's wall-clock is the number of times each agent is asked something, multiplied by
- * how long the chosen model takes to answer — pages are fetched in parallel with a ten
- * second ceiling and barely register. So the honest thing to state is the number of turns,
- * not a vague promise of thoroughness: depth was a word in a prompt until `_DEPTH_LIMITS`,
- * and every setting cost the same eight turns per task.
- */
+/** 深度说明明确列出工具轮数，而非空泛承诺。网页抓取并发且限时十秒，主要等待来自模型响应；不同深度必须实际改变每任务的轮数，不能只改变提示词中的名称。 */
 const DEPTHS: { value: ResearchDepth; label: string; hint: string }[] = [
   {
     value: "fast",
-    label: "Fast",
-    hint: "Up to 3 turns and 3 pages per task. Quickest and cheapest.",
+    label: "快速",
+    hint: "每个任务最多 3 轮、3 页，耗时最短、成本最低。",
   },
   {
     value: "balanced",
-    label: "Balanced",
-    hint: "Up to 5 turns and 5 pages per task. Recommended for most questions.",
+    label: "均衡",
+    hint: "每个任务最多 5 轮、5 页，适合大多数问题。",
   },
   {
     value: "comprehensive",
-    label: "Comprehensive",
-    hint: "Up to 8 turns and 8 pages per task. Most thorough, and the longest wait.",
+    label: "全面",
+    hint: "每个任务最多 8 轮、8 页，研究最深入，等待也最长。",
   },
 ];
 
 const SAMPLE_QUERY =
-  "What are the leading approaches to long-term memory in LLM agents, and their trade-offs?";
+  "大模型智能体实现长期记忆的主要方法有哪些，各有什么取舍？";
 
 export function StartResearchForm({
   onStarted,
@@ -90,9 +57,9 @@ export function StartResearchForm({
   selection,
 }: {
   onStarted: (runId: string) => void;
-  /** Seeded from `?q=`, so "ask this again" from a failed run is one click and an edit. */
+  /** 从 ?q= 初始化，让失败研究中的再次提问只需点击后编辑。 */
   initialQuestion?: string;
-  /** Files chosen on the Corpus page (`?folders=`/`?files=`). Locks the run to them. */
+  /** 来自语料库页的文件选择（?folders=、?files=），研究范围锁定为这些文件。 */
   selection?: { folder_ids: string[]; doc_keys: string[] };
 }) {
   const { activeId, active, isLoading: projectsLoading } = useActiveProject();
@@ -100,23 +67,23 @@ export function StartResearchForm({
   const [depth, setDepth] = useState<ResearchDepth>("balanced");
   const hasSelection = !!selection && selection.folder_ids.length + selection.doc_keys.length > 0;
   const [corpusModeChoice, setCorpusMode] = useState(false);
-  // A selection is corpus-only research by definition, so the switch is on and locked.
+  // 选择文件就意味着只研究语料库，因此开关启用并锁定。
   const corpusMode = hasSelection || corpusModeChoice;
   const [offline, setOffline] = useState(false);
-  // On by default, and sent explicitly on every run.
+  // 默认启用计划审核，每次请求都显式发送。
   //
-  // `POST /runs` defaults `skip_plan_gate` to `true` so that a script posting an
-  // un-updated body keeps the journey it already had. The *run form* is the other of the
-  // three populations AGENTS.md describes, and its default is the opposite: the design
-  // gate is how the product spends nothing until a person has seen what will be searched,
-  // and docs/getting-started/20-quick-start.md documents it as a step of the first run.
-  // That is why this is always in the body rather than omitted when true — omitting it
-  // would silently inherit the script default and quietly drop the gate.
+  // POST /runs 默认 skip_plan_gate=true，以兼容
+  // 尚未更新请求体的旧脚本；研究表单则面向另一类使用场景，
+  // 默认必须经过计划审核，让用户先看见将搜索什么，
+  // 再决定是否开始花费。
+  // 首次研究的此步骤记录在 docs/getting-started/20-quick-start.md。
+  // 因此即使是默认选择，也必须显式放入请求体，
+  // 否则会继承脚本默认值，意外跳过审核关卡。
   const [planGate, setPlanGate] = useState(true);
-  // Open when files were chosen, so the reader sees what the run is limited to.
+  // 选择文件时默认展开，让用户看见研究的范围限制。
   const [showAdvanced, setShowAdvanced] = useState(hasSelection);
-  // `null` until the probes answer, so the default lands once rather than flipping under
-  // the cursor. `picked` is the user's own choice and always wins after that.
+  // 探测完成前为 null，避免默认按钮在用户光标下改变；
+  // 用户自己的 picked 选择一旦存在，始终优先。
   const [picked, setPicked] = useState<ProviderKind | null>(null);
 
   const start = useStartV2Research();
@@ -125,9 +92,9 @@ export function StartResearchForm({
   const customEndpoint = useCustomEndpointStatus();
   const localLLM = useLocalLLMStatus();
 
-  // Custom endpoint first, then local, then API — whichever is actually reachable. A
-  // *selection* default, resolved before the run starts and shown on the button; nothing
-  // switches provider mid-run.
+  // 依次选择实际可达的自定义端点、本地模型和 API；
+  // 这里只是在开始前解析并显示的默认选择，
+  // 不会在研究中途替换提供方。
   const kind = picked ?? defaultKind(catalog.data, customEndpoint.data, localLLM.data);
   const chosenRoute = kind
     ? routeForKind(kind, catalog.data, customEndpoint.data, localLLM.data)
@@ -139,14 +106,14 @@ export function StartResearchForm({
   const canSubmit =
     trimmed.length >= MIN_QUERY && trimmed.length <= MAX_QUERY && Boolean(activeId) && !start.isPending;
 
-  // What the closed disclosure reports: departures from the default, never the default
-  // itself. Silent non-default state is worse than clutter, and a badge for something
-  // that is simply on reads as a warning.
+  // 折叠区关闭时只提示偏离默认值的选项，
+  // 避免默默隐藏非默认状态，也避免给普通默认配置
+  // 加上容易被误解为警告的徽标。
   const overrides = [
-    corpusMode ? "Corpus only" : null,
-    planGate ? null : "No plan review",
-    // A chosen model is a departure from the default and has to survive the disclosure
-    // being closed — the whole point of this control is that routing stops being silent.
+    corpusMode ? "仅限语料库" : null,
+    planGate ? null : "跳过计划审核",
+    // 选定模型若偏离默认值，关闭折叠区后也必须可见，
+    // 使路由选择始终明确。
     kind && kind !== "custom" ? PROVIDER_LABEL[kind] : null,
   ].filter(Boolean);
 
@@ -156,8 +123,8 @@ export function StartResearchForm({
   };
 
   const run = () => {
-    // Guards the Enter key and a double click alike: `isPending` is folded into
-    // `canSubmit`, so a second submit while the first is in flight does nothing.
+    // canSubmit 包含 isPending 检查，同时防止回车与双击
+    // 在首次请求尚未返回时再次提交。
     if (!canSubmit || !activeId) return;
     start.mutate(
       {
@@ -168,12 +135,12 @@ export function StartResearchForm({
         ...(hasSelection ? { corpus_selection: selection } : {}),
         ...(offline ? { offline: true } : {}),
         skip_plan_gate: !planGate,
-        // Omitted, not null, when nothing was chosen: the field's absence is what means
-        // "resolve it from my settings", and sending an empty map would fail validation
-        // for missing roles.
-        // Sent whenever a backend resolved to a real route, so the run records the models
-        // it was started on rather than re-resolving them later from settings that may
-        // have changed. Omitted only when nothing is configured at all.
+        // 未选模型时省略字段，不能发送 null；字段缺失才表示
+        // 按已保存的设置解析，空映射则会因角色不全
+        // 而无法通过校验。
+        // 解析到实际路由后就显式发送，记录研究启动时使用的模型，
+        // 而非在执行时从可能已改变的设置中
+        // 重新解析；仅在完全没有配置时省略。
         ...(chosenRoute ? { model_routing: routingFor(chosenRoute) } : {}),
       },
       { onSuccess: (r) => onStarted(r.run_id) },
@@ -182,11 +149,11 @@ export function StartResearchForm({
 
   return (
     <form onSubmit={submit} className="card space-y-5 border border-border bg-bg-surface p-5 sm:p-6" aria-describedby="start-context">
-      {/* 1. Research Question Input Area */}
+      {/* 研究问题输入区。 */}
       <div>
         <div className="mb-2 flex items-center justify-between gap-2">
           <label htmlFor="question" className="text-xs font-semibold uppercase tracking-wider text-text-secondary">
-            Research question
+            研究问题
           </label>
           {question.length === 0 && (
             <button
@@ -194,7 +161,7 @@ export function StartResearchForm({
               onClick={() => setQuestion(SAMPLE_QUERY)}
               className="font-mono text-xs text-accent hover:underline"
             >
-              Use a sample question ↗
+              使用示例问题 ↗
             </button>
           )}
         </div>
@@ -203,7 +170,7 @@ export function StartResearchForm({
           rows={4}
           value={question}
           onChange={(e) => setQuestion(e.target.value.slice(0, MAX_QUERY))}
-          placeholder={`e.g. ${SAMPLE_QUERY}`}
+          placeholder={`例如：${SAMPLE_QUERY}`}
           className="textarea-base w-full resize-y border border-border bg-bg-surface p-3.5 font-serif text-base leading-relaxed transition-colors focus:border-accent"
           aria-describedby="query-counter"
           aria-invalid={tooShort || undefined}
@@ -211,7 +178,7 @@ export function StartResearchForm({
         />
         <div id="query-counter" className="mt-1.5 flex justify-between font-mono text-xs">
           <span style={{ color: tooShort ? "var(--warning)" : "var(--text-muted)" }}>
-            {tooShort ? `At least ${MIN_QUERY} characters` : " "}
+            {tooShort ? `至少 ${MIN_QUERY} 个字符` : " "}
           </span>
           <span className="tabular-nums text-text-muted">
             {trimmed.length} / {MAX_QUERY}
@@ -219,17 +186,17 @@ export function StartResearchForm({
         </div>
       </div>
 
-      {/* 2. Controls & Configuration Bar (Depth & Options) */}
+      {/* 研究深度与选项控制栏。 */}
       <div className="flex flex-col gap-3 border border-border bg-bg-elevated/40 p-3.5 sm:flex-row sm:items-center sm:justify-between sm:p-4">
         <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
-          {/* Real radios in a fieldset, so arrow keys and screen readers work. */}
+          {/* 在 fieldset 中使用原生单选按钮，支持方向键和读屏器。 */}
           <fieldset className="flex items-center gap-2.5">
-            <legend className="sr-only">Research depth</legend>
+            <legend className="sr-only">研究深度</legend>
             <span
               aria-hidden
               className="font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted"
             >
-              Depth
+              深度
             </span>
             <div className="inline-flex border border-border bg-bg-surface">
               {DEPTHS.map((d) => {
@@ -273,7 +240,7 @@ export function StartResearchForm({
           <span aria-hidden className="inline-block w-2 text-center text-text-muted">
             {showAdvanced ? "▾" : "▸"}
           </span>
-          <span className="font-semibold uppercase tracking-wider">Options</span>
+          <span className="font-semibold uppercase tracking-wider">选项</span>
           {!showAdvanced && overrides.length > 0 && (
             <span className="text-[length:var(--text-micro)] font-semibold text-accent">
               · {overrides.join(" · ")}
@@ -282,7 +249,7 @@ export function StartResearchForm({
         </button>
       </div>
 
-      {/* 3. Advanced Options Panel */}
+      {/* 高级选项面板。 */}
       {showAdvanced && (
         <div id="run-options" className="space-y-3.5 border border-border bg-bg-elevated/30 p-4">
           <div className="border-b border-border/60 pb-3">
@@ -304,33 +271,31 @@ export function StartResearchForm({
               />
               <span>
                 <span className="block text-sm font-medium text-text-primary">
-                  {hasSelection ? "Only the files you selected" : "Restrict to uploaded corpus"}
+                  {hasSelection ? "仅使用选中的文件" : "仅研究已上传语料"}
                 </span>
                 <span className="block text-xs leading-relaxed text-text-muted">
                   {hasSelection
-                    ? `Evidence comes only from the ${selection!.doc_keys.length} file(s) and ${selection!.folder_ids.length} folder(s) you selected. `
-                    : "No web search. Evidence comes only from this project's documents. "}
-                  Your question and excerpts from those files are sent to the model provider
-                  you&apos;ve configured.
+                    ? `证据仅来自你选择的 ${selection!.doc_keys.length} 个文件和 ${selection!.folder_ids.length} 个文件夹。`
+                    : "不搜索网页，证据仅来自本项目的文档。"}
+                  你的问题和这些文件的摘录会发送给已配置的模型提供方。
                 </span>
                 {hasSelection && (
                   <Link href="/corpus" className="mt-1 block text-xs font-medium underline">
-                    Change selection
+                    更改选择
                   </Link>
                 )}
                 {corpusMode && corpus.data && corpus.data.documents === 0 && (
                   <span className="mt-1 block text-xs font-medium" style={{ color: "var(--warning)" }}>
-                    This project has no documents yet.{" "}
+                    本项目尚无文档。{" "}
                     <Link href="/corpus" className="underline font-semibold">
-                      Upload some
+                      上传文档
                     </Link>{" "}
-                    or the run will have nothing to read.
+                    ，否则研究将没有可读取的材料。
                   </span>
                 )}
                 {corpusMode && corpus.data && corpus.data.documents > 0 && (
                   <span className="mt-1 block text-xs text-text-secondary">
-                    {corpus.data.documents} document
-                    {corpus.data.documents === 1 ? "" : "s"} available.
+                    {corpus.data.documents} 份文档可用。
                   </span>
                 )}
               </span>
@@ -345,11 +310,9 @@ export function StartResearchForm({
                 disabled={start.isPending}
               />
               <span>
-                <span className="block text-sm font-medium text-text-primary">Offline</span>
+                <span className="block text-sm font-medium text-text-primary">离线</span>
                 <span className="block text-xs leading-relaxed text-text-muted">
-                  Every model call goes to an address on this computer. Research refuses to
-                  start if any model is set to a cloud provider. A local router that forwards
-                  to a cloud service still sends your text out.
+                  所有模型调用都指向本机地址；若任何模型配置为云端提供方，将拒绝启动。请注意，本地路由器若转发到云服务，仍会将文本发送到外部。
                 </span>
               </span>
             </label>
@@ -364,12 +327,10 @@ export function StartResearchForm({
               />
               <span>
                 <span className="block text-sm font-medium text-text-primary">
-                  Review the research plan before searching
+                  搜索前先审核研究计划
                 </span>
                 <span className="block text-xs leading-relaxed text-text-muted">
-                  The run pauses after the planner so you can see the subtopics it chose and
-                  drop the ones you did not ask for. Nothing is spent until you approve them.
-                  Turning this off starts searching immediately.
+                  规划器完成后暂停，让你查看并排除不需要的子主题。批准后才开始后续搜索花费；关闭后将直接开始搜索。
                 </span>
               </span>
             </label>
@@ -377,32 +338,32 @@ export function StartResearchForm({
         </div>
       )}
 
-      {/* 4. Action & Status Bar */}
+      {/* 操作与状态栏。 */}
       <div className="flex flex-col gap-4 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex max-w-xl flex-col gap-1.5">
           <p id="start-context" className="text-xs font-medium leading-snug text-text-secondary">
             {projectsLoading
-              ? "Loading your projects…"
+              ? "正在加载项目…"
               : noProject
-                ? "Create a project first — research is always scoped to one."
+                ? "请先创建项目——每次研究都必须属于一个项目。"
                 : start.isPending
-                  ? "Opening the run. You will land on its workspace."
+                  ? "正在打开研究工作区。"
                   : planGate
-                    ? `Saved to ${active?.name}. The run pauses for your plan review before searching, and again for your report review.`
-                    : `Saved to ${active?.name}. The run pauses for your review before anything is finalised.`}
+                    ? `保存到 ${active?.name}。研究会先暂停等待计划审核，生成报告后再次等待你审核。`
+                    : `保存到 ${active?.name}。最终确定前会暂停等待你审核。`}
           </p>
           <p className="flex flex-wrap items-center gap-1.5 font-mono text-[length:var(--text-micro)] text-text-muted">
             {kind === null ? (
-              "Models: resolving…"
+              "模型：正在解析…"
             ) : (
               <>
-                <span className="text-text-muted">Models:</span>
+                <span className="text-text-muted">模型：</span>
                 <span className="border border-border bg-bg-elevated px-1.5 py-0.5 font-medium text-text-primary">
-                  {chosenRoute ?? `${PROVIDER_LABEL[kind]} — not configured`}
+                  {chosenRoute ?? `${PROVIDER_LABEL[kind]}——尚未配置`}
                 </span>
                 {isUnpricedRoute(chosenRoute) && (
                   <span className="text-text-muted">
-                    · Cost is not measurable for this provider — cap spend at the provider.
+                    · 无法计量该提供方的费用，请在提供方设置消费上限。
                   </span>
                 )}
               </>
@@ -412,7 +373,7 @@ export function StartResearchForm({
 
         <button type="submit" disabled={!canSubmit} className="btn btn-primary self-start px-5 py-2.5 font-medium sm:self-auto">
           {start.isPending && <span className="spinner" />}
-          {start.isPending ? "Starting…" : "Start research"}
+          {start.isPending ? "启动中…" : "开始研究"}
         </button>
       </div>
 
@@ -426,14 +387,14 @@ export function StartResearchForm({
             borderColor: "var(--danger-line)",
           }}
         >
-          <p className="font-medium">Research couldn&apos;t be started.</p>
+          <p className="font-medium">无法启动研究。</p>
           <p className="mt-1">
             {start.error instanceof ApiError
               ? start.error.message
-              : "The request failed before it reached the server. Check your connection."}
+              : "请求未能到达服务端，请检查网络连接。"}
           </p>
           <button type="button" className="btn btn-secondary mt-2" disabled={!canSubmit} onClick={run}>
-            Try again
+            重试
           </button>
         </div>
       )}

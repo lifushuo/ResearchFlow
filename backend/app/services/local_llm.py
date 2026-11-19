@@ -1,16 +1,6 @@
-"""
-Local LLM (Ollama) discovery and health probe (docs/12 M15).
+"""发现本地 Ollama 服务及已安装模型（docs/12 M15）。
 
-`model_routing.available_providers()` reports Ollama as usable unconditionally, because
-local inference needs no API key. That is true about *keys* and misleading about
-*reality*: with no server running, the user picks a local model in the UI and the failure
-only surfaces minutes later, inside a run. This module supplies the missing fact — is a
-server actually there, and which models does it have — so the UI can tell the truth
-before a run is started.
-
-Kept deliberately dependency-free (plain httpx against Ollama's REST API) so a probe
-never drags in a model client or costs a token.
-"""
+无需密钥不代表服务正在运行，探测让界面在研究开始前得知真实可用性。直接用 httpx 调 REST，不创建模型客户端，也不消耗模型 Token。"""
 
 from __future__ import annotations
 
@@ -25,13 +15,8 @@ from typing import Literal
 import httpx
 import structlog
 
-# The default Ollama URL is read from the engine's process RunConfig, not from
-# `app.config.settings`. Both are the same value on the server — `app/runtime.py` copies
-# `settings.ollama_base_url` straight into the process default — but `app.config` builds a
-# `Settings` requiring `DATABASE_URL` and `JWT_SECRET_KEY` at import, which the desktop
-# host does not have. Importing it here killed the packaged sidecar at startup (#50), and
-# a lazy import would only have moved the crash to the first Settings-page probe, since
-# the sidecar calls `probe()`/`pull()` with no explicit base_url.
+# Ollama 默认地址从引擎 RunConfig 读取，不从 app.config.settings 读取。
+# 后者导入时要求数据库和 JWT 配置，桌面没有这些配置，延迟导入也只是把崩溃推迟到首次探测。
 from research_engine import catalog
 from research_engine.llm_factory import map_local_host
 from research_engine.runconfig import get_run_config
@@ -40,49 +25,33 @@ logger = structlog.get_logger()
 
 
 def _log_probe_failure(event: str, **fields: object) -> None:
-    """Best-effort structured log for a `probe()`/`pull()` failure.
+    """尽力记录探测或下载失败，日志本身也不能破坏“不抛异常”的契约。
 
-    Both callers promise never to raise, and this call sits inside the one except-block
-    standing between an already-caught transport failure and that clean return — so a
-    broken log sink would break the promise instead of just losing a diagnostic line.
-    Observed on Windows: unlike stdlib `logging` (which swallows a handler's own I/O
-    failure by design, via `Handler.handleError`), structlog's sink writes straight to
-    `sys.stdout`/`sys.stderr` with no such protection, and that write has been seen to
-    raise there. The information isn't lost either way — `error=str(exc)` still reaches
-    the caller through the returned status/event — so dropping the log line is the
-    correct trade, not a "never swallow" violation.
-    """
+    Windows 的 structlog 输出可能再次抛 I/O 错误；原错误已通过返回状态交给用户，因此可以放弃该日志行，不能为写日志使设置页失败。"""
     try:
         logger.info(event, **fields)
-    except Exception:  # noqa: BLE001 — the log call itself must never be why probe()/pull() raise
+    except Exception:  # noqa: BLE001 — 日志写入不能成为 probe/pull 抛异常的原因
         pass
 
 
-# A probe must never make the settings page feel slow: a local server answers in
-# milliseconds, and anything slower is functionally "not there" for our purposes.
+# 本地探测需快速返回；超时则报告不可用，不能拖慢设置页。
 _PROBE_TIMEOUT_SECONDS = 3.0
 
-# Smallest parameter count (in billions) we expect to survive the executor's structured
-# evidence step. Measured 2026-08-06: qwen2.5:7b plans and calls the search tool
-# correctly, then fails to return parsable evidence (`no_parsable_evidence`), because
-# small models are weak at strict JSON schemas and tool-calling. Surfacing this in the UI
-# is the difference between a feature and a support burden (docs/12 M15).
+# 模型参数量最低建议，面向执行器结构化证据步骤。
+# 实测小模型可能会规划和调用搜索，却无法返回严格可解析的证据 JSON；界面应事先披露（docs/12 M15）。
 _MIN_RESEARCH_PARAMS_B = 14.0
 
-# Parameter count in a tag: "qwen2.5:7b" → 7, "deepseek-r1:14b" → 14, "llama3.3:70b" → 70.
-# The leading boundary matters — a naive "4b" substring search matches *inside* "14b" and
-# mislabels a capable model as underpowered (caught in live testing, hence the regex).
+# 从标签提取参数量，如 7b、14b、70b；必须检查边界，不能把 14b 中的 4b 误识别成小模型。
 _PARAM_RE = re.compile(r"(?:^|[^0-9.])(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.IGNORECASE)
 
-# Qualitative size markers used when a tag carries no explicit parameter count.
+# 没有明确参数量时使用的定性大小标识。
 _SMALL_WORDS = ("mini", "small", "tiny")
 
-# Embedding models cannot chat or call tools at all — routing one to an agent role fails
-# immediately, so they are labelled rather than silently offered as a choice.
+# 向量模型不能聊天或调用工具，需明确标识，不能作为普通代理角色选项。
 _EMBEDDING_HINTS = ("embed", "bge-", "gte-", "minilm")
 
 
-# Models known not to support tool calling in Ollama.
+# 已知在 Ollama 中不支持工具调用的模型。
 _NO_TOOL_HINTS = ("deepseek-r1", "deepseek-coder", "phi3:mini", "tinyllama")
 
 
@@ -93,29 +62,27 @@ def _supports_tools(name: str) -> bool:
 
 @dataclass
 class LocalModel:
-    """One model installed on the local server."""
+    """本地服务已安装的单个模型。"""
 
-    name: str  # the Ollama tag, e.g. "qwen2.5:7b"
+    name: str  # Ollama 原始标签，例如 qwen2.5:7b。
     size_bytes: int | None = None
-    # The "provider:model" route to use for this model, when it maps to a catalog entry.
+    # 可映射到目录时，记录此模型实际使用的 provider:model 路由。
     route: str | None = None
     in_catalog: bool = False
-    # True when the name suggests a parameter count the pipeline handles poorly.
+    # 名称所示参数量可能难以完成研究流程时为 True。
     likely_underpowered: bool = False
-    # True for embedding models — usable for retrieval, never for an agent role.
+    # 向量模型为 True；可用于检索，不能承担代理角色。
     is_embedding: bool = False
-    # True if the model supports tool calling (required for Executor role).
+    # 是否支持工具调用，Executor 必须具备此能力。
     supports_tools: bool = True
-    # Parsed parameter count in billions, when the tag states one.
+    # 标签明确标注时解析参数量，单位十亿。
     params_b: float | None = None
 
 
-#: "Not detected" used to conflate two states with different fixes: no Ollama
-#: installed needs the installer link, Ollama installed but not running needs the
-#: one-click Start button (internal/07 Phase 2b). Both looked identical over HTTP.
+# 区分未安装与已安装但未运行：前者提示安装，后者提供启动按钮（internal/07 Phase 2b）。
 InstallState = Literal["running", "installed_not_running", "not_installed"]
 
-# Installer locations the platform installer sometimes doesn't add to PATH.
+# 安装器可能未加入 PATH 的常见程序位置。
 _OLLAMA_BINARY_CANDIDATES = (
     "/usr/local/bin/ollama",
     "/opt/homebrew/bin/ollama",
@@ -125,11 +92,9 @@ _OLLAMA_BINARY_CANDIDATES = (
 
 
 def resolve_binary() -> str | None:
-    """The `ollama` executable's path on this machine, checked beyond PATH — the
-    macOS/Windows installers do not always add it there. `None` when nothing is found.
-    Public: `sidecar.py::start_local_server` needs the actual path to spawn, not just
-    whether one exists.
-    """
+    """查找本机 ollama 可执行文件的真实路径，除 PATH 外也检查系统常用安装目录。
+
+    找不到返回 None；桌面启动服务需要路径本身，而不只是是否存在。"""
     on_path = shutil.which("ollama")
     if on_path:
         return on_path
@@ -141,19 +106,19 @@ def resolve_binary() -> str | None:
 
 
 def _binary_installed() -> bool:
-    """Whether an `ollama` executable exists on this machine, beyond just PATH."""
+    """检查本机是否安装 ollama，不只依赖 PATH。"""
     return resolve_binary() is not None
 
 
 @dataclass
 class LocalLLMStatus:
-    """Everything the settings UI needs to describe the local-LLM connection."""
+    """设置界面说明本地模型连接所需的完整状态。"""
 
     configured_base_url: str
     reachable: bool
     models: list[LocalModel] = field(default_factory=list)
     error: str | None = None
-    # Actionable next step, phrased for a user rather than an operator.
+    # 面向普通用户的可执行下一步建议。
     hint: str | None = None
     install_state: InstallState = "not_installed"
 
@@ -163,17 +128,14 @@ class LocalLLMStatus:
 
 
 def _api_root(base_url: str) -> str:
-    """Ollama's REST root from the OpenAI-compatible base URL.
+    """从兼容接口地址推导 Ollama REST 根地址。
 
-    Config holds `.../v1` because that is what the chat client needs; discovery lives at
-    `/api/tags` on the same host, so strip the OpenAI suffix rather than making the user
-    configure two URLs that must agree.
-    """
+    聊天配置通常以 /v1 结尾，而模型列表在 /api/tags；统一去掉后缀，无需用户配置两份必须一致的地址。"""
     return base_url.rstrip("/").removesuffix("/v1")
 
 
 def _parse_params_b(name: str) -> float | None:
-    """Parameter count in billions from an Ollama tag, or None when unstated."""
+    """从 Ollama 标签读取十亿参数量；未标注则返回 None。"""
     match = _PARAM_RE.search(name)
     return float(match.group(1)) if match else None
 
@@ -184,12 +146,9 @@ def _is_embedding(name: str) -> bool:
 
 
 def _is_underpowered(name: str) -> bool:
-    """Whether this model is likely too weak for the research pipeline.
+    """根据明确参数量或定性大小词判断是否可能不足以完成研究。
 
-    Judged on the stated parameter count, falling back to qualitative words. A tag with
-    no size at all is NOT flagged: guessing wrong in that direction would warn users off
-    perfectly capable models, and the run itself will tell them soon enough.
-    """
+    完全没有大小信息就不警告，不能猜测后误劝用户放弃可能足够的模型。"""
     lowered = name.lower()
     params = _parse_params_b(lowered)
     if params is not None:
@@ -198,18 +157,9 @@ def _is_underpowered(name: str) -> bool:
 
 
 def _match_catalog_route(name: str) -> tuple[str, bool]:
-    """Route for an installed Ollama tag, plus whether its family is in the catalog.
+    """返回精确安装标签的路由，并单独报告是否属于已知目录家族。
 
-    The route is always the **exact installed tag**. Returning the catalog's family route
-    instead collapsed distinct models onto one entry and then failed to run them: picking
-    `deepseek-r1:1.5b` or `deepseek-r1:14b` both produced `ollama:deepseek-r1`, which
-    Ollama 404s because no `deepseek-r1:latest` exists — and picking `qwen2.5:7b` produced
-    `ollama:qwen2.5`, which silently ran `qwen2.5:latest`, a different model than the one
-    the user selected. Silently running the wrong model is the worse of the two.
-
-    Catalog membership is still reported: it is what tells the UI a model has known
-    pricing and capabilities. It just no longer decides what gets dialled.
-    """
+    不能用目录家族名替代真实标签，否则不同大小被合并，可能调用不存在的 latest，或悄悄运行与用户所选不同的模型。目录仅提供已知计价和能力信息，不决定实际拨号名称。"""
     family = name.split(":", 1)[0]
     spec = catalog.get(family)
     in_catalog = spec is not None and spec.provider == "ollama"
@@ -217,16 +167,9 @@ def _match_catalog_route(name: str) -> tuple[str, bool]:
 
 
 async def probe(base_url: str | None = None) -> LocalLLMStatus:
-    """Ask the configured Ollama server what it has. Never raises.
+    """探测配置的 Ollama 服务器及模型，故障不向外抛出。
 
-    `configured` is what the UI displays and what a native run actually uses; `dial_url`
-    is what this probe connects to. Inside Docker those must differ — `localhost` there is
-    the container, not the host running Ollama — and until this call they didn't: the
-    probe dialled the raw configured value and, on failure, told the user to retype it as
-    `host.docker.internal` by hand. `llm_factory.get_llm` already made that same
-    substitution automatically for the actual pipeline calls; the health check now agrees
-    with the thing it's supposed to be checking.
-    """
+    界面保留原 configured 地址，容器请求使用 map_local_host 后的 dial_url，与实际模型调用保持一致，不要求用户手动改容器地址。"""
     configured = base_url or get_run_config().ollama_base_url
     dial_url = map_local_host(configured)
     url = f"{_api_root(dial_url)}/api/tags"
@@ -236,13 +179,11 @@ async def probe(base_url: str | None = None) -> LocalLLMStatus:
             response = await client.get(url)
             response.raise_for_status()
             payload = response.json()
-    except Exception as exc:  # noqa: BLE001 — every failure is "not reachable" to a user
+    except Exception as exc:  # noqa: BLE001 — 所有故障都转成用户可处理的不可达状态
         _log_probe_failure(
             "local_llm_probe_failed", configured=configured, dial_url=url, error=str(exc)
         )
-        # The Docker/localhost rewrite already happened above, so a stale "retype the
-        # address as host.docker.internal" instruction here would tell the user to do by
-        # hand what the code just did for them and failed at anyway — worse than no hint.
+        # 地址已自动完成容器映射，不能失败后再提示用户手动重复同一操作。
         installed = _binary_installed()
         return LocalLLMStatus(
             configured_base_url=configured,
@@ -271,7 +212,7 @@ async def probe(base_url: str | None = None) -> LocalLLMStatus:
                 route=route,
                 in_catalog=in_catalog,
                 supports_tools=_supports_tools(name),
-                # An embedding model is not "underpowered" for chat — it cannot chat.
+                # 向量模型不是聊天能力较弱，而是完全不能聊天。
                 likely_underpowered=(not embedding and _is_underpowered(name)),
                 is_embedding=embedding,
                 params_b=_parse_params_b(name),
@@ -313,7 +254,7 @@ async def probe(base_url: str | None = None) -> LocalLLMStatus:
 
 @dataclass
 class PullProgress:
-    """One line of Ollama's streaming `/api/pull` response."""
+    """Ollama /api/pull 流中的一条下载进度。"""
 
     status: str
     completed: int | None = None
@@ -322,11 +263,9 @@ class PullProgress:
 
 
 async def pull(model: str, base_url: str | None = None) -> AsyncIterator[PullProgress]:
-    """Stream Ollama's pull progress for `model` (internal/07 Phase 2b: "recommended-
-    model one-click pull with progress"). Never raises — a transport failure or a
-    non-200 response yields one `PullProgress(status="error")` instead of propagating,
-    matching `probe`'s "every failure becomes a status a user can act on" contract.
-    """
+    """流式获取模型下载进度（internal/07 Phase 2b）。
+
+    传输失败或非 200 转换为一条 status=error 的 PullProgress，不向外抛出，保持与 probe 一致的状态契约。"""
     configured = base_url or get_run_config().ollama_base_url
     dial_url = map_local_host(configured)
     url = f"{_api_root(dial_url)}/api/pull"
@@ -346,7 +285,7 @@ async def pull(model: str, base_url: str | None = None) -> AsyncIterator[PullPro
                         continue
                     try:
                         payload = json.loads(line)
-                    except Exception:  # noqa: BLE001 — a stray non-JSON line is not fatal
+                    except Exception:  # noqa: BLE001 — 单条非 JSON 消息不应中断整次进度读取
                         continue
                     yield PullProgress(
                         status=payload.get("status", ""),
@@ -354,6 +293,6 @@ async def pull(model: str, base_url: str | None = None) -> AsyncIterator[PullPro
                         total=payload.get("total"),
                         error=payload.get("error"),
                     )
-    except Exception as exc:  # noqa: BLE001 — every transport failure is "no response"
+    except Exception as exc:  # noqa: BLE001 — 传输失败统一报告为没有响应
         _log_probe_failure("local_llm_pull_failed", model=model, error=str(exc))
         yield PullProgress(status="error", error=str(exc))

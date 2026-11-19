@@ -6,7 +6,7 @@ import toast from "react-hot-toast";
 
 import { useArchiveSession, useDeleteSession } from "@/hooks/queries";
 import { sessionHref } from "@/lib/desktop";
-import { formatCost } from "@/lib/format";
+import { researchDepthLabel, formatCost } from "@/lib/format";
 import type { SessionSummary } from "@/lib/types";
 
 import { RelativeTime } from "./RelativeTime";
@@ -38,9 +38,9 @@ export function SessionCard({ session }: { session: SessionSummary }) {
     stop(e);
     try {
       await archive.mutateAsync({ id: session.session_id, archived: !archived });
-      toast.success(archived ? "Restored to History" : "Archived");
+      toast.success(archived ? "已恢复到历史记录" : "已归档");
     } catch {
-      toast.error(archived ? "Couldn't restore this session." : "Couldn't archive this session.");
+      toast.error(archived ? "无法恢复研究记录。" : "无法归档研究记录。");
     }
   };
 
@@ -48,9 +48,9 @@ export function SessionCard({ session }: { session: SessionSummary }) {
     stop(e);
     try {
       await del.mutateAsync(session.session_id);
-      toast.success("Session deleted");
+      toast.success("研究记录已删除");
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't delete this session.");
+      toast.error(err instanceof Error ? err.message : "无法删除研究记录。");
       setConfirming(false);
     }
   };
@@ -77,7 +77,7 @@ export function SessionCard({ session }: { session: SessionSummary }) {
       </p>
 
       <div className="mt-3.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs text-text-muted">
-        <span className="capitalize">{session.research_depth}</span>
+        <span className="capitalize">{researchDepthLabel(session.research_depth)}</span>
         <span aria-hidden>·</span>
         <span className="tabular-nums">{formatCost(session.total_cost_usd)}</span>
         {/* The product's central claim, per row. Rendered only when it was actually
@@ -89,7 +89,7 @@ export function SessionCard({ session }: { session: SessionSummary }) {
               <span aria-hidden>·</span>
               <span
                 className="tabular-nums"
-                title="Share of this report's [n] markers that resolve to a real source"
+                title="报告中可定位到真实来源的引用标记占比"
                 style={{
                   color:
                     session.citation_resolution_rate === 1
@@ -97,7 +97,7 @@ export function SessionCard({ session }: { session: SessionSummary }) {
                       : "var(--warning)",
                 }}
               >
-                {Math.round(session.citation_resolution_rate * 100)}% verified
+                {Math.round(session.citation_resolution_rate * 100)}% 引用可定位
               </span>
             </>
           )}
@@ -105,7 +105,7 @@ export function SessionCard({ session }: { session: SessionSummary }) {
           <>
             <span aria-hidden>·</span>
             <span>
-              {session.rework_count} rework{session.rework_count > 1 ? "s" : ""}
+              返工 {session.rework_count} 次
             </span>
           </>
         )}
@@ -114,14 +114,14 @@ export function SessionCard({ session }: { session: SessionSummary }) {
         <span className="ml-auto flex items-center gap-1.5 opacity-100 transition-opacity sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100 font-sans">
           {confirming ? (
             <>
-              <span className="text-[0.6875rem] text-danger">Delete permanently?</span>
+              <span className="text-[0.6875rem] text-danger">确定永久删除？</span>
               <button
                 type="button"
                 onClick={onDelete}
                 disabled={busy}
                 className="px-1.5 py-0.5 text-[0.6875rem] font-medium text-danger border border-danger/30 hover:bg-danger/10"
               >
-                {del.isPending ? "Deleting…" : "Yes"}
+                {del.isPending ? "删除中…" : "确认删除"}
               </button>
               <button
                 type="button"
@@ -131,7 +131,7 @@ export function SessionCard({ session }: { session: SessionSummary }) {
                 }}
                 className="px-1.5 py-0.5 text-[0.6875rem] text-text-muted border border-border hover:text-text-secondary"
               >
-                No
+                取消
               </button>
             </>
           ) : (
@@ -141,9 +141,9 @@ export function SessionCard({ session }: { session: SessionSummary }) {
                 onClick={onArchive}
                 disabled={busy}
                 className="px-1.5 py-0.5 text-[0.6875rem] text-text-muted border border-transparent hover:border-border hover:text-text-secondary"
-                title={archived ? "Restore to History" : "Move out of History"}
+                title={archived ? "恢复到历史记录" : "移出历史记录"}
               >
-                {archived ? "Restore" : "Archive"}
+                {archived ? "恢复" : "归档"}
               </button>
               <button
                 type="button"
@@ -153,9 +153,9 @@ export function SessionCard({ session }: { session: SessionSummary }) {
                 }}
                 disabled={busy}
                 className="px-1.5 py-0.5 text-[0.6875rem] text-text-muted border border-transparent hover:border-danger/30 hover:text-danger"
-                title="Delete permanently"
+                title="永久删除"
               >
-                Delete
+                删除
               </button>
             </>
           )}

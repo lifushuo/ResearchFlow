@@ -1,10 +1,6 @@
-"""
-Password policy + hashing (docs/architecture/06-security.md §1).
+"""密码策略与哈希（docs/architecture/06-security.md §1）。
 
-bcrypt directly (passlib is unmaintained). Reject >72 bytes explicitly rather than
-letting bcrypt silently truncate. A small embedded breached-password set blocks the
-most common choices; production can point BREACHED_PATH at a larger list.
-"""
+直接使用 bcrypt，超过 72 字节明确拒绝，不能任其静默截断。内置常见泄露密码集合，生产可通过 BREACHED_PATH 提供更大名单。"""
 
 from __future__ import annotations
 
@@ -13,8 +9,7 @@ import bcrypt
 MIN_LENGTH = 12
 MAX_BYTES = 72
 
-# A tiny sample of the most-common breached passwords. Real deployments should load
-# a larger list (e.g. top 10k) — this keeps the dependency-free default honest.
+# 默认仅包含少量常见泄露密码；真实部署建议加载更大的名单，不能把最小样本宣传为完整防护。
 _COMMON = {
     "password",
     "password123",
@@ -28,7 +23,7 @@ _COMMON = {
 
 
 class WeakPassword(ValueError):
-    """Raised when a password fails the policy."""
+    """密码不满足策略时抛出。"""
 
 
 def validate_password(password: str) -> None:

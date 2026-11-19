@@ -1,10 +1,6 @@
-"""
-Celery task wrappers over the async pipeline engine (app.workers.pipeline_runner).
+"""Celery 对异步研究引擎的轻量任务封装。
 
-The tasks are deliberately thin: they run the async engine and, on unexpected
-failure, mark the session FAILED. They do NOT auto-retry the whole pipeline (it is
-not idempotent); a crashed run is resumed from the LangGraph checkpoint explicitly.
-"""
+调用 app.workers.pipeline_runner；意外失败时标记会话失败。不自动重试整套研究，因为重复执行会重复消耗模型费用；崩溃必须明确从检查点恢复。"""
 
 from __future__ import annotations
 
@@ -21,9 +17,8 @@ logger = structlog.get_logger()
 def run_agent_pipeline(session_id: str, user_id: str) -> None:
     from app.workers.pipeline_runner import run_pipeline
 
-    # Clear first: workers are long-lived processes, and one run's identity must
-    # never leak into the next task's logs. The bound correlation_id (= session_id)
-    # rides along every log this task and the engine emit on the worker loop.
+    # 先清空旧上下文：Worker 是长生命周期进程，上一轮身份不能泄漏到下一轮日志。
+    # 本次 correlation_id 等于 session_id，并随任务和引擎日志传递。
     clear_run_context()
     bind_session_context(session_id, user_id=user_id)
     logger.info("pipeline_task_started")
@@ -54,14 +49,9 @@ def resume_agent_pipeline(
 
 @celery_app.task(name="resume_plan_gate")
 def resume_plan_gate(session_id: str, user_id: str, plan: dict) -> None:
-    """Resume a session suspended at the research design gate (internal/07 Phase 4).
+    """恢复暂停在研究计划关卡的会话（internal/07 Phase 4）。
 
-    A separate task from `resume_agent_pipeline` rather than an extra argument on it:
-    the two carry different payloads to different interrupts, and a single task that
-    guessed which one it was holding is how a plan edit ends up resuming the draft gate.
-    Celery also makes the distinction load-bearing — a queued message outlives a deploy,
-    so widening the old task's signature would leave in-flight messages ambiguous.
-    """
+    单独设任务，不复用报告关卡恢复入口：两者负载和中断类型不同，不能猜测。排队消息可能跨部署存在，随意扩展旧任务参数也会使旧消息产生歧义。"""
     from app.workers.pipeline_runner import resume_plan
 
     clear_run_context()
@@ -100,16 +90,12 @@ async def _mark_failed(session_id: str, error: str) -> None:
         await engine.dispose()
 
 
-# ── Research runs ─────────────────────────────────────────────────────────────────
+# 研究运行任务
 #
-# Separate task names from the session pair, for the reason `resume_plan_gate` is separate: a
-# queued Celery message outlives a deploy, so widening an existing task's meaning would
-# leave in-flight messages ambiguous about which domain they belong to.
+# 研究运行与会话使用不同任务名；排队消息可能跨部署保留，不能通过修改旧任务含义来混用两个领域。
 #
-# **The `name=` strings are a wire protocol and do not follow the Python identifiers.** They
-# are what a message already sitting in the broker carries, so renaming one strands every
-# queued run at the moment of an upgrade. Same reasoning as an Alembic revision id: the
-# value exists in deployed state, not just in this file.
+# name= 的字符串是消息协议，不跟随 Python 函数名随意改动。
+# 消息代理中的旧消息已经保存该名称，改名会使升级时队列中的任务失去处理入口；与 Alembic revision ID 一样，它属于已部署状态。
 
 
 @celery_app.task(name="run_research_pipeline")
@@ -160,12 +146,9 @@ def resume_research_plan_gate(run_id: str, user_id: str, plan: dict) -> None:
 
 
 async def _mark_run_failed(run_id: str, error: str) -> None:
-    """A crash outside the adapter still has to leave the run FAILED, not RUNNING forever.
+    """即使适配器外崩溃，也要把运行标为 FAILED，不能永远停在 RUNNING。
 
-    The run counterpart of `_mark_failed`, and the same shape: its own session, its own Redis
-    lifecycle, and it never raises — a failure here would lose the only record of the first
-    failure.
-    """
+    与会话 _mark_failed 一样，使用独立会话管理数据库和 Redis，并自行处理异常，避免记录失败时又报错，丢掉最初故障。"""
     import uuid
 
     from sqlalchemy import select
@@ -182,11 +165,8 @@ async def _mark_run_failed(run_id: str, error: str) -> None:
                 await db.execute(select(ResearchRun).where(ResearchRun.id == uuid.UUID(run_id)))
             ).scalar_one_or_none()
             if run:
-                # Through `record_failure` rather than assigning status here, so this path
-                # inherits the cancelled-run rule instead of being a second place that has
-                # to remember it (issue #54). Writing FAILED over a CANCELLED run violates
-                # `ck_run_cancelled` and raises — from the one function whose docstring
-                # promises it never does.
+                # 通过 record_failure 统一处理，不在这里直接写状态。
+                # 它会保留已取消运行的终态；否则写 FAILED 会违反 ck_run_cancelled，使本应不抛异常的失败处理器再次报错。
                 await run_lifecycle.record_failure(db, run, error[:500])
                 await db.commit()
         await publish_event(run_id, {"type": "FAILED", "data": {"reason": error[:500]}})

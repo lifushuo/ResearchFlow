@@ -1,21 +1,7 @@
-"""The model's view of a conversation: the most recent turns, in the order they happened.
+"""模型读取最近的聊天窗口，但按实际发生顺序提供。
 
-Two things have to be true at once, and the query this replaces had neither.
-
-The window must be the **newest** turns. `ORDER BY created_at ASC LIMIT 20` took the first
-twenty messages ever written, so past turn twenty the model stopped seeing the conversation
-— and because every caller commits the user's new message *before* reading the window, and
-builds its message list only from that window, it also stopped seeing the question it was
-being asked.
-
-And the turns must reach the model **oldest first**, because a transcript in reverse reads
-as a different conversation. Selecting newest-first and reversing is what satisfies both;
-changing only the `LIMIT` would satisfy neither.
-
-One home for three callers — `app/api/v1/chat.py`, `app/api/v1/threads.py` and
-`desktop/sidecar.py`. This is a product rule that had been restated once per host, which is
-the shape `AGENTS.md` records drifting every time it is kept in step by discipline.
-"""
+先倒序取最新 limit 条，再反转成从旧到新；直接升序 LIMIT 只会永久取最早消息，长对话连当前问题都看不到。
+报告聊天、项目线程和桌面统一复用。"""
 
 from __future__ import annotations
 
@@ -24,19 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat_message import ChatMessage
 
-#: How many turns of conversation the model is shown: enough for continuity, bounded so a
-#: long thread cannot grow the prompt — and the bill — without limit. Report chat and
-#: project threads have always used the same ceiling; they now read it from one place.
+# 统一限制模型可见消息数，维持连续性同时约束上下文和费用，两个聊天入口共用。
 HISTORY_LIMIT = 20
 
 
 async def recent_turns(db: AsyncSession, where, *, limit: int = HISTORY_LIMIT) -> list[ChatMessage]:
-    """The newest `limit` messages matching `where`, returned oldest first.
+    """选取 where 范围内最新 limit 条消息，再按旧到新返回。
 
-    `where` rather than an id because the column is the only difference between the two
-    conversations this serves: report chat scopes by `session_id`, project threads by
-    `thread_id`, and `chat_messages` carries exactly one of them per row.
-    """
+    报告通过 session_id 限定，项目线程通过 thread_id 限定，其余逻辑相同。"""
     newest_first = (
         (
             await db.execute(

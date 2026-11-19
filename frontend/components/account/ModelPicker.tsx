@@ -14,42 +14,31 @@ import type { ModelInfo, ModelRouting } from "@/lib/types";
 
 import { Section } from "./Section";
 
-/**
- * Per-role model selection (docs/12 M8).
- *
- * Presets are the front door and the per-role drawer sits behind "Customize", because
- * the useful default is one click and only a minority of users want five dropdowns.
- *
- * The framing is deliberate: routing different roles to different models is a *quality*
- * decision, not just a flexibility toggle. The executor runs many tool-calling rounds and
- * wants speed and breadth; the synthesizer writes the artifact the user actually reads and
- * wants the strongest model available. The copy says so, because a picker that only offers
- * knobs teaches nothing.
- */
+/** 按角色选择模型（docs/12 M8）。预设提供一步可用的默认方案，逐角色选择藏在自定义抽屉中。不同角色使用不同模型关乎质量：执行器多次调用工具，重速度和覆盖；综合器撰写用户最终阅读的成果，重输出质量。文案应解释取舍，而非只给出参数。 */
 
 const PRESET_COPY: Record<string, string> = {
-  fast: "Cheapest and quickest. Good for scoping a question.",
-  balanced: "A strong model where it shows, a fast one where it doesn't.",
-  best: "Highest quality, highest cost.",
+  fast: "速度最快、费用最低，适合初步界定问题。",
+  balanced: "关键环节使用强模型，常规环节使用快速模型。",
+  best: "优先保证质量，费用也最高。",
 };
 
 const PROVIDER_NAMES: Record<string, string> = {
-  custom: "Custom Endpoint (OpenAI-compatible)",
+  custom: "自定义端点（兼容 OpenAI）",
   google: "Google Gemini",
   anthropic: "Anthropic Claude",
   openai: "OpenAI",
   openrouter: "OpenRouter",
-  ollama: "Local (Ollama)",
+  ollama: "本地模型（Ollama）",
 };
 
 function formatPrice(model: ModelInfo): string {
-  if (model.provider === "custom") return "custom endpoint";
-  if (model.input_per_mtok === null || model.output_per_mtok === null) return "price not set";
-  if (model.input_per_mtok === 0 && model.output_per_mtok === 0) return "free — runs locally";
+  if (model.provider === "custom") return "自定义端点";
+  if (model.input_per_mtok === null || model.output_per_mtok === null) return "价格未配置";
+  if (model.input_per_mtok === 0 && model.output_per_mtok === 0) return "免费——在本地运行";
   return `$${model.input_per_mtok}/$${model.output_per_mtok} per 1M`;
 }
 
-/** Rough per-run cost signal so "best" vs "fast" is a number, not a vibe. */
+/** 用每次研究的大致相对费用帮助比较速度与质量，避免只靠模糊印象选择。 */
 function relativeCost(routing: ModelRouting, byRoute: Map<string, ModelInfo>): number {
   return Object.values(routing).reduce((sum, route) => {
     const m = byRoute.get(route);
@@ -84,11 +73,11 @@ export function ModelPicker() {
       max_output_tokens: null,
       supports_tools: true,
       supports_structured_output: true,
-      notes: "Served by your configured custom OpenAI-compatible endpoint.",
+      notes: "由你配置的兼容 OpenAI 的自定义端点提供服务。",
       available: reachable,
     }));
 
-    // Ensure any currently active custom: route is present even if unadvertised
+    // 即使端点未列出，也保留当前生效的 custom: 路由。
     if (current) {
       for (const route of Object.values(current)) {
         if (route.startsWith("custom:") && !list.some((m) => m.route === route)) {
@@ -104,7 +93,7 @@ export function ModelPicker() {
             max_output_tokens: null,
             supports_tools: true,
             supports_structured_output: true,
-            notes: "Served by your configured custom OpenAI-compatible endpoint.",
+            notes: "由你配置的兼容 OpenAI 的自定义端点提供服务。",
             available: reachable,
           });
         }
@@ -136,13 +125,13 @@ export function ModelPicker() {
 
   if (isLoading || !catalog || !current) {
     return (
-      <Section title="Models" description="Choose which model runs each stage of the pipeline.">
+      <Section title="模型" description="选择流水线各阶段使用的模型。">
         <div className="h-24 animate-pulse border border-border bg-bg-surface" />
       </Section>
     );
   }
 
-  // Only offer presets for providers the user can actually reach right now.
+  // 只为用户当前可访问的提供方展示预设。
   const presetProviders = Object.keys(catalog.presets).filter((p) =>
     catalog.available_providers.includes(p),
   );
@@ -154,10 +143,10 @@ export function ModelPicker() {
     setDraft(next);
     try {
       await setRouting.mutateAsync(next);
-      toast.success("Models updated. Applies to your next research run.");
+      toast.success("模型已更新，将用于下一次研究。");
     } catch (e) {
       setDraft(null);
-      toast.error(e instanceof Error ? e.message : "Could not save model selection.");
+      toast.error(e instanceof Error ? e.message : "无法保存模型选择。");
     }
   }
 
@@ -165,9 +154,9 @@ export function ModelPicker() {
     setDraft(null);
     try {
       await resetRouting.mutateAsync();
-      toast.success("Back to this deployment's default models.");
+      toast.success("已恢复此部署的默认模型。");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Could not reset.");
+      toast.error(e instanceof Error ? e.message : "无法重置。");
     }
   }
 
@@ -175,14 +164,14 @@ export function ModelPicker() {
 
   return (
     <Section
-      title="Models"
-      description="Each stage of the pipeline can run on a different model. Cheap and fast where the work is mechanical, strongest where it writes what you read."
+      title="模型"
+      description="各阶段可以使用不同模型：常规处理选择快速低价模型，报告写作选择更强模型。"
       footer={
         <>
           <span className="text-xs text-text-muted">
             {catalog.user_routing
-              ? "Using your selection."
-              : "Using this deployment's default models."}
+              ? "正在使用你的选择。"
+              : "正在使用此部署的默认模型。"}
           </span>
           <div className="flex items-center gap-2">
             {catalog.user_routing && (
@@ -192,7 +181,7 @@ export function ModelPicker() {
                 disabled={busy}
                 className="btn btn-ghost"
               >
-                Use defaults
+                使用默认配置
               </button>
             )}
             <button
@@ -201,17 +190,17 @@ export function ModelPicker() {
               className="btn btn-ghost"
               aria-expanded={customizing}
             >
-              {customizing ? "Hide roles" : "Customize"}
+              {customizing ? "收起角色配置" : "自定义"}
             </button>
           </div>
         </>
       }
     >
-      {/* Presets */}
+      {/* 模型预设。 */}
       {presetProviders.length === 0 ? (
         <div className="flex items-center gap-2.5 border border-border/70 bg-bg-surface/50 p-4 font-mono text-xs text-text-secondary">
           <span className="inline-block h-2 w-2 bg-text-muted shrink-0" />
-          <span>No provider is configured yet. Add an API key above, or run a local model with Ollama, and presets will appear here.</span>
+          <span>尚未配置提供方。请先添加 API 密钥或启动 Ollama 本地模型，然后这里会显示可用预设。</span>
         </div>
       ) : (
         presetProviders.map((provider) => (
@@ -240,7 +229,7 @@ export function ModelPicker() {
                   >
                     <div className="flex items-center justify-between">
                       <div className="font-serif text-sm font-bold capitalize text-text-primary">
-                        {name}
+                        {({ fast: "快速", balanced: "均衡", best: "最佳质量" } as Record<string, string>)[name] ?? name}
                       </div>
                       {active && (
                         <span className="h-2 w-2 bg-accent shadow-xs shadow-accent/50" />
@@ -251,8 +240,8 @@ export function ModelPicker() {
                     </div>
                     <div className="mt-2 font-mono text-[0.6875rem] text-text-muted border-t border-border/40 pt-2">
                       {relativeCost(mapping, byRoute) === 0
-                        ? "free"
-                        : `~$${relativeCost(mapping, byRoute).toFixed(2)} / 1M out`}
+                        ? "免费"
+                        : `约 $${relativeCost(mapping, byRoute).toFixed(2)} / 百万输出词元`}
                     </div>
                   </button>
                 );
@@ -262,11 +251,11 @@ export function ModelPicker() {
         ))
       )}
 
-      {/* Per-role drawer */}
+      {/* 按角色展开模型配置。 */}
       {customizing && (
         <div className="mt-6 space-y-4 border-t border-border/60 pt-6">
           <div className="text-xs font-mono font-semibold uppercase tracking-wider text-text-secondary">
-            Role Allocations
+            角色模型分配
           </div>
           {catalog.roles.map((role) => {
             const selected = byRoute.get(current[role]);
@@ -286,7 +275,7 @@ export function ModelPicker() {
                 <div>
                   <select
                     id={`model-${role}`}
-                    aria-label={`Model for ${ROLE_COPY[role].label}`}
+                    aria-label={`${ROLE_COPY[role].label}的模型`}
                     className="input-base w-full text-xs"
                     value={current[role]}
                     disabled={busy}
@@ -309,8 +298,8 @@ export function ModelPicker() {
                               disabled={disabled}
                             >
                               {m.display_name} — {formatPrice(m)}
-                              {!m.available ? " (needs a key)" : ""}
-                              {role === "executor" && !m.supports_tools ? " (no tool support)" : ""}
+                              {!m.available ? "（需要密钥）" : ""}
+                              {role === "executor" && !m.supports_tools ? "（不支持工具调用）" : ""}
                             </option>
                           );
                         })}

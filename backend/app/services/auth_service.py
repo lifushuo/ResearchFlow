@@ -1,10 +1,6 @@
-"""
-Refresh-token lifecycle: issue, rotate, revoke, reuse-detect (docs/06 §1).
+"""刷新令牌的签发、轮换、吊销和重复使用检测（docs/06 §1）。
 
-A refresh token is opaque; only its sha256 is stored. Rotation issues a new token
-and revokes the old one. Presenting an already-revoked token is treated as theft:
-the whole family for that user is revoked.
-"""
+只保存不透明令牌的 SHA-256。轮换后旧令牌失效，再次提交已吊销令牌视为泄露，吊销该用户整族令牌。"""
 
 from __future__ import annotations
 
@@ -32,10 +28,7 @@ async def issue_refresh_token(db: AsyncSession, user_id: UUID) -> str:
 
 
 async def rotate_refresh_token(db: AsyncSession, raw: str) -> tuple[UUID, str] | None:
-    """Validate + rotate. Returns (user_id, new_raw) or None if invalid.
-
-    Reuse of a revoked token revokes every token for that user (family revocation).
-    """
+    """校验并轮换令牌，成功返回用户 ID 和新原始令牌，无效返回 None；发现旧令牌复用则吊销该用户整族令牌。"""
     token_hash = tokens.hash_refresh_token(raw)
     row = (
         await db.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
@@ -45,7 +38,7 @@ async def rotate_refresh_token(db: AsyncSession, raw: str) -> tuple[UUID, str] |
 
     now = datetime.now(UTC)
     if row.revoked_at is not None:
-        # Reuse of a rotated/revoked token → assume compromise, revoke the family.
+        # 重复使用已轮换或已吊销令牌视为泄露，吊销整个令牌家族。
         await _revoke_all_for_user(db, row.user_id)
         return None
     if row.expires_at <= now:
@@ -66,11 +59,9 @@ async def revoke_refresh_token(db: AsyncSession, raw: str) -> None:
 
 
 async def revoke_all_for_user(db: AsyncSession, user_id: UUID) -> None:
-    """Revoke every live refresh token for a user — signs out all their devices.
+    """吊销用户全部有效刷新令牌，让所有设备退出。
 
-    Public entry point for deliberate account-wide sign-out (password change);
-    reuse detection calls the same logic via the private alias below.
-    """
+    供改密码等主动全账号退出使用；重复使用检测也复用同一逻辑。"""
     await _revoke_all_for_user(db, user_id)
 
 

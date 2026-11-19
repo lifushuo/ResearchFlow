@@ -1,14 +1,7 @@
-"""
-Extracting text from ingested corpus documents (internal/12 M10, docs/13 "Three privacy tiers").
+"""提取资料库文档文本，见 internal/12 M10、docs/13 隐私分层。
 
-Pure bytes in, text out — with the page boundaries a PDF has and an offset map the
-chunker turns into exact citation locations. Supported: PDF, Markdown, plain text;
-anything else is refused, because a format we cannot locate a quote inside has no
-business entering a citation-grade corpus.
-
-`pypdf` is imported lazily so an MD/TXT-only deployment (and every test that never
-touches a PDF) does not pay for it, and so the engine's import surface stays small.
-"""
+输入字节，输出标准文本、页边界与精确定位所需偏移。
+不支持的格式明确拒绝；PDF 解析器延迟导入，避免纯文本部署承担不必要依赖。"""
 
 from __future__ import annotations
 
@@ -18,14 +11,11 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 
-# A single document must be small enough that extracting, chunking, and embedding it
-# stays a bounded operation on a laptop; 500 such documents (the M10 DoD scale) is
-# ~12 GB in the worst case, which no corpus is. These are tripwires, not tuning knobs.
+# 限制单文档大小，保证普通笔记本上的提取、切块和嵌入有界；这些是保护阈值。
 MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 2000
 
-#: ZIP-based formats are bounded *before* parsing, on what the archive says it would expand
-#: to (internal/rfcs/V3.1-corpus-scope.md §11.2). A 25 MiB upload can declare gigabytes.
+#: ZIP 格式在解析前检查声明解压大小，防止小上传包声明巨大解压内容，见 RFC V3.1 §11.2。
 MAX_ARCHIVE_EXPANDED_BYTES = 200 * 1024 * 1024
 MAX_ARCHIVE_RATIO = 100
 MAX_ARCHIVE_MEMBERS = 10_000
@@ -35,16 +25,11 @@ VERBATIM, LINEARIZED = "verbatim", "linearized"
 
 @dataclass(frozen=True)
 class Extraction:
-    """What a document becomes inside the corpus.
+    """文档进入资料库后的标准表示。
 
-    `text` is canonical: deterministic for pinned parser versions, and every citation's
-    quote is verified against it. `page_starts` are PDF pages (`[0]` for everything else).
-    `segments` are `(start, label)` pairs, in order, naming where each sheet, row, slide,
-    cell or chapter begins — the human-readable location of a citation, derived without
-    touching the `corpus://` URL format (RFC D-13). `mode` is `linearized` when the text is
-    a rendering of structure (a spreadsheet, a notebook) rather than the document's own
-    prose, and the UI says so beside every quote from it (RFC D-14).
-    """
+    text 是固定解析器版本下的标准文本，引用必须与其逐字核对。
+    page_starts 记录 PDF 页起点，其他文档为 [0]；segments 记录工作表、行、页、单元格或章节位置。
+    结构转成的文本标为 linearized，界面需向引用读者披露，见 RFC D-13、D-14。"""
 
     text: str
     page_starts: list[int]
@@ -57,14 +42,11 @@ class Extraction:
 class Format:
     kind: str
     label: str
-    #: The module a lazily imported parser needs, so packaging can be checked against it
-    #: (`research-sidecar.spec` hiddenimports). None for the standard library.
+    #: 延迟解析器所需模块，用于核对桌面打包依赖；标准库模块记为 None。
     parser_module: str | None = None
 
 
-#: Every accepted extension, and the one place that list lives. The refusal message, the
-#: download media types and the upload picker's list are all checked against this
-#: (`tests/task/test_document_formats.py`): five homes used to disagree (audit C8).
+#: 支持扩展名的唯一清单；错误提示、下载类型和上传选择器由测试核对，避免多处不一致。
 FORMATS: dict[str, Format] = {
     ".pdf": Format("pdf", "PDF", "pypdf"),
     ".html": Format("html", "HTML", "bs4"),
@@ -75,21 +57,19 @@ FORMATS: dict[str, Format] = {
     ".text": Format("txt", "plain text"),
     ".rst": Format("txt", "plain text"),
     ".json": Format("txt", "plain text"),
-    # Tier B (RFC V3.1 §10.2): exact-pinned parsers, both MIT, with cp314 wheels on every
-    # target (G-1). Word documents and spreadsheets, cached values only.
+    # B 级格式使用固定版本的 MIT 解析器，要求所有目标平台有 cp314 轮子；表格仅读缓存值。
     ".docx": Format("docx", "Word document", "docx"),
     ".xlsx": Format("spreadsheet", "Excel workbook", "python_calamine"),
     ".xlsm": Format("spreadsheet", "Excel workbook", "python_calamine"),
     ".xls": Format("spreadsheet", "Excel workbook", "python_calamine"),
     ".ods": Format("spreadsheet", "OpenDocument spreadsheet", "python_calamine"),
-    # Tier C (RFC V3.1 §10.2). PowerPoint, OpenDocument text and EPUB are ZIP archives of
-    # XML read with the standard library and lxml (already a dependency) — no python-pptx,
-    # so no image library joins the desktop bundle. RTF through striprtf (BSD-3, pure).
+    # C 级格式：PowerPoint、OpenDocument、EPUB 用标准库和已有 lxml 读取 ZIP/XML，
+    # 避免额外引入图片库；RTF 使用纯 Python 的 striprtf。
     ".pptx": Format("pptx", "PowerPoint presentation"),
     ".odt": Format("odt", "OpenDocument text"),
     ".epub": Format("epub", "EPUB book"),
     ".rtf": Format("rtf", "Rich Text", "striprtf"),
-    # Tier A (RFC V3.1 §10.2): the standard library reads all of these.
+    # A 级格式由标准库处理，见 RFC V3.1 §10.2。
     ".csv": Format("csv", "CSV"),
     ".tsv": Format("csv", "TSV"),
     ".ipynb": Format("ipynb", "Jupyter notebook"),
@@ -134,12 +114,11 @@ FORMATS: dict[str, Format] = {
     },
 }
 
-#: Bounds on a table rendered into text, beyond which the file is refused by name rather than
-#: indexed in part (§10.2). A partial index would answer as if it had read the whole sheet.
+#: 表格文本超出上限就明确拒绝，不能仅索引部分内容却表现得像已读完整表格。
 MAX_TABLE_ROWS = 1_048_576
 MAX_TABLE_COLUMNS = 256
 MAX_TABLE_CELLS = 2_000_000
-#: A notebook cell's text output is kept up to this many characters, then marked as cut.
+#: 笔记本单元格的文本输出最多保留这么多字符，超出时明确标记截断。
 MAX_NOTEBOOK_OUTPUT_CHARS = 4096
 
 
@@ -148,11 +127,7 @@ def _extension(filename: str) -> str:
 
 
 def kind_for(filename: str) -> str:
-    """The document kind for a filename, or raises for an unsupported format.
-
-    Fail closed: the error names what IS supported instead of letting an odd file
-    through as "text", where its bytes would surface as a citation later.
-    """
+    """根据文件名确定文档类型，不支持时明确列出支持格式并拒绝。"""
     ext = _extension(filename)
     fmt = FORMATS.get(ext)
     if fmt is None:
@@ -167,11 +142,7 @@ def kind_for(filename: str) -> str:
 
 
 def check_archive(data: bytes) -> None:
-    """Refuse a ZIP-based document whose declared expansion is too large, before parsing.
-
-    Reads only the central directory. A member's declared size is what a parser would
-    allocate, so a bomb is refused on its own say-so, never by trying it.
-    """
+    """解析前读取 ZIP 中央目录，若声明展开大小超限则拒绝，不尝试实际解压验证。"""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             members = archive.infolist()
@@ -195,12 +166,9 @@ def check_archive(data: bytes) -> None:
 
 
 def extract(filename: str, data: bytes) -> Extraction:
-    """The canonical extraction of one document, or a `ValueError` naming why not.
+    """提取单文档标准表示，无法读取时用 ValueError 说明原因。
 
-    Any other exception a parser raises is turned into a `ValueError` here, so an
-    unreadable file is a refused upload (400) and never a server error (RFC B-5). A parser
-    that is missing from the build is named as such rather than reported as a bad file.
-    """
+    解析错误转换为上传拒绝而非服务端错误；构建缺少解析器时单独说明，不能归咎文件损坏。"""
     if len(data) > MAX_DOCUMENT_BYTES:
         raise ValueError(
             f"Document is {len(data)} bytes; the corpus accepts at most "
@@ -231,8 +199,7 @@ def extract(filename: str, data: bytes) -> Extraction:
         if kind == "ipynb":
             return _extract_notebook(data)
         if kind == "code":
-            # Exact source: what a citation quotes is the file as written. Only the BOM and
-            # Windows line endings go, as for every text format, so offsets are stable.
+            # 保留源码原文，仅去掉 BOM 并统一 Windows 换行，保持引用偏移稳定。
             text = data.decode("utf-8-sig", errors="replace").replace("\r\n", "\n")
             if not text.strip():
                 raise ValueError("Document contains no text.")
@@ -248,12 +215,12 @@ def extract(filename: str, data: bytes) -> Extraction:
             f"This build cannot read {FORMATS[_extension(filename)].label} files "
             f"(missing {exc.name or 'parser'})."
         ) from exc
-    except Exception as exc:  # noqa: BLE001 — every other parser failure is a refused file
+    except Exception as exc:  # noqa: BLE001 — 其他解析错误也应作为文件拒绝返回
         raise ValueError(f"Could not read this file: {type(exc).__name__}.") from exc
 
 
 def extract_document(filename: str, data: bytes) -> tuple[str, list[int], str]:
-    """`(text, page_starts, kind)` — the pre-3.1 shape of `extract`, kept for its callers."""
+    """保留 3.1 之前的返回结构 text、page_starts、kind，供既有调用方使用。"""
     result = extract(filename, data)
     return result.text, result.page_starts, result.kind
 
@@ -263,12 +230,11 @@ def _extract_pdf(data: bytes) -> tuple[str, list[int], str]:
 
     try:
         reader = PdfReader(io.BytesIO(data))
-    except Exception as exc:  # noqa: BLE001 — every parse failure means "not a PDF"
+    except Exception as exc:  # noqa: BLE001 — 解析失败表示无法作为 PDF 读取
         raise ValueError(f"Not a readable PDF: {exc}") from exc
 
     if reader.is_encrypted:
-        # A password prompt is not text we can locate quotes in. Refuse rather than
-        # silently trying an empty password.
+        # 加密 PDF 无法可靠定位引用，明确拒绝，不偷偷尝试空密码。
         raise ValueError("The PDF is encrypted. Remove the password before ingesting it.")
     if len(reader.pages) > MAX_PDF_PAGES:
         raise ValueError(
@@ -282,11 +248,11 @@ def _extract_pdf(data: bytes) -> tuple[str, list[int], str]:
     for page in reader.pages:
         try:
             page_text = page.extract_text() or ""
-        except Exception:  # noqa: BLE001 — one broken page must not sink the document
+        except Exception:  # noqa: BLE001 — 单页损坏不应使整份文档提取失败
             page_text = ""
         page_starts.append(offset)
         parts.append(page_text)
-        offset += len(page_text) + 1  # the "\n" join below
+        offset += len(page_text) + 1  # 为下方通过换行连接页文本预留位置。
 
     text = "\n".join(parts)
     if not text.strip():
@@ -295,28 +261,18 @@ def _extract_pdf(data: bytes) -> tuple[str, list[int], str]:
 
 
 def _extract_html(data: bytes) -> tuple[str, list[int], str]:
-    """Readable text from an HTML document, for indexing only.
+    """从 HTML 提取用于索引的可读正文。
 
-    The *original* bytes are stored alongside this and are what the preview renders —
-    in a sandboxed iframe, never in this origin. What goes into the index is the prose,
-    because a citation's whole promise is that a verbatim snippet can be located inside
-    the document, and a chunk of `<div class="col-md-6">` is text that means nothing.
-
-    `script` and `style` are dropped rather than merely untagged: their bodies are not
-    content, and indexing them would let an uploaded page inject arbitrary strings into a
-    corpus a model later quotes as evidence.
-
-    Same parser as `tools.read_webpage` (bs4 + lxml) so a page ingested as a file and the
-    same page fetched by the executor produce comparable text.
-    """
+    原件另存，预览在隔离 iframe 中展示；索引不保留无意义的标签。
+    script/style 连内容一起删除，避免代码进入证据库。
+    与 read_webpage 共用 bs4、lxml 解析方式，让上传页面和在线读取结果可比较。"""
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(data, "lxml")
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
     text = soup.get_text("\n")
-    # Collapse the blank-line storm tag removal leaves behind; offsets stay the locator,
-    # so the only requirement is that this is deterministic.
+    # 压缩去标签后留下的连续空行；偏移以确定性的标准文本为准。
     lines = [line.strip() for line in text.replace("\r\n", "\n").split("\n")]
     text = "\n".join(line for line in lines if line)
     if not text.strip():
@@ -325,14 +281,9 @@ def _extract_html(data: bytes) -> tuple[str, list[int], str]:
 
 
 def _extract_table(data: bytes, *, delimiter: str | None) -> Extraction:
-    """A CSV or TSV as one line per data row, each carrying its own header (§10.2).
+    """CSV/TSV 每数据行生成一行带表头的文本，见 §10.2。
 
-    `Row N — Header: value; Header: value`. The header is written into every row because a
-    quoted row must be readable on its own, and verbatim matching survives only if the
-    header is part of the text that is quoted. N is the row number a spreadsheet shows —
-    the header is row 1 — so "row 14" in a citation is row 14 in the user's own program.
-    Empty cells are left out rather than rendered as "Header: ".
-    """
+    每行重复表头，使单独引用仍有意义；行号采用表格本身编号，表头为第 1 行，空单元格省略。"""
     import csv
 
     raw = data.decode("utf-8-sig", errors="replace").replace("\r\n", "\n")
@@ -375,12 +326,9 @@ def _extract_table(data: bytes, *, delimiter: str | None) -> Extraction:
 
 
 def _extract_notebook(data: bytes) -> Extraction:
-    """A Jupyter notebook as its cells in order, each headed `## Cell N (markdown|code)`.
+    """按顺序输出 Jupyter 单元格，以单元格号和类型作标题。
 
-    Text outputs (`stream`, `text/plain`) follow their cell under `Output:`, cut at
-    `MAX_NOTEBOOK_OUTPUT_CHARS`; images and other rich outputs are left out and counted in
-    the cell's heading, so the text never claims to show what it cannot.
-    """
+    保留 stream、text/plain 输出并限制长度；图片等富输出省略但计数，避免暗示已读取。"""
     import json
 
     try:
@@ -431,9 +379,7 @@ def _extract_notebook(data: bytes) -> Extraction:
     return Extraction(text, [0], "ipynb", segments, LINEARIZED)
 
 
-#: An encrypted Office file is an OLE compound file, not a ZIP: password protection replaces
-#: the archive with an encrypted container. Recognised by its magic number and refused by
-#: name, rather than reported as a corrupt file.
+#: 加密 Office 文件可能是 OLE 而非 ZIP；通过文件头识别并明确报加密，不误报普通损坏。
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
@@ -446,14 +392,10 @@ def _refuse_encrypted_office(data: bytes) -> None:
 
 
 def _extract_docx(data: bytes) -> Extraction:
-    """A Word document's body in order: headings, paragraphs, tables (§10.2).
+    """按顺序提取 Word 标题、段落和表格。
 
-    Headings are prefixed `#` by level, so the text keeps the document's outline. Paragraph
-    text is every `w:t` in the paragraph, inserted runs included and deleted text
-    (`w:delText`) excluded — the accepted-changes view, which is what a reader of the
-    finished document sees. Tables become `Row N — Header: value; …` like a CSV. Footnotes,
-    comments, headers and footers are not read (a known limit, stated in the docs).
-    """
+    标题保留层级；读取接受修订后的文字，排除删除内容；表格按带表头的行输出。
+    不读取脚注、批注、页眉和页脚，该限制已在文档披露。"""
     _refuse_encrypted_office(data)
     check_archive(data)
     import docx
@@ -518,7 +460,7 @@ def _extract_docx(data: bytes) -> Extraction:
 
 
 def _cell(value) -> str:
-    """One spreadsheet value as text: integers without `.0`, dates as ISO, the rest as is."""
+    """把单元格值转成文本：整数去 .0，日期用 ISO，其余保持原表示。"""
     import datetime as _dt
 
     if value is None:
@@ -533,15 +475,10 @@ def _cell(value) -> str:
 
 
 def _extract_spreadsheet(data: bytes, ext: str) -> Extraction:
-    """Every sheet in workbook order: `## Sheet: <name>`, then its rows like a CSV (§10.2).
+    """按工作簿顺序提取工作表与数据行，见 §10.2。
 
-    Cached values only — formulas are not indexed, so a citation quotes the number a reader
-    of the workbook sees. Hidden sheets are read and marked `(hidden)`: leaving them out
-    could hide evidence, and the mark tells the reader it was not on screen. Merged cells
-    take their top-left value, which is what calamine reports. Row numbers are the sheet's
-    own, so "row 14" in a citation is row 14 in the spreadsheet program.
-    """
-    if ext != ".xls":  # .xls is an OLE file by design; the others are ZIP archives
+    仅读缓存值，不索引公式；隐藏表仍读取并标记隐藏。合并单元格使用左上角值；行号与表格软件一致。"""
+    if ext != ".xls":  # .xls 本来就是 OLE，其余这些格式为 ZIP。
         _refuse_encrypted_office(data)
         check_archive(data)
     from python_calamine import CalamineWorkbook
@@ -596,7 +533,7 @@ def _extract_spreadsheet(data: bytes, ext: str) -> Extraction:
 
 
 def _xml(archive: zipfile.ZipFile, name: str):
-    """One XML part of an archive, parsed with entity resolution and network access off."""
+    """解析压缩包内单个 XML 部件，关闭实体解析和网络访问。"""
     from lxml import etree
 
     parser = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
@@ -610,7 +547,7 @@ _PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 
 def _rels(archive: zipfile.ZipFile, part: str) -> dict[str, str]:
-    """Relationship id → target path for one part of an OOXML package."""
+    """读取 OOXML 部件的关系 ID 到目标路径映射。"""
     folder, _, name = part.rpartition("/")
     rels_name = f"{folder}/_rels/{name}.rels"
     if rels_name not in archive.namelist():
@@ -627,7 +564,7 @@ def _rels(archive: zipfile.ZipFile, part: str) -> dict[str, str]:
 
 
 def _paragraphs(element) -> list[str]:
-    """The text of each DrawingML paragraph under `element`, in order."""
+    """按顺序提取 element 下每个 DrawingML 段落。"""
     out = []
     for para in element.iter(f"{_A}p"):
         text = "".join(t.text or "" for t in para.iter(f"{_A}t")).strip()
@@ -637,12 +574,9 @@ def _paragraphs(element) -> list[str]:
 
 
 def _extract_pptx(data: bytes) -> Extraction:
-    """Slides in presentation order: `## Slide N: <title>`, then its text, then `Notes:`.
+    """按演示文稿定义的顺序输出幻灯片标题、正文与备注。
 
-    Order comes from the presentation's own slide list, not from file names — `slide10.xml`
-    sorts before `slide2.xml`, and slides can be reordered without being renamed. Text frames
-    are read in shape order; tables become `Row N — Header: value` lines.
-    """
+    不按文件名排序，否则 slide10 会排在 slide2 前；文本按形状顺序，表格按带表头的行输出。"""
     _refuse_encrypted_office(data)
     check_archive(data)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -714,7 +648,7 @@ _ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
 
 
 def _extract_odt(data: bytes) -> Extraction:
-    """An OpenDocument text file's body in order: headings, paragraphs, tables (as rows)."""
+    """按顺序提取 OpenDocument 文本的标题、段落和表格行。"""
     check_archive(data)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         if "content.xml" not in archive.namelist():
@@ -757,7 +691,7 @@ def _extract_odt(data: bytes) -> Extraction:
                         add(f"Row {n} — " + "; ".join(cells), f"table {tables} row {n}")
             continue
         if any(a.tag == f"{_ODF_TABLE}table-cell" for a in block.iterancestors()):
-            continue  # read with its table
+            continue  # 随所属表格一起读取。
         text = text_of(block)
         if not text:
             continue
@@ -774,7 +708,7 @@ def _extract_odt(data: bytes) -> Extraction:
 
 
 def _extract_epub(data: bytes) -> Extraction:
-    """An EPUB's chapters in reading (spine) order, each through the HTML extractor."""
+    """按 EPUB 的 spine 阅读顺序提取章节，正文使用 HTML 提取器。"""
     check_archive(data)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         names = set(archive.namelist())
@@ -804,7 +738,7 @@ def _extract_epub(data: bytes) -> Extraction:
             try:
                 chapter, _, _ = _extract_html(archive.read(href))
             except ValueError:
-                continue  # a chapter with no text (a cover image) contributes nothing
+                continue  # 没有文本的章节（如纯图片封面）不贡献正文。
             first = chapter.split("\n", 1)[0][:80]
             segments.append((offset, f"chapter {number}: {first}"))
             parts.append(chapter)
@@ -816,7 +750,7 @@ def _extract_epub(data: bytes) -> Extraction:
 
 
 def _extract_rtf(data: bytes) -> Extraction:
-    """Rich Text with its control words stripped. Linearized: the formatting is gone."""
+    """去掉 RTF 控制字提取文字；格式已丢失，因此标记为结构转写文本。"""
     from striprtf.striprtf import rtf_to_text
 
     raw = data.decode("latin-1")

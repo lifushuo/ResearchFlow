@@ -43,8 +43,8 @@ KEY_ENV = (
 
 @pytest.fixture
 def no_keys(monkeypatch):
-    """No key anywhere this host looks: environment, `.env`, keychain."""
-    for name in KEY_ENV:
+    """No keys or custom endpoint in environment, `.env` or keychain."""
+    for name in (*KEY_ENV, "CUSTOM_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(sc, "load_env_file", lambda *a, **kw: False)
     monkeypatch.setattr(sc, "stored_keys", dict)

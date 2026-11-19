@@ -42,15 +42,15 @@ describe("CorpusPage upload queue", () => {
     const input = container.querySelector<HTMLInputElement>("input[webkitdirectory]")!;
     fireEvent.change(input, { target: { files: folderOf(["a.txt", "b.txt", "c.txt"]) } });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Stop uploading" }));
-    expect(screen.getByRole("button", { name: "Stopping after this file…" })).toBeDisabled();
+    fireEvent.click(await screen.findByRole("button", { name: "停止上传" }));
+    expect(screen.getByRole("button", { name: "当前文件完成后停止…" })).toBeDisabled();
 
     await act(async () => release());
 
     expect(mutateAsync).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("Upload queue (1/3 completed)")).toBeInTheDocument();
-    const stopped = screen.getAllByTitle("stopped before upload");
+    expect(screen.getByText("上传队列（已完成 1/3）")).toBeInTheDocument();
+    const stopped = screen.getAllByTitle("已停止，未上传");
     expect(stopped).toHaveLength(2);
-    expect(screen.getByRole("button", { name: "Clear queue" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "清空队列" })).toBeInTheDocument();
   });
 });

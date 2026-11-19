@@ -1,75 +1,52 @@
-"""
-Model catalog (docs/13 §6, docs/12 M8).
+"""模型目录，见 docs/13 §6、docs/12 M8。
 
-Replaces the flat `PRICE_TABLE` + `_ANTHROPIC_NO_SAMPLING` tuple that used to live in
-`llm_factory`. One entry per model, carrying everything three different consumers need:
+每项集中描述价格、采样参数支持、工具调用、结构化输出、显示名和上下文窗口，
+供费用核算、请求构造和界面共用。新增模型通常只需增加目录项。
 
-- **cost accounting** — price per 1M input/output tokens,
-- **request construction** — whether the model accepts sampling parameters, whether it
-  supports tool calling and structured output,
-- **the UI** — display name and context window for the per-role model picker.
-
-Adding a model should be a catalog entry and nothing else. That is the test: if enabling a
-model requires editing `llm_factory`, this file is missing a field.
-
-## Prices are never estimated
-
-`input_per_mtok` / `output_per_mtok` of `None` means "this deployment must supply the
-price", not "free". `llm_factory.validate_pricing()` refuses to boot on a routed model with
-no price, which is deliberate: a wrong price silently corrupts the budget guard, and the
-budget guard is what stops a runaway session from draining a user's key.
-
-Anthropic figures below are first-party list prices, verified against the Anthropic API
-reference. Google figures carry over from the previous price table. OpenAI and OpenRouter
-are intentionally unpriced — fill them from the provider's own pricing page for your
-deployment. Ollama is genuinely zero: inference runs on the user's own hardware.
-"""
+价格为 None 表示部署者尚需提供价格，不能理解为免费。
+validate_pricing 会拒绝缺少必需价格的路由，防止费用预算静默失真。
+Anthropic 价格来自其公开资料；Google 沿用原表；OpenAI/OpenRouter 由部署方补充。
+Ollama 的远程 API 费用为零，推理运行在用户自己的硬件上。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Agent roles, re-exported for convenience alongside the presets below.
+# 集中导出角色名称，便于与下方预设共同使用。
 from research_engine.runconfig import ROLES  # noqa: F401
 
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """One routable model."""
+    """一个可通过路由选择的模型。"""
 
     provider: str
     model_id: str
     display_name: str
 
-    # Pricing, $ per 1M tokens. None = this deployment must supply it (see module docstring).
+    # 价格单位为美元/百万 Token；None 表示部署者尚未提供价格。
     input_per_mtok: float | None
     output_per_mtok: float | None
 
-    # None where the provider's published limit could not be verified — the UI shows
-    # "unknown" rather than a number nobody checked.
+    # 无法核实供应商上限时保持 None，界面显示未知，不能填写猜测值。
     context_window: int | None = None
     max_output_tokens: int | None = None
 
     supports_tools: bool = True
     supports_structured_output: bool = True
 
-    # False when the provider rejects temperature/top_p/top_k. The factory omits them
-    # rather than taking a 400.
+    # 供应商不接受 temperature/top_p/top_k 时设为 False，工厂会省略这些参数以免请求被拒绝。
     sampling_params_supported: bool = True
 
-    # ISO date this entry was last checked against the provider's own published model list
-    # and price sheet. This catalog is hand-maintained, and a hand-maintained copy of a
-    # fast-moving external fact has exactly one failure mode: it rots silently. Nothing
-    # expires automatically — an unverified entry still routes and still runs — but
-    # `stale_entries()` can report what has not been looked at recently, so "is this
-    # current?" has an answer other than reading the file and guessing.
+    # 记录最近核对供应商模型及价格的 ISO 日期。条目不会自动失效，
+    # stale_entries 只提示哪些内容需要重新核实，避免人工目录静默过期。
     verified_on: str | None = None
 
     notes: str = ""
 
     @property
     def route(self) -> str:
-        """The "provider:model" string used in MODEL_* routing and RunConfig."""
+        """返回 MODEL_* 和 RunConfig 使用的 provider:model 路由字符串。"""
         return f"{self.provider}:{self.model_id}"
 
     @property
@@ -83,14 +60,10 @@ def _spec(*args, **kwargs) -> ModelSpec:
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────────
 #
-# Sampling: Opus 4.7 and later, plus Sonnet 5 and Fable 5, reject temperature/top_p/top_k.
-# Opus 4.6, Sonnet 4.6, and Haiku 4.5 still accept them. Sonnet 5 rejects only *non-default*
-# values — treated the same here, since omitting the parameter is always valid and the
-# alternative is encoding a per-parameter default table for no behavioural gain.
+# 部分较新 Anthropic 模型拒绝采样参数；Sonnet 5 对非默认值有限制。
+# 统一省略不支持的参数，避免维护逐参数默认值表。旧模型仍按目录声明处理。
 #
-# `claude-opus-5` was missing from both the old price table and the old no-sampling tuple,
-# so routing any role to it failed twice over: `validate_pricing()` refused to boot, and had
-# it booted, every request would have sent a temperature and taken a 400 (docs/12 M8).
+# claude-opus-5 曾同时遗漏价格和采样能力声明，导致启动或请求失败，见 docs/12 M8。
 
 _ANTHROPIC = [
     _spec(
@@ -138,8 +111,7 @@ _ANTHROPIC = [
         "anthropic",
         "claude-sonnet-5",
         "Claude Sonnet 5",
-        # Standard list price. An introductory $2/$10 runs through 2026-08-31; the higher
-        # standard rate is kept deliberately so the budget guard never under-estimates.
+        # 采用标准价格而非截至 2026-08-31 的促销价，避免预算低估。
         input_per_mtok=3.00,
         output_per_mtok=15.00,
         context_window=1_000_000,
@@ -196,7 +168,7 @@ _GOOGLE = [
         input_per_mtok=0.075,
         output_per_mtok=0.30,
     ),
-    # Legacy, kept priced so an older MODEL_* config still boots.
+    # 保留旧模型价格，保证已有 MODEL_* 配置仍可启动。
     _spec(
         "google",
         "gemini-1.5-pro",
@@ -213,40 +185,23 @@ _GOOGLE = [
     ),
 ]
 
-# ── Ollama (local) ────────────────────────────────────────────────────────────────
+# ── Ollama 本地模型 ──
 #
-# No chat models are cataloged. The three that were here (llama3.3 70B, qwen2.5 7B,
-# mistral-nemo 12B) were removed: the 70B model exceeds consumer-laptop VRAM, and both
-# smaller ones fall below _MIN_RESEARCH_PARAMS_B in `local_llm.py`, so the pipeline's
-# own quality floor rejected them. Ollama stays in KNOWN_PROVIDERS — its embedding models
-# (`nomic-embed-text`) power corpus retrieval, and dynamic routing via `ollama:<tag>`
-# still works for any tag the user pulls. The catalog just no longer pretends specific
-# local chat models are a supported tier.
+# 不再列出固定本地聊天模型：原模型或超出普通笔记本显存，或达不到本项目质量门槛。
+# 仍保留 Ollama 嵌入模型和 ollama:<tag> 动态路由，不把具体聊天模型冒称为受支持档位。
 
 CATALOG: dict[str, ModelSpec] = {spec.model_id: spec for spec in (*_ANTHROPIC, *_GOOGLE)}
 
-# Providers the factory can build a client for. OpenAI and OpenRouter are routable but
-# deliberately carry no catalog entries: their model lists change constantly and their
-# prices are not ours to guess. Route to them explicitly and register the model with
-# `register()` (below) so pricing is a conscious act. Ollama stays for embeddings and
-# dynamic routing even though no chat models are cataloged.
+# 工厂支持的供应商。OpenAI/OpenRouter 可路由，但模型和价格由部署方显式 register。
+# Ollama 虽无固定聊天条目，仍支持嵌入和动态路由。
 KNOWN_PROVIDERS = ("anthropic", "google", "openai", "openrouter", "ollama", "custom")
 
 
 def stale_entries(today: str, max_age_days: int = 120) -> list[tuple[str, str | None]]:
-    """Catalog entries not verified against their provider within `max_age_days`.
+    """列出超过 max_age_days 未核实的目录项，返回路由和上次核实日期。
 
-    Returns `(route, verified_on)` pairs, `verified_on` being None for entries that were
-    never dated at all. Purely advisory — this refuses nothing and expires nothing.
-
-    Model line-ups and prices change on the provider's schedule, not ours, so the only
-    honest thing a hand-maintained catalog can do is say when it was last checked.
-    Answering "are these current?" otherwise means diffing this file against six vendors'
-    pricing pages by hand, which is precisely the work nobody does.
-
-    `today` is passed in rather than read from the clock: the engine takes no ambient
-    dependencies, and a caller-supplied date keeps this testable.
-    """
+    日期缺失也会列出。这里只提示维护，不拒绝路由，也不让条目自动过期。
+    today 由调用方传入，避免引擎依赖外部时钟并便于测试。"""
     from datetime import date
 
     def parse(value: str) -> date:
@@ -262,7 +217,7 @@ def stale_entries(today: str, max_age_days: int = 120) -> list[tuple[str, str | 
         try:
             age = (now - parse(spec.verified_on)).days
         except ValueError, TypeError:
-            out.append((spec.route, spec.verified_on))  # unparseable is not verified
+            out.append((spec.route, spec.verified_on))  # 日期无法解析表示没有可靠核实日期。
             continue
         if age > max_age_days:
             out.append((spec.route, spec.verified_on))
@@ -270,11 +225,7 @@ def stale_entries(today: str, max_age_days: int = 120) -> list[tuple[str, str | 
 
 
 def register(spec: ModelSpec) -> None:
-    """Add or override a catalog entry at runtime.
-
-    The escape hatch for a model this file doesn't ship — a new release, a fine-tune, or
-    an OpenRouter/OpenAI route whose price the operator knows and we don't.
-    """
+    """运行时新增或覆盖目录项，供新模型、微调模型或部署方自行定价的路由使用。"""
     CATALOG[spec.model_id] = spec
 
 
@@ -290,16 +241,12 @@ def providers() -> list[str]:
     return sorted({s.provider for s in CATALOG.values()})
 
 
-# ── Presets ───────────────────────────────────────────────────────────────────────
+# ── 角色路由预设 ──
 #
-# Role specialization is a *quality* argument, not just a flexibility toggle: the executor
-# runs many tool-calling rounds and wants breadth and speed, while the synthesizer writes
-# the artifact the user reads and wants the strongest model. Presets encode that, so the
-# common case is one click and the per-role drawer stays for people who want it.
+# 按角色选择模型也影响质量：执行器需要多轮工具调用的速度与覆盖面，
+# 综合器负责最终正文，更重视写作能力。预设简化常用配置，仍允许逐角色调整。
 #
-# Ollama presets were removed alongside its catalog entries: with no cataloged local chat
-# model that clears the pipeline's quality floor, a preset would route to models the UI
-# itself warns are underpowered.
+# 没有通过质量门槛的固定本地聊天模型，因此不提供会误导用户的 Ollama 聊天预设。
 
 PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "anthropic": {
@@ -336,5 +283,5 @@ PRESET_NAMES = ("fast", "balanced", "best")
 
 
 def preset(provider: str, name: str) -> dict[str, str] | None:
-    """Role → route mapping for a named preset, or None if the pair is unknown."""
+    """返回命名预设的角色到路由映射；未知组合返回 None。"""
     return (PRESETS.get(provider) or {}).get(name)

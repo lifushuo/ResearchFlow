@@ -1,0 +1,4 @@
+# Shell 脚本保留 Unix 换行，避免 Windows 检出后在 Linux 中无法执行。
+*.sh text eol=lf
+# 升级夹具是旧版本原始字节证据，禁止 Git 自动转换换行后破坏清单哈希。
+backend/tests/fixtures/upgrade/** -text

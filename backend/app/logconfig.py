@@ -1,22 +1,7 @@
-"""
-Structured logging configuration for both the API and the Celery worker.
+"""API 与 Celery 共用的结构化日志配置。
 
-structlog is imported across the app and the research engine, but nothing ever
-configured it, so every `get_logger()` fell back to default formatting with no shared
-context. This module installs one configuration for both processes and provides the
-helpers that bind a unit of work's correlation identity into contextvars, so every log
-between the API trigger, the Celery task, and the research engine carries the same
-`correlation_id` — letting a failed run be joined end to end across the async boundary.
-
-**Three keys, and they do not mean the same thing.** `correlation_id` is the join key and
-always equals whichever unit of work this context is about. `session_id` is a `sessions.id`
-and `run_id` is a `research_runs.id` — the two pipelines this backend carries, one of which
-is the product. There is one binder each, because a single binder that wrote `session_id`
-whatever it was handed is exactly how run ids came to be logged as sessions.
-
-Whichever id is bound already exists on both sides of the API → Celery hop, so no new
-identifier is threaded through task arguments to make correlation work.
-"""
+把工作单元身份绑定到 contextvars，让请求、后台任务和引擎日志通过同一 correlation_id 串联。
+correlation_id 是关联键；session_id 只能指 sessions.id，run_id 只能指 research_runs.id。分别提供绑定函数，避免把运行冒记为会话。已有 ID 可跨任务传递，无需新造关联标识。"""
 
 from __future__ import annotations
 
@@ -24,13 +9,9 @@ import structlog
 
 
 def configure_logging(*, json_output: bool) -> None:
-    """Install the process-wide structlog configuration. Idempotent.
+    """安装进程共用日志配置，重复调用结果一致。
 
-    `merge_contextvars` is the point of this module: context bound at a boundary
-    (API trigger, Celery task entry) rides along every log emitted in that context,
-    including the engine on the worker loop (`app.workers.event_loop.run`, which hands each
-    task a fresh copy of the caller's context).
-    """
+    merge_contextvars 将入口绑定的身份自动加入后续日志；Worker 为每个任务复制独立上下文，避免串用。"""
     renderer = (
         structlog.processors.JSONRenderer() if json_output else structlog.dev.ConsoleRenderer()
     )
@@ -48,28 +29,21 @@ def configure_logging(*, json_output: bool) -> None:
 
 
 def bind_session_context(session_id: str, **extra) -> None:
-    """Bind a session's correlation identity to the current context.
+    """绑定会话日志身份；在请求触发点和 Celery 入口调用。
 
-    Call at the API trigger point and at Celery task entry; all logs in that context then
-    carry `correlation_id` (= session_id) without every call site passing it.
-    """
+    后续日志自动携带等于 session_id 的 correlation_id，无需层层传参。"""
     structlog.contextvars.bind_contextvars(
         correlation_id=session_id, session_id=session_id, **extra
     )
 
 
 def bind_research_run_context(run_id: str, **extra) -> None:
-    """Bind a research run's correlation identity to the current context.
+    """绑定研究运行日志身份，字段必须是 run_id，不能写成 session_id。
 
-    `run_id`, never `session_id`. This function exists because the session binder was
-    called with run ids for the whole life of the run surface, so every server-side run log
-    named a `sessions.id` that did not exist — which is unreadable if you are joining logs
-    and actively misleading if you are reading one.
-    """
+    否则日志会声称运行属于一个不存在的会话，既无法关联又会误导排查。"""
     structlog.contextvars.bind_contextvars(correlation_id=run_id, run_id=run_id, **extra)
 
 
 def clear_run_context() -> None:
-    """Drop all bound context — call at Celery task entry so long-lived worker
-    processes never leak one run's identity into the next task's logs."""
+    """清空绑定上下文；Celery 每个任务开始时调用，避免长生命周期进程沿用上一个任务的日志身份。"""
     structlog.contextvars.clear_contextvars()

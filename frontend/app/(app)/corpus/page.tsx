@@ -120,19 +120,19 @@ function extensionOf(name: string): string {
  *  and the embedding endpoint's. */
 function rejectionReason(file: File): string | null {
   if (!ACCEPTED.includes(extensionOf(file.name))) {
-    return `unsupported type — ${ACCEPTED.join(", ")} only`;
+    return `不支持此格式；支持：${ACCEPTED.join("、")}`;
   }
-  if (file.size > MAX_BYTES) return `too large — ${formatBytes(MAX_BYTES)} max`;
-  if (file.size === 0) return "empty file";
+  if (file.size > MAX_BYTES) return `文件过大；最大 ${formatBytes(MAX_BYTES)}`;
+  if (file.size === 0) return "文件为空";
   return null;
 }
 
 const STATE_STYLE: Record<Outcome, { label: string; token: string }> = {
-  queued: { label: "queued", token: "text-muted" },
-  uploading: { label: "uploading", token: "info" },
-  done: { label: "added", token: "success" },
-  skipped: { label: "skipped", token: "warning" },
-  failed: { label: "failed", token: "danger" },
+  queued: { label: "等待上传", token: "text-muted" },
+  uploading: { label: "上传中", token: "info" },
+  done: { label: "已添加", token: "success" },
+  skipped: { label: "已跳过", token: "warning" },
+  failed: { label: "失败", token: "danger" },
 };
 
 function QueueRow({ item }: { item: QueueItem }) {
@@ -185,8 +185,8 @@ export default function CorpusPage() {
   if (!activeId) {
     return (
       <EmptyState
-        title="No active project"
-        description="Select or create a project to manage its corpus."
+        title="尚未选择项目"
+        description="请先选择或创建项目，再管理其语料库。"
       />
     );
   }
@@ -219,7 +219,7 @@ export default function CorpusPage() {
         stopped += 1;
         setQueue((q) =>
           q.map((x) =>
-            x.key === item.key ? { ...x, state: "skipped", detail: "stopped before upload" } : x,
+            x.key === item.key ? { ...x, state: "skipped", detail: "已停止，未上传" } : x,
           ),
         );
         continue;
@@ -235,7 +235,7 @@ export default function CorpusPage() {
         setQueue((q) => q.map((x) => (x.key === item.key ? { ...x, state: "done" } : x)));
       } catch (err) {
         failed += 1;
-        const detail = err instanceof ApiError ? err.message : "upload failed";
+        const detail = err instanceof ApiError ? err.message : "上传失败";
         // One bad file must not abandon the rest of a folder — record it and continue.
         setQueue((q) => q.map((x) => (x.key === item.key ? { ...x, state: "failed", detail } : x)));
       }
@@ -245,15 +245,15 @@ export default function CorpusPage() {
     setStopping(false);
     refetchStatus();
     const skipped = items.filter((i) => i.state === "skipped").length;
-    if (added) toast.success(`Added ${added} document${added === 1 ? "" : "s"}`);
+    if (added) toast.success(`已添加 ${added} 份文档`);
     if (failed || skipped) {
       toast.error(
-        [failed ? `${failed} failed` : "", skipped ? `${skipped} skipped` : ""]
+        [failed ? `${failed} 份失败` : "", skipped ? `${skipped} 份已跳过` : ""]
           .filter(Boolean)
           .join(", "),
       );
     }
-    if (stopped) toast(`Stopped: ${stopped} not uploaded`);
+    if (stopped) toast(`已停止：${stopped} 份未上传`);
   };
 
   const fromInput = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -277,13 +277,13 @@ export default function CorpusPage() {
   };
 
   const handleDelete = async (docId: string, filename: string) => {
-    if (!confirm(`Delete ${filename}?`)) return;
+    if (!confirm(`确定删除“${filename}”吗？`)) return;
     try {
       await del.mutateAsync({ projectId: activeId, docId });
-      toast.success(`Deleted ${filename}`);
+      toast.success(`已删除“${filename}”`);
       refetchStatus();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Delete failed.");
+      toast.error(err instanceof ApiError ? err.message : "删除失败。");
     }
   };
 
@@ -296,14 +296,13 @@ export default function CorpusPage() {
           id="corpus-management"
           className="mb-1 font-serif text-2xl font-bold tracking-tight text-text-primary"
         >
-          Corpus Management
+          语料库管理
         </h1>
         <p className="mb-6 max-w-2xl text-sm leading-relaxed text-text-muted">
-          Upload documents to restrict research to a local corpus. Scoped to{" "}
-          <strong className="font-semibold text-text-primary">{active?.name}</strong>. Approved
-          reports in this project are automatically saved here too and marked{" "}
-          <span className="border border-border bg-bg-elevated px-1.5 py-0.2 font-mono text-[0.6875rem] font-semibold uppercase tracking-wider text-text-secondary">Generated</span>{" "}
-          so they are never recycled as evidence for subsequent questions.
+          上传文档后，可将研究限定在本地语料库内。当前项目：
+          <strong className="font-semibold text-text-primary">{active?.name}</strong>。本项目已批准的报告也会自动归档于此，并标注为
+          <span className="border border-border bg-bg-elevated px-1.5 py-0.2 font-mono text-[0.6875rem] font-semibold uppercase tracking-wider text-text-secondary">自动生成</span>，
+          不会被循环用作后续问题的研究证据。
         </p>
 
         {/* 1. Drag & Drop Upload Zone */}
@@ -326,7 +325,7 @@ export default function CorpusPage() {
             📄
           </div>
           <p className="mt-3 text-sm font-semibold text-text-primary">
-            Drag & drop files or folders here to ingest
+            将文件或文件夹拖到这里上传
           </p>
           <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5 font-mono text-[length:var(--text-micro)] text-text-muted">
             {ACCEPTED.map((ext) => (
@@ -334,7 +333,7 @@ export default function CorpusPage() {
                 {ext}
               </span>
             ))}
-            <span className="ml-1 text-text-muted">· up to {formatBytes(MAX_BYTES)} each</span>
+            <span className="ml-1 text-text-muted">· 单个文件最大 {formatBytes(MAX_BYTES)}</span>
           </div>
 
           <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
@@ -345,7 +344,7 @@ export default function CorpusPage() {
               onClick={() => fileInput.current?.click()}
             >
               {busy && <span className="spinner" />}
-              Choose files
+              选择文件
             </button>
             <button
               type="button"
@@ -353,7 +352,7 @@ export default function CorpusPage() {
               disabled={busy}
               onClick={() => folderInput.current?.click()}
             >
-              Choose folder
+              选择文件夹
             </button>
           </div>
 
@@ -388,7 +387,7 @@ export default function CorpusPage() {
           <div className="mb-8 border border-border bg-bg-surface shadow-xs">
             <div className="flex items-center justify-between border-b border-border bg-bg-elevated/40 px-3.5 py-2.5">
               <span className="font-mono text-xs font-semibold uppercase tracking-wider text-text-secondary">
-                Upload queue ({doneCount}/{queue.length} completed)
+                上传队列（已完成 {doneCount}/{queue.length}）
               </span>
               {busy && (
                 <button
@@ -400,7 +399,7 @@ export default function CorpusPage() {
                   }}
                   className="font-mono text-xs text-text-muted transition-colors hover:text-text-primary disabled:opacity-60"
                 >
-                  {stopping ? "Stopping after this file…" : "Stop uploading"}
+                  {stopping ? "当前文件完成后停止…" : "停止上传"}
                 </button>
               )}
               {!busy && (
@@ -409,7 +408,7 @@ export default function CorpusPage() {
                   onClick={() => setQueue([])}
                   className="font-mono text-xs text-text-muted transition-colors hover:text-text-primary"
                 >
-                  Clear queue
+                  清空队列
                 </button>
               )}
             </div>
@@ -436,11 +435,11 @@ export default function CorpusPage() {
           <div className="space-y-4 lg:col-span-2">
             <div className="flex items-baseline justify-between gap-2">
               <h2 className="font-serif text-lg font-bold tracking-tight text-text-primary">
-                Documents
+                文档列表
               </h2>
               {docs && docs.length > 0 && (
                 <span className="border border-border bg-bg-elevated px-2 py-0.5 font-mono text-xs text-text-muted">
-                  {docs.length} {docs.length === 1 ? "document" : "documents"}
+                  {docs.length} 份文档
                 </span>
               )}
             </div>
@@ -467,9 +466,9 @@ export default function CorpusPage() {
                           {doc.origin === "generated" && <GeneratedBadge className="shrink-0" />}
                         </div>
                         <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-xs text-text-muted">
-                          <span>{doc.chunks} chunks</span>
+                          <span>{doc.chunks} 个片段</span>
                           {size && <span>· {size}</span>}
-                          {doc.created_at && <span>· {new Date(doc.created_at).toLocaleDateString()}</span>}
+                          {doc.created_at && <span>· {new Date(doc.created_at).toLocaleDateString("zh-CN")}</span>}
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5">
@@ -479,14 +478,14 @@ export default function CorpusPage() {
                             onClick={() => setPreview({ id: doc.id, filename: doc.filename })}
                             className="btn btn-secondary px-2.5 py-1 font-mono text-xs font-medium text-accent hover:border-accent"
                           >
-                            Preview
+                            预览
                           </button>
                         ) : (
                           <span
                             className="px-2 py-0.5 font-mono text-xs text-text-muted"
-                            title="Added before original files were kept — its text is still searchable."
+                            title="此文档上传时尚未保留原文件，已提取的文本仍可检索。"
                           >
-                            text only
+                            仅存文本
                           </span>
                         )}
                         <button
@@ -494,7 +493,7 @@ export default function CorpusPage() {
                           disabled={del.isPending}
                           className="px-2 py-1 font-mono text-xs font-medium text-text-muted transition-colors hover:text-danger"
                         >
-                          Delete
+                          删除
                         </button>
                       </div>
                     </li>
@@ -503,9 +502,9 @@ export default function CorpusPage() {
               </ul>
             ) : (
               <div className="border border-dashed border-border bg-bg-surface p-10 text-center shadow-xs">
-                <p className="text-sm font-medium text-text-secondary">No documents uploaded yet</p>
+                <p className="text-sm font-medium text-text-secondary">尚未上传文档</p>
                 <p className="mt-1 text-xs text-text-muted">
-                  Drag files into the dropzone above or click &ldquo;Choose files&rdquo; to build your corpus.
+                  将文件拖到上方区域，或点击“选择文件”建立语料库。
                 </p>
               </div>
             )}
@@ -514,12 +513,12 @@ export default function CorpusPage() {
           {/* Right Sidebar: Corpus Stats & Privacy */}
           <div className="space-y-4">
             <h2 className="font-serif text-lg font-bold tracking-tight text-text-primary">
-              Corpus Stats
+              语料库统计
             </h2>
             <div className="card space-y-4 border border-border bg-bg-surface p-5 shadow-xs">
               <div className="border-b border-border/60 pb-3">
                 <div className="font-mono text-xs uppercase tracking-wider text-text-muted">
-                  Total Documents
+                  文档总数
                 </div>
                 <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-text-primary">
                   {status ? status.documents : "—"}
@@ -527,7 +526,7 @@ export default function CorpusPage() {
               </div>
               <div className="border-b border-border/60 pb-3">
                 <div className="font-mono text-xs uppercase tracking-wider text-text-muted">
-                  Total Chunks
+                  片段总数
                 </div>
                 <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-text-primary">
                   {status ? status.chunks : "—"}
@@ -535,20 +534,20 @@ export default function CorpusPage() {
               </div>
               <div>
                 <div className="font-mono text-xs uppercase tracking-wider text-text-muted">
-                  Embedding Model
+                  向量嵌入模型
                 </div>
                 <div className="mt-1.5 truncate border border-border bg-bg-elevated px-2 py-1 font-mono text-xs font-semibold text-accent">
-                  {status?.current_model || "None"}
+                  {status?.current_model || "未配置"}
                 </div>
               </div>
 
               <div className="border-t border-border/60 pt-3">
                 <div className="flex items-center gap-1.5 text-xs text-text-muted font-mono">
                   <span className="h-2 w-2 rounded-full bg-success" aria-hidden />
-                  Local Storage
+                  本地存储
                 </div>
                 <p className="mt-1 text-[length:var(--text-micro)] text-text-muted leading-relaxed">
-                  Documents are embedded and stored locally in this project&apos;s corpus database.
+                  文档经向量化后，存储在当前项目的本地语料库中。
                 </p>
               </div>
             </div>

@@ -3,15 +3,7 @@ import { describe, expect, it } from "vitest";
 import { V2_STATUS_META, RUN_STATUS_ORDER, runStatusMeta } from "./runStatus";
 import type { RunStatus } from "./types";
 
-/**
- * One vocabulary for a run's status, used by the badge, the header sentence, the History
- * filters and the run card.
- *
- * The session equivalent drifted exactly once — `AWAITING_PLAN` was added to the badge and not
- * to the filter list, so the run a user was most likely scanning for could be seen and not
- * filtered for. `Record<RunStatus, …>` makes the type checker catch the first half of
- * that; these tests catch the second.
- */
+/** 研究任务徽标、页头状态句、历史筛选及卡片共用一套状态定义。Record<RunStatus, …> 保证映射包含全部状态；测试进一步保证有序列表也同步包含，避免新增 AWAITING_PLAN 后只改徽标而漏掉筛选。 */
 
 const ALL: RunStatus[] = [
   "PENDING",
@@ -46,16 +38,16 @@ describe("Run status vocabulary", () => {
   });
 
   it("never claims a cancelled or failed run produced an artifact", () => {
-    expect(V2_STATUS_META.CANCELLED.sentence).not.toMatch(/artifact/i);
-    expect(V2_STATUS_META.FAILED.sentence).not.toMatch(/artifact/i);
-    expect(V2_STATUS_META.COMPLETED.sentence).toMatch(/artifact/i);
+    expect(V2_STATUS_META.CANCELLED.sentence).not.toMatch(/成果文件/);
+    expect(V2_STATUS_META.FAILED.sentence).not.toMatch(/成果文件/);
+    expect(V2_STATUS_META.COMPLETED.sentence).toMatch(/成果文件/);
   });
 
   it("survives a status it has not been taught, without inventing one", () => {
     const meta = runStatusMeta("SOMETHING_NEW");
     expect(meta.label).toBe("something new");
-    expect(meta.sentence).toMatch(/does not recognise/);
-    // The important half: it must not silently map onto a status the run is not in.
+    expect(meta.sentence).toMatch(/尚不认识/);
+    // 不能把未知状态静默映射成研究实际并未处于的状态。
     expect(meta.label).not.toBe(V2_STATUS_META.COMPLETED.label);
     expect(meta.needsYou).toBeUndefined();
   });

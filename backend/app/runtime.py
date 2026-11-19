@@ -1,13 +1,7 @@
-"""
-Host adapter: build the engine's RunConfig from server settings (docs/13 §4).
+"""服务端配置适配器：把部署设置转换成引擎 RunConfig（docs/13 §4）。
 
-`research_engine` deliberately does not import `app.config` — this module is the seam.
-Server-side processes (API, Celery worker, eval harness) install one process
-default at startup; the desktop host (docs/12 M9) will supply its own builder
-reading local JSON + the OS keychain, and `research_engine` will not know the difference.
-
-Keep this module thin: it maps settings fields to RunConfig fields and nothing else.
-"""
+引擎不导入 app.config。API 和 Celery 等服务端进程启动时安装基础配置；桌面端自行读取本地设置与系统密钥库。
+这里只映射字段，不混入业务流程，让引擎不必区分主机类型。"""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from research_engine.runconfig import RunConfig, set_process_default
 
 
 def run_config_from_settings(s: Settings | None = None) -> RunConfig:
-    """Map environment-derived settings onto the engine's config object."""
+    """将从环境读取的服务端设置映射到引擎配置对象。"""
     s = s or settings
     return RunConfig(
         llm_mode=s.llm_mode,
@@ -48,7 +42,7 @@ def run_config_from_settings(s: Settings | None = None) -> RunConfig:
 
 
 def install_process_default(s: Settings | None = None) -> RunConfig:
-    """Install the settings-derived config as this process's engine baseline."""
+    """把配置安装成本进程的引擎默认值。"""
     cfg = run_config_from_settings(s)
     set_process_default(cfg)
     return cfg

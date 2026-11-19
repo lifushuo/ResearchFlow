@@ -1,28 +1,12 @@
-"""
-Quantities in claims and snippets, compared under narrow, explicit rules.
+"""按明确且保守的规则比较 Claim 和片段中的数量，见 RFC V3.1 §9.3。
 
-internal/rfcs/V3.1-corpus-scope.md §9.3. The mechanical half of claim verification in a
-selected-files run: a number, date or percentage a claim states must be present in the
-snippets of the citations it carries, after normalisation. **Necessary, never sufficient** —
-a value can match and still be attached to the wrong subject, which only the model verdict
-can catch.
+数字、日期、百分比需在证据中出现；数值相同只是必要条件，主体是否正确仍由模型判断。
+歧义表示按原文比较，不能宽泛归一化后把编造数字误当有据。
 
-The rules are deliberately narrow. Every normalisation that could equate two different
-values is either excluded or confined to an unambiguous form; anything ambiguous is compared
-literally. A false "match" here would wave an invented figure past the one check no model
-opinion can override, so when in doubt this module says "not found".
-
-| Representation    | Rule                                                                     |
-|-------------------|--------------------------------------------------------------------------|
-| Thousands groups  | `1,000` = `1000` = `1 000`; a comma groups only before exactly 3 digits   |
-| Scale words       | k/thousand ×10³, M/million/mn ×10⁶, bn/billion ×10⁹ (short scale)        |
-| Percentages       | `12%` = `12 percent` = `12 per cent`; a ratio `0.12` is NOT `12%`        |
-| Units             | identity conversions within a dimension only; never across dimensions    |
-| Dates             | month names and ISO normalise; all-numeric `03/04/2021` stays literal    |
-| Rounding          | a claim may round a value half-up to its own precision, never add digits |
-| Calculations      | only when stated: each operand must match, and the arithmetic is redone; |
-|                   | a bare operand stands for a percentage only if that exact one is stated  |
-"""
+支持明确千位分隔、k/thousand、M/million/mn、bn/billion，采用短级差制。
+12% 与 12 percent 等价，但 0.12 不自动等价于 12%。
+单位仅在同量纲内换算；月份名和 ISO 日期可归一化，纯数字歧义日期保持原样。
+允许按 Claim 精度四舍五入，不允许增加精度。计算必须明确提出、操作数有据并由代码复算。"""
 
 from __future__ import annotations
 
@@ -53,8 +37,7 @@ _MONTHS = {
 }
 _MONTH_RE = "|".join(sorted(_MONTHS, key=len, reverse=True))
 
-#: Bare `m` and `b` are deliberately absent: `5 m` is five metres far more often than five
-#: million, and an equivalence that is usually wrong has no place in a check this strict.
+#: 不把裸 m、b 当作百万、十亿，避免把 5 m（米）误当 500 万。
 _SCALE = {
     "k": 3,
     "thousand": 3,
@@ -65,7 +48,7 @@ _SCALE = {
     "trillion": 12,
 }
 
-#: (dimension, factor to the dimension's base unit). Base units: m, g, s, l, byte, Wh.
+#: 量纲与到基本单位的倍数；基本单位为 m、g、s、l、byte、Wh。
 _UNITS = {
     "mm": ("length", Decimal("0.001")),
     "cm": ("length", Decimal("0.01")),
@@ -136,15 +119,11 @@ _UNIT_RE = "|".join(
 
 @dataclass(frozen=True)
 class Quantity:
-    """One value as stated: its exact decimal, its kind, and the precision it was given at.
+    """原文数量的十进制值、类型和精度。
 
-    `kind` is `number`, `percent`, `date`, or `unit:<dimension>`. `exponent` is the place of
-    the last significant digit (12.4 → -1, 12 → 0, 1,200 → 2) — rounding is judged against
-    it. `literal` holds a date's normalised text, or a four-digit number's own digits when
-    it may also be a year. `step` is set for a converted unit: the size of one unit of the
-    last stated digit, in the base unit — 6 hours is stated to 3,600 s, which no power of ten
-    expresses.
-    """
+    kind 区分数值、百分比、日期与单位；exponent 表示最后有效位的位置。
+    literal 保存日期或可能为年份的四位数文本；step 保存单位换算后的精度步长，
+    例如整小时精度为 3600 秒，不能用十的幂表示。"""
 
     value: Decimal | None
     kind: str
@@ -174,8 +153,7 @@ def _decimal(text: str) -> Decimal:
 
 
 def _exponent(text: str) -> int:
-    """The place of the last significant digit. Trailing zeros of an integer are not
-    significant — `2,300,000` states no more than `2.3 million` does."""
+    """返回最后有效数字的位数；整数末尾零不增加精度，2300000 与 2.3 million 等价。"""
     digits = text.replace(",", "").replace(" ", "")
     if "." in digits:
         return -len(digits.split(".", 1)[1])
@@ -183,7 +161,7 @@ def _exponent(text: str) -> int:
 
 
 def extract(text: str) -> list[Quantity]:
-    """Every quantity stated in `text`, dates first so their digits are not reread."""
+    """提取文本全部数量，先处理日期，避免把日期数字再次当作普通数字。"""
     found: list[Quantity] = []
     spans: list[tuple[int, int]] = []
 
@@ -222,7 +200,7 @@ def extract(text: str) -> list[Quantity]:
         num = m.group("num")
         try:
             value = _decimal(num)
-        except InvalidOperation:  # pragma: no cover — the regex admits only digits
+        except InvalidOperation:  # pragma: no cover — 正则已保证这里只包含数字
             continue
         exponent = _exponent(num)
         scale = (m.group("scale") or "").lower()
@@ -236,10 +214,8 @@ def extract(text: str) -> list[Quantity]:
         unit = (m.group("unit") or "").lower() or (m.group("cur") or "")
         if unit:
             dimension, factor = _UNITS[unit]
-            # Precision moves with the unit: 5 km is stated to the kilometre, i.e. to the
-            # thousand metres, so the converted value keeps that coarseness — as a step, since
-            # an hour is 3,600 s and rounding to a power of ten would reject "6 hours" against
-            # "6 hours".
+            # 精度随单位换算：5 km 的精度仍是千米，而非米。
+            # 用 step 保留此粗粒度，尤其小时等非十进制换算不能靠十的幂舍入。
             found.append(
                 Quantity(
                     value * factor,
@@ -249,25 +225,23 @@ def extract(text: str) -> list[Quantity]:
                 )
             )
             continue
-        # A bare four-digit integer in year range may be a year as well as a number: it
-        # keeps its value (so `2021` equals `2,021`) and carries itself as a literal, so a
-        # claim stating just the year is backed by a full date in that year.
+        # 年份范围的四位整数既保留数值，也保留日期文本身份，使完整日期可支持其中的年份断言。
         maybe_year = num if num.isdigit() and len(num) == 4 and 1500 <= int(num) <= 2199 else ""
         found.append(Quantity(value, "number", exponent, literal=maybe_year))
     return found
 
 
 def _rounds_to(claim: Quantity, snippet: Quantity) -> bool:
-    """Whether the claim's value is the snippet's, rounded half-up to the claim's precision."""
+    """检查证据值按 Claim 精度四舍五入后是否与其相同。"""
     if claim.value is None or snippet.value is None:
         return False
     if claim.step is not None and snippet.step is not None:
         if claim.step < snippet.step:
-            return False  # the claim is more precise than its evidence
+            return False  # Claim 比证据更精确。
         rounded = (snippet.value / claim.step).to_integral_value(ROUND_HALF_UP) * claim.step
         return rounded == claim.value
     if claim.exponent < snippet.exponent:
-        return False  # the claim is more precise than its evidence: a digit was invented
+        return False  # Claim 增加了证据没有提供的有效位。
     quantum = Decimal(1).scaleb(claim.exponent)
     try:
         rounded = snippet.value.quantize(quantum, rounding=ROUND_HALF_UP)
@@ -277,11 +251,11 @@ def _rounds_to(claim: Quantity, snippet: Quantity) -> bool:
 
 
 def matches(claim: Quantity, snippet: Quantity) -> bool:
-    """Whether one snippet quantity backs one claim quantity, under the rules above."""
+    """按上述规则判断一个证据数量是否支持一个 Claim 数量。"""
     if claim.kind == "date" or snippet.kind == "date":
         if claim.kind == "date" and snippet.kind == "date":
             return claim.literal == snippet.literal or (
-                # "March 2021" (YYYY-MM) is backed by any date in that month.
+                # 某年某月的断言可由该月任何完整日期支持。
                 len(claim.literal) == 7 and snippet.literal.startswith(claim.literal + "-")
             )
         if claim.kind == "number" and claim.literal and snippet.kind == "date":
@@ -293,11 +267,9 @@ def matches(claim: Quantity, snippet: Quantity) -> bool:
 
 
 def unsupported(claim_text: str, snippets: str) -> list[str]:
-    """The quantities `claim_text` states that no quantity in `snippets` backs.
+    """返回 Claim 中无法被任何证据数量支持的数值。
 
-    Empty means every stated quantity is present. A claim with no quantities is never
-    rejected here — whether its words are supported is the model verdict's question.
-    """
+    空列表表示数字全部有据；不含数字的 Claim 不在这里拒绝，其含义仍需模型判断。"""
     available = extract(snippets)
     missing: list[str] = []
     for quantity in extract(claim_text):
@@ -316,13 +288,10 @@ _OPS = {
 
 
 def _as_stated(operand: Quantity, available: list[Quantity]) -> Quantity | None:
-    """The operand as the snippets state it, or None when they do not.
+    """将计算操作数对应到片段中实际陈述的值，缺失时返回 None。
 
-    A verifier copying `31%` as `31` has not changed the figure, so a bare number stands
-    for a percentage — but only when the snippets state exactly that percentage and do not
-    state the bare number itself. Nothing else is lifted: a unit carries a scale, and
-    guessing it would equate values the table above keeps apart.
-    """
+    仅在片段明确有相同比例且无同值裸数字时，允许用 31 表示 31%；
+    不猜测单位或尺度。"""
     if any(matches(operand, s) for s in available):
         return operand
     if operand.kind == "number":
@@ -333,11 +302,7 @@ def _as_stated(operand: Quantity, available: list[Quantity]) -> Quantity | None:
 
 
 def calculation_holds(op: str, operands: list[str], result: str, snippets: str) -> bool:
-    """A stated calculation: each operand is in the snippets and the arithmetic is right.
-
-    `operands` and `result` are the values as the claim states them. The result is
-    recomputed here, to the result's own precision, rather than taken from the model.
-    """
+    """核对明确提出的计算：每个操作数必须在片段中，结果按声明精度重新计算，不采信模型口算。"""
     func = _OPS.get(op)
     if func is None or len(operands) != 2:
         return False
@@ -350,7 +315,7 @@ def calculation_holds(op: str, operands: list[str], result: str, snippets: str) 
     if a is None or b is None:
         return False
     if op in ("add", "subtract") and a.kind != b.kind:
-        return False  # 31% less 19 people is not 12 of anything
+        return False  # 31% 减去 19 人不是可解释的同类数值计算。
     if a.value is None or b.value is None or outcome[0].value is None:
         return False
     computed = func(a.value, b.value)

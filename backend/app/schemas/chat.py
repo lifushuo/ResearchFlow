@@ -1,9 +1,6 @@
-"""
-Project chat threads and memory status (docs/14 §8).
+"""项目聊天线程及记忆状态结构（docs/14 §8）。
 
-Separate from `schemas/research.py` because these describe conversation *about a
-project*, not about one research run — the distinction the whole milestone rests on.
-"""
+与 research.py 分开，因为这里讨论整个项目，不是单次研究。"""
 
 from datetime import datetime
 from uuid import UUID
@@ -16,8 +13,7 @@ from app.services.chat_scope import ChatScope
 class ThreadCreateRequest(BaseModel):
     model_config = {"str_strip_whitespace": True}
 
-    # Optional: a thread opened from the composer is titled from its first message
-    # instead, so the user never has to name a conversation before having it.
+    # 标题可选；未提供时从首条消息生成，不强迫用户开聊前先命名。
     title: str | None = Field(default=None, max_length=200)
 
 
@@ -38,12 +34,9 @@ class ThreadListResponse(BaseModel):
 
 
 class Citation(BaseModel):
-    """One [R{n}] marker, resolved to the approved report it came from.
+    """将 R 编号定位到获批报告。
 
-    `excerpt` is the retrieved chunk verbatim. Storing it is what makes a citation
-    checkable rather than decorative: the chip shows the user the exact text the claim
-    was drawn from, the same contract as the source snippets on a report (docs/27).
-    """
+    excerpt 保存检索原片段，用户可以核对结论依据，而不只是看到装饰性引用（docs/27）。"""
 
     marker: str
     session_id: UUID
@@ -67,10 +60,8 @@ class ThreadMessageRequest(BaseModel):
     model_config = {"str_strip_whitespace": True}
 
     message: str = Field(..., min_length=1, max_length=4000)
-    #: What this question may read (internal/07 Phase 5). Same vocabulary as
-    #: `research.ChatRequest.scope` — one word must mean one thing on both chat
-    #: surfaces, which is why both defer to `app/services/chat_scope.py`. "report"
-    #: here means this project's approved research, which is today's behaviour.
+    # 定义本轮允许读取的范围，和报告聊天使用同一套 scope 值及 chat_scope.py 解释。
+    # 此处 report 指项目内获批研究。
     scope: ChatScope = "report"
 
 
@@ -81,13 +72,9 @@ class MemoryModelBreakdown(BaseModel):
 
 
 class MemoryStatusResponse(BaseModel):
-    """Makes memory legible rather than magic (docs/14 §8).
+    """让记忆状态可见（docs/14 §8）。
 
-    `pending_reports` and `stale_models` exist so the two ways memory can quietly be
-    incomplete — an ingestion that failed, and chunks written by a model that is no
-    longer configured — are visible in the UI instead of being discovered as "chat can't
-    find my research".
-    """
+    pending_reports 披露摄取失败，stale_models 披露旧模型向量尚未重建，避免只能从聊天找不到内容才发现缺口。"""
 
     available: bool
     chunk_count: int

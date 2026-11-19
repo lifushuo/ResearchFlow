@@ -78,22 +78,22 @@ async function registerAndLogin(page: Page): Promise<string> {
  * project" — twice, for two different missing preconditions.
  */
 async function ensureActiveProject(page: Page): Promise<void> {
-  await page.getByRole("button", { name: /select project/i }).click();
+  await page.getByRole("button", { name: /选择项目/ }).click();
 
   const existing = page.getByRole("option");
   if ((await existing.count()) === 0) {
-    await page.getByRole("button", { name: "+ New" }).click();
+    await page.getByRole("button", { name: "+ 新建" }).click();
     // By label and by role, never by placeholder or by exact copy. This journey sat
     // broken on `getByPlaceholder("Project name...")` and `name: "Create"` after the
     // switcher was restyled, and nothing caught it: golden-e2e only runs once the backend
     // and frontend jobs are green, and they were not.
-    await page.getByLabel(/project name/i).fill("E2E Project");
-    await page.getByRole("button", { name: /create project/i }).click();
+    await page.getByLabel("项目名称").fill("E2E Project");
+    await page.getByRole("button", { name: "创建项目" }).click();
   } else {
     await existing.first().click();
   }
 
-  await expect(page.getByRole("listbox", { name: "Projects" })).toBeHidden();
+  await expect(page.getByRole("listbox", { name: "项目", exact: true })).toBeHidden();
 }
 
 test.describe("Golden journey 6 — corpus documents preview in place", () => {
@@ -112,17 +112,17 @@ test.describe("Golden journey 6 — corpus documents preview in place", () => {
 
     // The row appears once ingestion finishes, and offers a preview rather than a
     // download — the behaviour change this journey exists to pin.
-    const preview = page.getByRole("button", { name: "Preview" }).first();
+    const preview = page.getByRole("button", { name: "预览", exact: true }).first();
     await expect(preview).toBeVisible({ timeout: 120_000 });
     await preview.click();
 
-    const drawer = page.getByRole("dialog", { name: /Preview of grounding\.md/ });
+    const drawer = page.getByRole("dialog", { name: "预览：grounding.md", exact: true });
     await expect(drawer).toBeVisible();
     await expect(drawer.getByText("Recall improved by 12 points")).toBeVisible();
 
     // Escape closes it and the corpus list is still there — "in place" is the claim.
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
-    await expect(page.getByRole("button", { name: "Preview" }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "预览", exact: true }).first()).toBeVisible();
   });
 });

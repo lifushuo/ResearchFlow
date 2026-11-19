@@ -20,9 +20,11 @@ import argparse
 import asyncio
 import json
 import os
+import tempfile
 import time
+import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,10 +32,23 @@ from pathlib import Path
 from langgraph.checkpoint.memory import MemorySaver
 
 from evals import metrics
+from evals.agent_eval_ext import long_run
+from evals.agent_eval_ext.execution_observer import environment_secrets
+from evals.agent_eval_ext.judge_runtime import (
+    judge_trace_artifacts,
+    token_usage,
+    trace_judge_batch,
+    trace_judge_case,
+    trace_judge_restored_batch,
+    trace_judge_stage,
+    trace_judge_wait,
+)
+from evals.judge_config import judge_client_config, judge_provider_keys
+from evals.query_selection import select_queries
+from research_engine.eval_trace import eval_trace_run, trace_span, traced_ainvoke
 from research_engine.graph import build_graph
 from research_engine.local import load_env_file, run_config_from_env
 from research_engine.runconfig import (
-    get_run_config,
     reset_run_config,
     set_process_default,
     set_run_config,
@@ -66,6 +81,21 @@ MIN_CITATION_SUPPORT = 0.95
 MIN_COMPLETION_RATE = 0.90
 
 _ROLES = ("planner", "executor", "critic", "synthesizer", "chat")
+
+#: The judge's own prompt is part of the run's configuration fingerprint: a resumed run
+#: must not mix verdicts produced under a different instruction. Keep the text here, not
+#: inline in `judge_citation_support`, so there is one string to hash and one to edit.
+JUDGE_SYSTEM_PROMPT = (
+    "You judge whether claims are supported by their cited evidence. "
+    "For each numbered claim, respond with exactly one line: "
+    '"Claim N: YES" if the evidence supports the claim, or '
+    '"Claim N: NO" if it does not. Answer for every claim.'
+)
+JUDGE_HUMAN_PREFIX = (
+    "For each claim below, determine if it is supported by its cited evidence.\n"
+    'Answer with one line per claim in format: "Claim N: YES" or "Claim N: NO"\n\n'
+)
+JUDGE_PROMPT = JUDGE_SYSTEM_PROMPT + JUDGE_HUMAN_PREFIX
 
 
 # ── The judge (RG-5) ──────────────────────────────────────────────────────────────
@@ -136,6 +166,13 @@ def validate_judge(route: str, pipeline: dict[str, str]) -> str:
 def configure_judge(route: str) -> str:
     """Install the judge for this process, checked against every route the harness runs."""
     global JUDGE_ROUTE
+    try:
+        judge_provider_keys(route)
+        from evals.judge_config import judge_max_output_tokens
+
+        judge_max_output_tokens()
+    except ValueError as exc:
+        raise JudgeConfigError(str(exc)) from exc
     JUDGE_ROUTE = validate_judge(route, {role: RUN_CONFIG.models[role] for role in _ROLES})
     return JUDGE_ROUTE
 
@@ -151,13 +188,10 @@ def _judge_llm():
             "back to the pipeline's own critic: a self-judged rate is not evidence for RG-5."
         )
     from research_engine import llm_factory
+    from research_engine.response_diagnostics import diagnostic_models
 
-    base = get_run_config()
-    token = set_run_config(replace(base, models={**base.models, "critic": JUDGE_ROUTE}))
-    try:
+    with judge_client_config(JUDGE_ROUTE), diagnostic_models():
         llm = llm_factory.get_llm("critic")
-    finally:
-        reset_run_config(token)
     # A gateway reports in response headers which connection and model served a call, and the
     # OpenAI-compatible client drops them unless asked (`gateway_routing` reads them). Set on
     # this judge's own instance only — the pipeline's clients are untouched — and only where
@@ -290,6 +324,26 @@ def _result_path(run_date: str, *, custom_spec: bool = False) -> Path:
     return path
 
 
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name, "").strip()
+    return Path(value) if value else None
+
+
+def _check_output_path(out: Path) -> None:
+    """先实际测试目录写入，避免模型调用完成后才发现容器挂载目录只读。"""
+    if out.exists():
+        raise FileExistsError(
+            f"{out} already exists and eval results are write-once. "
+            "Pass a new --out, or omit --out to get an auto-numbered filename."
+        )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=out.parent, prefix=".eval-write-check-", mode="w", encoding="utf-8"
+    ) as probe:
+        probe.write("output check\n")
+        probe.flush()
+
+
 @contextmanager
 def _pipeline_scope(prompt_overrides: dict[str, str] | None) -> Iterator[None]:
     """The config the pipeline runs under — baseline or candidate — for this block only.
@@ -368,46 +422,292 @@ def candidate_section(overrides: dict[str, str], rows: list[dict]) -> dict:
     }
 
 
-async def run_one(query: dict, *, prompt_overrides: dict[str, str] | None = None) -> dict:
+def _trace_artifacts(writer, *, requested: bool, artifact_root: Path | None = None) -> dict:
+    if not requested:
+        return {}
+    if writer is None:
+        return {"runtime_trace_status": "unavailable"}
+
+    def shown(path: Path) -> str:
+        try:
+            return str(path.relative_to(artifact_root or EVALS_DIR))
+        except ValueError:
+            return str(path)
+
+    result = {
+        "runtime_trace": shown(writer.path),
+        "runtime_trace_status": "partial" if writer.write_failed else "recorded",
+    }
+    if writer.bad_case_written:
+        result["runtime_bad_case"] = shown(writer.bad_case_path)
+    return result
+
+
+def _jsonable(value: object, depth: int = 0) -> object:
+    """Bounded, JSON-safe projection of graph state for a local progress artifact."""
+    import math
+
+    if depth > 6:
+        return "[depth-limit]"
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k)[:120]: _jsonable(v, depth + 1) for k, v in list(value.items())[:200]}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v, depth + 1) for v in list(value)[:200]]
+    return str(value)[:2000]
+
+
+def _interrupt_payload(result: object) -> dict:
+    """Which human gate fired — read off the interrupt, never assumed (AGENTS.md)."""
+    if not isinstance(result, dict):
+        return {}
+    interrupts = result.get("__interrupt__") or ()
+    if not interrupts:
+        return {}
+    first = interrupts[0]
+    value = getattr(first, "value", None)
+    if not isinstance(value, dict):
+        value = first.get("value") if isinstance(first, dict) else None
+    if not isinstance(value, dict):
+        return {}
+    return {k: _jsonable(value.get(k)) for k in ("type", "word_count", "source_count")}
+
+
+def _save(ctx, store, action: str, *args, **kwargs):
+    """A failed artifact write becomes an explicit state, never a silent loss.
+
+    `action` is a *method name*, not a bound method: resolving it here means a
+    `None` store is a cheap no-op instead of an AttributeError raised while
+    Python is still evaluating the call's arguments.
+    """
+    if store is None:
+        return None
+    try:
+        return long_run.persist(getattr(store, action), *args, **kwargs)
+    except long_run.ArtifactSaveFailed as exc:
+        store.save_failed = True
+        if ctx is not None:
+            ctx.exit_code = long_run.EXIT_ARTIFACT_SAVE_FAILED
+            ctx.note(f"artifact_save_failed:{exc}")
+        return None
+
+
+def _row_failure(query: dict, started: float, error: object, runtime_trace, requested, root):
+    return {
+        "id": query["id"],
+        "domain": query.get("domain"),
+        "completed": False,
+        "error": str(error)[:300],
+        "latency_s": round(time.time() - started, 2),
+        **_trace_artifacts(runtime_trace, requested=requested, artifact_root=root),
+    }
+
+
+async def run_one(
+    query: dict,
+    *,
+    prompt_overrides: dict[str, str] | None = None,
+    trace_dir: Path | None = None,
+    trace_run_id: str | None = None,
+    trace_artifact_root: Path | None = None,
+    trace_content: bool = False,
+) -> dict:
     """Run one query to the gate; return its report metrics + timing.
 
     `prompt_overrides` is a candidate spec (RFC §14.2), already validated by the caller. It
     reaches the pipeline and is gone before the judge runs — see `_pipeline_scope`.
+
+    With progress enabled the draft is written the moment the graph stops at the human
+    review gate — before a single judge call — so a killed process keeps its evidence.
+    A validated resume reuses that draft and never re-runs the research graph; the
+    `interrupt()` is still left unapproved: the harness does not resume to the finalizer.
     """
-    graph = build_graph(MemorySaver())
-    thread_id = f"eval-{query['id']}"
-    config = {"configurable": {"thread_id": thread_id}}
-    initial = initial_state(
-        session_id=thread_id,
-        user_id="eval",
-        query=query["query"],
-        depth=query.get("depth", "balanced"),
-    )
+    ctx = long_run.current()
+    if ctx is not None and ctx.stop.requested:
+        # A cooperative stop must never start another paid research graph. The
+        # caller's result and the already-flushed progress stay authoritative.
+        return _row_failure(
+            query,
+            time.time(),
+            f"cooperative_stop:{ctx.stop.reason}",
+            None,
+            False,
+            trace_artifact_root,
+        )
+    store = None
+    if ctx is not None:
+        ctx.budget.start_case(ctx.remaining_cases)
+        ctx.remaining_cases = max(0, ctx.remaining_cases - 1)
+        config = long_run.build_config(
+            run_config=RUN_CONFIG,
+            judge_route=JUDGE_ROUTE,
+            judge_prompt=JUDGE_PROMPT,
+            case_id=query["id"],
+            query=query["query"],
+            depth=query.get("depth", "balanced"),
+            prompt_overrides=prompt_overrides,
+        )
+        store = ctx.store_for(config)
+        try:
+            long_run.persist(store.preflight)
+        except long_run.ArtifactSaveFailed as exc:
+            store.save_failed = True
+            ctx.exit_code = long_run.EXIT_ARTIFACT_SAVE_FAILED
+            ctx.note(f"preflight:{exc}")
+            ctx.stop.request("artifact_save_failed")
+            row = _row_failure(query, time.time(), exc, None, False, trace_artifact_root)
+            row["research_state"] = long_run.ARTIFACT_SAVE_FAILED
+            return row
 
     started = time.time()
-    error = None
-    try:
-        # The candidate is live for the pipeline alone. Reading the state back composes no
-        # prompt, so it runs after the reset; so does everything below, the judge included.
-        with _pipeline_scope(prompt_overrides):
-            await graph.ainvoke(initial, config)
-        state = (await graph.aget_state(config)).values
-    except Exception as e:  # noqa: BLE001
-        return {
-            "id": query["id"],
-            "domain": query.get("domain"),
-            "completed": False,
-            "error": str(e)[:300],
-            "latency_s": round(time.time() - started, 2),
+    runtime_trace = None
+    trace_requested = trace_dir is not None or os.environ.get("RF_EVAL_TRACE") == "1"
+    trace_directory = trace_dir or Path(
+        os.environ.get("RF_EVAL_TRACE_DIR") or RESULTS_DIR / "traces"
+    )
+
+    reused = None
+    if store is not None and store.source_dir is not None:
+        # A fingerprint mismatch refuses the whole run: neither a paid research graph nor
+        # a paid judge call may silently reinterpret saved evidence.
+        resume = (
+            store.load_for_rejudge(case_id=query["id"])
+            if ctx.rejudge
+            else store.load(case_id=query["id"])
+        )
+        ctx.batches_restored += len(resume.batches)
+        ctx.research_reused += 1
+        _save(ctx, store, "adopt_resume")
+        _save(
+            ctx,
+            store,
+            "save_progress",
+            status=long_run.RESEARCH_DRAFT_READY,
+            reason="resumed_from_saved_draft",
+        )
+        reused = resume.draft
+        state = {
+            "draft_report": reused["draft_report"],
+            "sources": reused["sources"],
+            "error": reused.get("error"),
+            "cost_usd": reused.get("cost_usd", 0.0),
+            "tokens_input": reused.get("tokens_input", 0),
+            "tokens_output": reused.get("tokens_output", 0),
+            "evidence": reused.get("evidence") or [],
         }
+        interrupt = reused.get("interrupt") or {}
+    else:
+        graph = build_graph(MemorySaver())
+        thread_id = f"eval-{query['id']}"
+        config = {"configurable": {"thread_id": thread_id}}
+        initial = initial_state(
+            session_id=thread_id,
+            user_id="eval",
+            query=query["query"],
+            depth=query.get("depth", "balanced"),
+        )
+        invoke_result = None
+        try:
+            # The candidate is live for the pipeline alone. Reading the state back composes
+            # no prompt, so it runs after the reset; so does everything below, the judge.
+            with _pipeline_scope(prompt_overrides):
+                with eval_trace_run(
+                    case_id=query["id"],
+                    run_id=trace_run_id or uuid.uuid4().hex,
+                    thread_id=thread_id,
+                    directory=trace_directory,
+                    enabled=trace_requested,
+                    capture_content=trace_content or os.environ.get("RF_EVAL_CONTENT_TRACE") == "1",
+                    redaction_secrets=environment_secrets(),
+                ) as runtime_trace:
+                    if ctx is not None:
+                        invoke_result = await long_run.with_deadline(
+                            graph.ainvoke(initial, config), budget=ctx.budget, stage="research"
+                        )
+                    else:
+                        invoke_result = await graph.ainvoke(initial, config)
+            state = (await graph.aget_state(config)).values
+        except (long_run.StageDeadlineExceeded, long_run.CooperativeStop) as exc:
+            _save(ctx, store, "save_progress", status=long_run.RESEARCH_FAILED, reason=str(exc))
+            row = _row_failure(
+                query, started, exc, runtime_trace, trace_requested, trace_artifact_root
+            )
+            if ctx is not None:
+                row["research_state"] = long_run.RESEARCH_FAILED
+                ctx.exit_code = long_run.EXIT_JUDGE_PARTIAL
+            return row
+        except Exception as e:  # noqa: BLE001
+            _save(
+                ctx,
+                store,
+                "save_progress",
+                status=long_run.RESEARCH_FAILED,
+                reason=type(e).__name__,
+            )
+            row = _row_failure(
+                query, started, e, runtime_trace, trace_requested, trace_artifact_root
+            )
+            if ctx is not None:
+                row["research_state"] = long_run.RESEARCH_FAILED
+            return row
+        interrupt = _interrupt_payload(invoke_result)
 
-    latency = round(time.time() - started, 2)
-    if state.get("error"):
-        error = str(state["error"])[:300]
-
+    latency = (
+        round(time.time() - started, 2) if reused is None else float(reused.get("latency_s", 0.0))
+    )
+    error = str(state["error"])[:300] if state.get("error") else None
     report = state.get("draft_report") or ""
     sources = state.get("sources") or []
     completed = bool(report) and error is None
+    claim_lines = [c for c in metrics.claim_lines(report) if metrics.CITE_RE.search(c)]
+    citations = [{"claim": c, "cites": metrics.extract_citations(c)} for c in claim_lines]
+    research_state = long_run.RESEARCH_DRAFT_READY if completed else long_run.RESEARCH_FAILED
+
+    if store is not None and reused is None:
+        draft_doc = {
+            "state": research_state,
+            "draft_report": report,
+            "sources": _jsonable(sources),
+            "evidence": _jsonable(state.get("evidence") or []),
+            "citations": _jsonable(citations),
+            "claim_lines": claim_lines,
+            "report_sha256": long_run.sha256_text(report),
+            "sources_sha256": long_run.canonical_hash(sources),
+            "claims_sha256": long_run.canonical_hash(claim_lines),
+            "tokens_input": state.get("tokens_input", 0),
+            "tokens_output": state.get("tokens_output", 0),
+            "cost_usd": round(state.get("cost_usd", 0.0), 6),
+            "latency_s": latency,
+            "error": error,
+            # The human gate is deliberately left suspended. Nothing here approves the
+            # draft or continues the graph to `finalizer_node`.
+            "interrupt": {
+                **interrupt,
+                "gate": "hitl_gate" if completed else None,
+                "approved": False,
+                "resume_action": "not_taken",
+                "word_count": len(report.split()),
+                "source_count": len(sources),
+            },
+        }
+        _save(ctx, store, "save_draft", query["id"], draft_doc)
+        _save(
+            ctx,
+            store,
+            "save_progress",
+            status=research_state,
+            reason=None if completed else (error or "no_draft_report"),
+            extra={
+                "claim_count": len(claim_lines),
+                "tokens_input": state.get("tokens_input", 0),
+                "tokens_output": state.get("tokens_output", 0),
+            },
+        )
 
     result = {
         "id": query["id"],
@@ -418,16 +718,48 @@ async def run_one(query: dict, *, prompt_overrides: dict[str, str] | None = None
         "cost_usd": round(state.get("cost_usd", 0.0), 6),
         "tokens": state.get("tokens_input", 0) + state.get("tokens_output", 0),
         **metrics.report_metrics(report, sources),
+        **_trace_artifacts(
+            runtime_trace, requested=trace_requested, artifact_root=trace_artifact_root
+        ),
     }
+    if ctx is not None:
+        result["research_state"] = research_state
+        if reused is not None:
+            result["research_reused"] = True
 
-    if completed and RUN_CONFIG.llm_mode == "real":
-        rate, claim_rows = await judge_citation_support(report, sources)
+    if completed and RUN_CONFIG.llm_mode == "real" and not (store and store.save_failed):
+        # Judge observation is outside both candidate prompts and the graph trace (docs/08 §5).
+        judge_trace_dir = os.environ.get("RF_JUDGE_BATCH_TRACE_DIR")
+        phase = "candidate" if prompt_overrides is not None else "baseline"
+        if store is not None and store.resume is not None:
+            phase += "-resume"
+        if ctx is not None:
+            ctx.store = store
+        with trace_judge_case(
+            case_id=query["id"],
+            phase=phase,
+            trace_dir=judge_trace_dir,
+            judge_route=JUDGE_ROUTE,
+            run_id=trace_run_id,
+            capture_content=trace_content or os.environ.get("RF_EVAL_CONTENT_TRACE") == "1",
+            redaction_secrets=environment_secrets(),
+            total_claims=len([c for c in metrics.claim_lines(report) if metrics.CITE_RE.search(c)]),
+            batch_size=long_run.JUDGE_BATCH_SIZE,
+        ) as judge_trace:
+            rate, claim_rows = await judge_citation_support(report, sources)
+        result.update(
+            judge_trace_artifacts(
+                judge_trace, requested=bool(judge_trace_dir), artifact_root=trace_artifact_root
+            )
+        )
         result["citation_support_rate"] = rate
         # The per-claim ruling — not just the aggregate — is what makes a miss
         # publishable and debuggable (docs/12 M5: "including the misses"). It is also
         # the only way to diff the judge against the graph's own citation-fidelity pass.
         result["claim_verdicts"] = claim_rows
         result["report"] = report
+        if ctx is not None:
+            result["judge_status"] = ctx.last_judge_status or long_run.JUDGE_FAILED
     return result
 
 
@@ -435,26 +767,33 @@ async def judge_citation_support(
     report: str, sources: list[dict]
 ) -> tuple[float | None, list[dict]]:
     """Real-mode only: ask a model whether each cited claim is actually supported by the
-    snippet it cites. Batches up to 4 claims per LLM call to reduce latency from
-    per-claim rate-limit sleeps.
+    snippet it cites. Batches up to 4 claims per LLM call.
 
     Returns `(supported / *judged* claims, per-claim rows)`. The denominator counts only
     claims the judge actually ruled on: a provider error, a partial reply, or an
     unparseable answer leaves a claim unjudged, and unjudged is **excluded** rather than
     scored as unsupported. The rate is None when nothing could be judged — "we could not
-    measure this" has to stay distinct from "it scored zero" (docs/16 §6), and it did not
-    until M18. `benchmark.py::calc_support_rate` implements the same rule; these are two
-    homes for one contract, so change both (AGENTS.md).
+    measure this" has to stay distinct from "it scored zero" (docs/16 §6). The identical
+    rule lives in `benchmark.py::calc_support_rate`; change both (AGENTS.md).
+
+    With a reliability context, every batch is atomically persisted as soon as it ends,
+    waits happen only before a real next request, and a stop/deadline yields a partial
+    result that can be resumed. Without one (the CLI default and every existing test)
+    the behaviour is the same as before, minus the unconditional 15 s sleeps.
     """
-    import re as _re
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
+    from evals.agent_eval_ext.batch_ledger import BatchBusy
     from research_engine.llm_factory import served_model_id
 
+    ctx = long_run.current()
+    store = ctx.store if ctx is not None else None
     by_index = {s.get("index"): s for s in sources if isinstance(s, dict)}
     claims = [c for c in metrics.claim_lines(report) if metrics.CITE_RE.search(c)]
     if not claims:
+        if ctx is not None:
+            ctx.last_judge_status = long_run.JUDGE_COMPLETED
         return None, []
 
     # The configured independent judge, or a refusal — never the pipeline's critic (RG-5).
@@ -476,76 +815,417 @@ async def judge_citation_support(
         )
         claim_evidence.append((claim, snippets))
 
-    BATCH_SIZE = 4
+    BATCH_SIZE = long_run.JUDGE_BATCH_SIZE
+    report_hash = long_run.sha256_text(report)
+    sources_hash = long_run.canonical_hash(sources)
+    resumed = store.resume.batches if store is not None and store.resume is not None else {}
+    total_batches = (len(claim_evidence) + BATCH_SIZE - 1) // BATCH_SIZE
     # Only claims the judge actually ruled on enter this map, and every number below is
     # derived from it — so an unjudged claim cannot reach the rate as a miss.
     verdict_by_claim: dict[int, bool] = {}
-    # What the provider says served each ruling — the disclosure half of "a judge that
-    # actually answered". None when the response names no model.
     served_by_claim: dict[int, str | None] = {}
-    # And, through a gateway, which connection served it (`gateway_routing`).
     routing_by_claim: dict[int, dict[str, str | None]] = {}
-    for batch_start in range(0, len(claim_evidence), BATCH_SIZE):
-        batch = claim_evidence[batch_start : batch_start + BATCH_SIZE]
+    batch_statuses: list[str] = []
+    attempted = 0
+    stop_reason: str | None = None
+    previous_batch_no = 0
 
-        # Build a single prompt covering all claims in this batch.
-        claim_blocks = []
-        for i, (claim, snippets) in enumerate(batch, start=1):
-            claim_blocks.append(f"Claim {i}: {claim}\nEvidence {i}:\n{snippets}")
-        human_content = (
-            "For each claim below, determine if it is supported by its cited evidence.\n"
-            'Answer with one line per claim in format: "Claim N: YES" or "Claim N: NO"\n\n'
-            + "\n\n".join(claim_blocks)
-        )
+    with ExitStack() as ownership:
+        for batch_start in range(0, len(claim_evidence), BATCH_SIZE):
+            batch_no = batch_start // BATCH_SIZE + 1
+            batch = claim_evidence[batch_start : batch_start + BATCH_SIZE]
+            batch_claims = [c for c, _ in batch]
 
-        messages = [
-            SystemMessage(
-                content="You judge whether claims are supported by their cited evidence. "
-                "For each numbered claim, respond with exactly one line: "
-                '"Claim N: YES" if the evidence supports the claim, or '
-                '"Claim N: NO" if it does not. Answer for every claim.'
-            ),
-            HumanMessage(content=human_content),
-        ]
+            lease = None
+            if store is not None and batch_no not in resumed:
+                try:
+                    lease = ownership.enter_context(store.batch_lease(batch_no))
+                except BatchBusy:
+                    stop_reason = f"batch_in_progress:{batch_no}"
+                    break
+                except (OSError, ValueError) as exc:
+                    store.save_failed = True
+                    stop_reason = f"batch_ownership_failed:{type(exc).__name__}"
+                    break
+                store.lease = lease
+                if lease.uncertain_previous_request:
+                    ctx.note(f"batch_{batch_no}_previous_request_may_have_been_billed")
+                if lease.committed is not None:
+                    _save(ctx, store, "restore_commit", batch_no, lease.committed)
+                    if store.save_failed:
+                        stop_reason = "artifact_save_failed"
+                        break
+                    resumed[batch_no] = lease.committed
 
-        try:
-            resp = await llm.ainvoke(messages)
-            text = resp.content if isinstance(resp.content, str) else ""
-            served = served_model_id(resp)
-            routing = gateway_routing(resp)
-            # Parse each "Claim N: YES/NO" line from the response.
-            for match in _re.finditer(r"Claim\s+(\d+)\s*:\s*(YES|NO)", text, _re.IGNORECASE):
-                idx = batch_start + int(match.group(1)) - 1
-                verdict_by_claim[idx] = match.group(2).upper() == "YES"
-                served_by_claim[idx] = served
-                routing_by_claim[idx] = routing
-        except Exception as e:  # noqa: BLE001 — one failed batch must not sink the run
-            # The batch's claims stay UNJUDGED and are excluded from the denominator
-            # below. Counting them as unsupported — which this did until M18 — is what
-            # made an exhausted quota indistinguishable from a quality collapse, and it
-            # is the same defect `benchmark.py::calc_support_rate` was written to fix.
-            print(f"Citation judging error (batch {batch_start // BATCH_SIZE + 1}): {e}")
+            if batch_no in resumed:
+                saved = resumed[batch_no]
+                if saved.get("claim_sha256") != long_run.canonical_hash(batch_claims) or saved.get(
+                    "expected_count"
+                ) != len(batch):
+                    raise long_run.ResumeRejected(f"batch_claims_changed:{batch_no}")
+                for key, value in (saved.get("verdicts") or {}).items():
+                    idx = int(key)
+                    verdict_by_claim[idx] = bool(value["supported"])
+                    served_by_claim[idx] = value.get("served_model")
+                    routing_by_claim[idx] = value.get("judge_routing")
+                status = saved.get("status", "unjudged")
+                batch_statuses.append(status)
+                attempted += 1
+                trace_judge_restored_batch(
+                    batch_no=batch_no,
+                    batch_start=batch_start,
+                    expected_count=int(saved.get("expected_count", len(batch))),
+                    judged_count=int(saved.get("judged_count", 0)),
+                    unjudged_count=int(saved.get("unjudged_count", 0)),
+                    yes_count=int(saved.get("yes_count", 0)),
+                    no_count=int(saved.get("no_count", 0)),
+                    status=status,
+                    restored_from=f"batch-{batch_no:04d}.json",
+                    reason_hint=saved.get("reason_hint"),
+                    served_model=saved.get("served_model"),
+                    response_diagnostic=saved.get("response_diagnostic"),
+                )
+                previous_batch_no = batch_no
+                if lease is not None:
+                    lease.release()
+                    store.lease = None
+                continue
 
-        # Free-tier rate limit avoidance (Gemini = 15 RPM). Applied once per batch
-        # rather than per claim — batching 4 claims turns ~82s of sleep into ~21s.
-        if RUN_CONFIG.llm_mode == "real":
-            await asyncio.sleep(15)
+            if ctx is not None:
+                if ctx.throttle.blocked_reason:
+                    stop_reason = ctx.throttle.blocked_reason
+                    break
+                if ctx.stop.requested:
+                    stop_reason = ctx.stop.reason or "cooperative_stop"
+                    break
+                try:
+                    ctx.budget.check("judge")
+                except long_run.StageDeadlineExceeded as exc:
+                    stop_reason = f"judge_deadline:{exc}"
+                    break
+                # Only the *next* request waits, and only for as long as it must. A 429's
+                # Retry-After is honoured here; the failed batch itself is never re-sent.
+                seconds, reason, retry_after = ctx.throttle.required()
+                seconds = min(seconds, ctx.budget.remaining("judge"))
+                planned = (seconds, reason, retry_after)
+                traced_wait = seconds > 0 and previous_batch_no > 0
+                try:
+                    if traced_wait:
+                        with trace_judge_wait(
+                            batch_no=previous_batch_no,
+                            seconds=seconds,
+                            reason=reason,
+                            provider=ctx.throttle.provider,
+                            retry_after=retry_after,
+                        ) as observed:
+                            record = await ctx.throttle.wait_before_next(
+                                batch_no=previous_batch_no, budget=ctx.budget, planned=planned
+                            )
+                            observed["elapsed_s"] = record.actual_s
+                    else:
+                        record = await ctx.throttle.wait_before_next(
+                            batch_no=previous_batch_no, budget=ctx.budget, planned=planned
+                        )
+                except long_run.CooperativeStop as exc:
+                    stop_reason = exc.reason
+                    break
+                except asyncio.CancelledError:
+                    # A cancel *between* batches still owns the batches already measured.
+                    # Flush them before the exception closes the trace scope.
+                    ctx.last_judge_status = long_run.JUDGE_PARTIAL
+                    ctx.exit_code = long_run.EXIT_JUDGE_PARTIAL
+                    if store is not None:
+                        _save(
+                            ctx,
+                            store,
+                            "save_progress",
+                            status=long_run.JUDGE_PARTIAL,
+                            reason="cancelled_during_throttle",
+                        )
+                        _save(
+                            ctx,
+                            store,
+                            "save_final",
+                            status=long_run.JUDGE_PARTIAL,
+                            reason="cancelled_during_throttle",
+                            extra={"attempted_batches": attempted, "total_batches": total_batches},
+                        )
+                    raise
+                if store is not None:
+                    store.note_wait(record)
+                ctx.budget.spend("judge", record.actual_s)
+                if store is not None:
+                    _save(
+                        ctx,
+                        store,
+                        "save_progress",
+                        status=long_run.JUDGE_PARTIAL,
+                        reason="judging",
+                        extra={"wait": record.as_dict(), "next_batch_no": batch_no},
+                    )
+                    if store.save_failed:
+                        stop_reason = "artifact_save_failed"
+                        break
 
+            # Build a single prompt covering all claims in this batch.
+            claim_blocks = [
+                f"Claim {i}: {claim}\nEvidence {i}:\n{snippets}"
+                for i, (claim, snippets) in enumerate(batch, start=1)
+            ]
+            messages = [
+                # Literal on purpose: `test_every_judge_system_message_is_literal_text` forbids
+                # any Name/Call/Attribute in a judge system message, so an override or prompt
+                # registry can never reach it. `JUDGE_SYSTEM_PROMPT` is the identical text used
+                # for the config fingerprint; a drift test pins the two together.
+                SystemMessage(
+                    content="You judge whether claims are supported by their cited evidence. "
+                    "For each numbered claim, respond with exactly one line: "
+                    '"Claim N: YES" if the evidence supports the claim, or '
+                    '"Claim N: NO" if it does not. Answer for every claim.'
+                ),
+                HumanMessage(content=JUDGE_HUMAN_PREFIX + "\n\n".join(claim_blocks)),
+            ]
+
+            if store is not None:
+                _save(ctx, store, "request_started")
+                if store.save_failed:
+                    stop_reason = "artifact_save_failed"
+                    break
+            request_started_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+            trace_judge_stage(
+                "batch_started",
+                batch_no=batch_no,
+                batch_start_zero_based=batch_start,
+                expected_count=len(batch),
+                details={"input": messages},
+            )
+            observed_started = time.perf_counter()
+            observed_response = None
+            observed_text = ""
+            observed_error: BaseException | None = None
+            observed_received = False
+            observed_served = None
+            from research_engine.response_diagnostics import (
+                ResponseObservation,
+                response_observation,
+            )
+
+            response_diag = ResponseObservation(
+                lease.batch_id
+                if lease is not None
+                else long_run.canonical_hash(
+                    {
+                        "report": report_hash,
+                        "sources": sources_hash,
+                        "batch_start": batch_start,
+                        "claims": batch_claims,
+                        "route": JUDGE_ROUTE,
+                        "prompt": JUDGE_PROMPT,
+                    }
+                )
+            )
+            preexisting_indices = set(verdict_by_claim)
+            if ctx is not None:
+                ctx.throttle.note_request_started()
+            try:
+                with response_observation(response_diag):
+                    invoke = traced_ainvoke(
+                        llm, messages, role="judge", configured_route=JUDGE_ROUTE
+                    )
+                    resp = (
+                        await long_run.run_request(invoke, budget=ctx.budget)
+                        if ctx is not None
+                        else await invoke
+                    )
+                    from research_engine.response_diagnostics import observe
+
+                    observe("after_conversion", resp)
+                observed_response = resp
+                observed_received = True
+                _save(ctx, store, "response_received")
+                text = resp.content if isinstance(resp.content, str) else ""
+                observed_text = text
+                served = served_model_id(resp)
+                observed_served = served
+                routing = gateway_routing(resp)
+                # Batch-local labels only; `evals/judge_labels.py` is the one parser.
+                from evals.judge_labels import claim_labels
+
+                for local_idx, supported in claim_labels(text, len(batch)).items():
+                    idx = batch_start + local_idx
+                    verdict_by_claim[idx] = supported
+                    served_by_claim[idx] = served
+                    routing_by_claim[idx] = routing
+            except asyncio.CancelledError as e:
+                observed_error = e
+                if ctx is None:
+                    raise
+                stop_reason = "cancelled"
+            except long_run.CooperativeStop as e:
+                observed_error = e
+                stop_reason = e.reason
+            except long_run.StageDeadlineExceeded as e:
+                # The throttle wait consumed the last of the judge budget before this request.
+                observed_error = e
+                stop_reason = f"judge_deadline:{e}"
+            except Exception as e:  # noqa: BLE001 — one failed batch must not sink the run
+                observed_error = e
+                # The batch's claims stay UNJUDGED and are excluded from the denominator.
+                # A 429 paces the next request; it never triggers a duplicate paid call.
+                if ctx is not None:
+                    retry = ctx.throttle.note_rate_limit(e, status=long_run.http_status(e))
+                    if retry is not None:
+                        ctx.note(f"batch_{batch_no}_429_retry_after_s={retry}")
+                print(f"Citation judging error (batch {batch_no}): {type(e).__name__}")
+            finally:
+                observed_ms = (time.perf_counter() - observed_started) * 1000
+                trace_judge_batch(
+                    batch_no=batch_no,
+                    batch_start=batch_start,
+                    expected_count=len(batch),
+                    verdict_by_claim=verdict_by_claim,
+                    response=observed_response,
+                    text=observed_text,
+                    error=observed_error,
+                    elapsed_ms=observed_ms,
+                    response_received=observed_received,
+                    preexisting_indices=preexisting_indices,
+                    served_model=observed_served,
+                    response_diagnostic=response_diag.snapshot(
+                        harness_text_chars=len(observed_text)
+                        if observed_received
+                        else "unavailable"
+                    ),
+                )
+
+            local = {
+                str(i): {
+                    "supported": bool(verdict_by_claim[i]),
+                    "served_model": served_by_claim.get(i),
+                    "judge_routing": routing_by_claim.get(i),
+                }
+                for i in range(batch_start, batch_start + len(batch))
+                if i in verdict_by_claim and i not in preexisting_indices
+            }
+            judged = len(local)
+            unjudged = len(batch) - judged
+            status = "complete" if unjudged == 0 else "unjudged" if judged == 0 else "partial"
+            batch_statuses.append(status)
+            attempted += 1
+            if isinstance(observed_error, asyncio.CancelledError):
+                reason_hint = "evaluation_cancelled"
+            elif observed_error is not None:
+                reason_hint = (
+                    "response_processing_exception" if observed_received else "invoke_exception"
+                )
+            elif status == "complete":
+                reason_hint = None
+            elif not observed_text.strip():
+                reason_hint = "empty_or_nontext_response"
+            elif judged == 0:
+                reason_hint = "unparseable_response"
+            else:
+                reason_hint = "partial_response"
+
+            if store is not None:
+                _save(
+                    ctx,
+                    store,
+                    "save_batch",
+                    batch_no,
+                    {
+                        "report_sha256": report_hash,
+                        "sources_sha256": sources_hash,
+                        "claim_sha256": long_run.canonical_hash(batch_claims),
+                        "expected_count": len(batch),
+                        "judged_count": judged,
+                        "unjudged_count": unjudged,
+                        "yes_count": sum(1 for v in local.values() if v["supported"]),
+                        "no_count": sum(1 for v in local.values() if not v["supported"]),
+                        "status": status,
+                        "reason_hint": reason_hint,
+                        "verdicts": local,
+                        "served_model": observed_served,
+                        "application_level_calls": 1,
+                        "elapsed_ms": round(observed_ms, 3),
+                        "error_type": type(observed_error).__name__ if observed_error else None,
+                        "http_status": long_run.http_status(observed_error),
+                        "started_at": request_started_at,
+                        "response_received": observed_received,
+                        "response_diagnostic": response_diag.snapshot(
+                            harness_text_chars=len(observed_text)
+                            if observed_received
+                            else "unavailable"
+                        ),
+                        "tokens_input": token_usage(observed_response, "input_tokens"),
+                        "tokens_output": token_usage(observed_response, "output_tokens"),
+                        "cost_usd": None,
+                        "finished_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                    },
+                )
+                if ctx is not None and not store.save_failed:
+                    ctx.batches_persisted += 1
+                    if status == "complete":
+                        ctx.batches_completed += 1
+            if lease is not None:
+                lease.release()
+                store.lease = None
+            previous_batch_no = batch_no
+            if stop_reason or (store is not None and store.save_failed):
+                stop_reason = stop_reason or "artifact_save_failed"
+                break
+
+    if store is not None:
+        store.lease = None
     rows = [
         {
             "claim": claim,
-            # None means the judge never ruled on this claim. Distinct from False, and
-            # the two must never be collapsed by a downstream truthiness check.
+            # None means the judge never ruled on this claim. Distinct from False.
             "supported": verdict_by_claim.get(i),
             "judged": i in verdict_by_claim,
             "judged_by": served_by_claim.get(i),
-            # None for a claim nothing ruled on; a dict of Nones when a ruling came back
-            # through no gateway that reports routing.
             "judge_routing": routing_by_claim.get(i),
             "cites": metrics.extract_citations(claim),
         }
         for i, claim in enumerate(claims)
     ]
+
+    if ctx is not None:
+        if store is not None and store.save_failed:
+            status = long_run.ARTIFACT_SAVE_FAILED
+        elif not verdict_by_claim and not stop_reason:
+            status = long_run.JUDGE_FAILED
+        elif (
+            stop_reason or attempted < total_batches or any(s != "complete" for s in batch_statuses)
+        ):
+            status = long_run.JUDGE_PARTIAL
+        else:
+            status = long_run.JUDGE_COMPLETED
+        ctx.last_judge_status = status
+        if status == long_run.JUDGE_PARTIAL:
+            ctx.exit_code = long_run.EXIT_JUDGE_PARTIAL
+        elif status == long_run.JUDGE_FAILED:
+            ctx.exit_code = long_run.EXIT_JUDGE_FAILED
+        elif status == long_run.ARTIFACT_SAVE_FAILED:
+            ctx.exit_code = long_run.EXIT_ARTIFACT_SAVE_FAILED
+        if store is not None:
+            _save(
+                ctx,
+                store,
+                "save_progress",
+                status=status,
+                reason=stop_reason,
+                extra={"attempted_batches": attempted, "total_batches": total_batches},
+            )
+            _save(
+                ctx,
+                store,
+                "save_final",
+                status=status,
+                reason=stop_reason,
+                extra={"attempted_batches": attempted, "total_batches": total_batches},
+            )
+
     if not verdict_by_claim:
         # Nothing was measured. Returning 0.0 here would publish an unmeasured run as a
         # total quality failure — the unmeasured-vs-zero conflation AGENTS.md calls a P0.
@@ -637,6 +1317,10 @@ def aggregate(rows: list[dict]) -> dict:
         r["citation_support_rate"] for r in done if r.get("citation_support_rate") is not None
     ]
     citation_support = round(sum(support_vals) / len(support_vals), 4) if support_vals else None
+    rulings = [c for r in done for c in r.get("claim_verdicts", [])]
+    full_input_known = bool(done) and all(isinstance(r.get("claim_verdicts"), list) for r in done)
+    claim_total = len(rulings) if full_input_known else None
+    claim_judged = sum(c.get("judged") is True for c in rulings) if full_input_known else None
 
     return {
         "queries": n,
@@ -647,6 +1331,9 @@ def aggregate(rows: list[dict]) -> dict:
         "avg_cost_usd": mean("cost_usd"),
         "avg_latency_s": mean("latency_s"),
         "citation_support_rate": citation_support,
+        "claims_total": claim_total,
+        "claims_judged": claim_judged,
+        "full_judge_coverage": claim_judged / claim_total if claim_total else None,
     }
 
 
@@ -712,17 +1399,35 @@ def _meets(value: float | None, threshold: float) -> bool | None:
 
 
 def check_release_criteria(agg: dict) -> dict:
-    return {
+    result = {
         "completion_rate_ok": _meets(agg["completion_rate"], MIN_COMPLETION_RATE),
         "citation_support_ok": _meets(agg.get("citation_support_rate"), MIN_CITATION_SUPPORT),
+        "full_judge_coverage_ok": _meets(agg.get("full_judge_coverage"), 1.0),
+        "gate_version": "report-full-input/1",
         "thresholds": {
             "min_completion_rate": MIN_COMPLETION_RATE,
             "min_citation_support": MIN_CITATION_SUPPORT,
         },
     }
+    checks = [
+        result[k] for k in ("completion_rate_ok", "citation_support_ok", "full_judge_coverage_ok")
+    ]
+    result["gate_passed"] = False if False in checks else None if None in checks else True
+    return result
 
 
-async def main() -> None:
+async def _pace_between_queries(ctx) -> None:
+    """Optional, recorded pacing — only when a next query exists."""
+    if ctx is None:
+        return
+    seconds = min(long_run.query_interval(), ctx.budget.remaining("research"))
+    if seconds <= 0:
+        return
+    record = await ctx.throttle.wait_fixed(seconds, reason="inter_query_throttle")
+    ctx.budget.spend("research", record.actual_s)
+
+
+async def _main() -> None:
     parser = argparse.ArgumentParser(description="Run the report-quality eval suite.")
     parser.add_argument(
         "--mode",
@@ -730,7 +1435,26 @@ async def main() -> None:
         default="report",
         help="Which eval to run (report or memory)",
     )
-    parser.add_argument("--limit", type=int, default=None, help="run only the first N queries")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--limit", type=int, default=None, help="run only the first N queries")
+    selection.add_argument(
+        "--case-id", help="run exactly one original report case by ID; incompatible with --limit"
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="record runtime metadata (also RF_EVAL_TRACE=1; report mode only)",
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="trace directory; default beside --out; also RF_EVAL_TRACE_DIR",
+    )
+    parser.add_argument(
+        "--trace-content",
+        action="store_true",
+        help="enable trace with bounded redacted prompts, responses, tool inputs/outputs and errors",
+    )
     parser.add_argument(
         "--out", type=str, default=None, help="output path (default results/eval-<date>.json)"
     )
@@ -746,17 +1470,52 @@ async def main() -> None:
         "--judge",
         type=str,
         default=None,
-        help="provider:model of the citation judge. Required for a real-mode report eval, and "
+        help="provider:model of the citation judge (default EVAL_JUDGE_MODEL). Required for a real-mode report eval, and "
         "refused if it is a router alias or any model the pipeline runs on (RG-5)",
     )
+    parser.add_argument(
+        "--progress-dir",
+        type=Path,
+        default=None,
+        help="atomic reliability artifacts (default RF_EVAL_RELIABILITY_DIR); off when unset",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="a previous --progress-dir to resume; validates report and judge config first",
+    )
+    parser.add_argument(
+        "--rejudge-from",
+        type=Path,
+        default=None,
+        help="reuse a validated draft with a new output budget; rescore ALL judge batches",
+    )
     args = parser.parse_args()
+    if args.case_id is not None and args.mode != "report":
+        parser.error("--case-id supports --mode report only; nothing was run")
+    if args.rejudge_from is not None and args.mode != "report":
+        parser.error("--rejudge-from supports --mode report only")
+    queries_file = EVALS_DIR / ("memory_queries.json" if args.mode == "memory" else "queries.json")
+    try:
+        queries = select_queries(
+            json.loads(queries_file.read_text(encoding="utf-8-sig"))["queries"],
+            case_id=args.case_id,
+            limit=args.limit,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(f"{exc}; no queries were run")
+    tracing = args.trace or args.trace_content or os.environ.get("RF_EVAL_TRACE") == "1"
+    if tracing and args.mode != "report":
+        parser.error("runtime tracing currently supports --mode report only")
 
     # Before any query runs: a run that would be self-judged must cost nothing.
     judging = args.mode == "report" and RUN_CONFIG.llm_mode == "real"
     if judging:
+        args.judge = args.judge or os.environ.get("EVAL_JUDGE_MODEL")
         if not args.judge:
             parser.error(
-                "a real-mode report eval needs --judge provider:model, a pinned model "
+                "a real-mode report eval needs --judge provider:model or EVAL_JUDGE_MODEL, a pinned model "
                 "independent of the pipeline's routes (RG-5); nothing was run"
             )
         try:
@@ -775,25 +1534,72 @@ async def main() -> None:
         except CandidateSpecError as e:
             parser.error(str(e))
 
-    if args.mode == "memory":
-        queries_file = EVALS_DIR / "memory_queries.json"
-    else:
-        queries_file = EVALS_DIR / "queries.json"
+    run_date = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
+    out = Path(args.out) if args.out else _result_path(run_date, custom_spec=candidate is not None)
+    try:
+        _check_output_path(out)
+    except FileExistsError as exc:
+        raise SystemExit(f"{exc} No queries were run.") from exc
+    except OSError as exc:
+        parser.error(
+            f"cannot write evaluation result to {out}: {exc}. "
+            "Pass --out in a writable directory; no queries were run. "
+            "In Docker, use --out /tmp/eval.json and keep the container for docker cp."
+        )
 
-    queries = json.loads(queries_file.read_text())["queries"]
-    if args.limit:
-        queries = queries[: args.limit]
+    progress_root = args.progress_dir or _env_path("RF_EVAL_RELIABILITY_DIR")
+    resume_root = args.resume_from or _env_path("RF_EVAL_RESUME_FROM")
+    if args.rejudge_from is not None:
+        if resume_root is not None:
+            parser.error("--rejudge-from cannot be combined with --resume-from")
+        resume_root = args.rejudge_from
+    if resume_root is not None and progress_root is None:
+        raise SystemExit("resume requires a separate --progress-dir; no queries were run")
+    ctx = None
+    if progress_root is not None:
+        provider = (JUDGE_ROUTE or RUN_CONFIG.models["critic"]).partition(":")[0] or "unknown"
+        try:
+            # A second real write, before any model call: a mounted directory that exists
+            # but refuses writes must fail here, not after a 180 s research run (AGENTS.md).
+            ctx = long_run.build_context(
+                root=progress_root,
+                judge_provider=provider,
+                resume_root=resume_root,
+                case_count=len(queries) * (2 if candidate is not None else 1),
+            )
+            long_run.preflight_root(progress_root)
+            ctx.rejudge = args.rejudge_from is not None
+        except (OSError, long_run.ReliabilityError) as exc:
+            raise SystemExit(f"reliability preflight failed: {exc}; no queries were run") from exc
+        long_run.activate(ctx)
+        if resume_root is not None:
+            print(f"Resuming from {resume_root} (report + judge config must match)…")
+
+    trace_kwargs = {}
+    if tracing:
+        trace_kwargs = {
+            "trace_dir": args.trace_dir
+            or Path(os.environ.get("RF_EVAL_TRACE_DIR") or out.parent / "traces"),
+            "trace_run_id": os.environ.get("RF_EVAL_TRACE_RUN_ID") or uuid.uuid4().hex,
+            "trace_artifact_root": out.parent,
+            **({"trace_content": True} if args.trace_content else {}),
+        }
+    elif judging and os.environ.get("RF_JUDGE_BATCH_TRACE_DIR"):
+        trace_kwargs = {"trace_artifact_root": out.parent}
 
     print(f"Running {len(queries)} queries in LLM_MODE={RUN_CONFIG.llm_mode} mode={args.mode}…")
     rows = []
-    for q in queries:
+    for index, q in enumerate(queries):
+        if ctx is not None and ctx.stop.requested:
+            print(f"  cooperative stop before {q['id']}: {ctx.stop.reason}")
+            break
         if args.mode == "memory":
             row = await run_one_memory(q)
             rows.append(row)
             flag = "✓" if row.get("pass_test") else "✗"
             print(f"  {flag} {q['id']:24s} type={q['type']} latency={row.get('latency_s')}s")
         else:
-            row = await run_one(q)
+            row = await run_one(q, **trace_kwargs)
             rows.append(row)
             flag = "✓" if row.get("completed") else "✗"
             print(
@@ -801,23 +1607,28 @@ async def main() -> None:
                 f"uncited={row.get('uncited_claim_count')} cost=${row.get('cost_usd')}"
             )
 
-        if RUN_CONFIG.llm_mode == "real":
-            await asyncio.sleep(60)
+        # No unconditional 60 s sleep after every query (the last one included). Pacing is
+        # configurable, recorded, and applied only when another query actually follows.
+        if index < len(queries) - 1:
+            await _pace_between_queries(ctx)
 
     candidate_rows: list[dict] = []
     if candidate is not None:
         roles = ", ".join(sorted(candidate))
         print(f"\nCandidate spec ({roles}) — the same {len(queries)} queries, the same thresholds…")
-        for q in queries:
-            row = await run_one(q, prompt_overrides=candidate)
+        for index, q in enumerate(queries):
+            if ctx is not None and ctx.stop.requested:
+                print(f"  cooperative stop before candidate {q['id']}: {ctx.stop.reason}")
+                break
+            row = await run_one(q, prompt_overrides=candidate, **trace_kwargs)
             candidate_rows.append(row)
             flag = "✓" if row.get("completed") else "✗"
             print(
                 f"  {flag} {q['id']:24s} sources={row.get('source_count')} "
                 f"uncited={row.get('uncited_claim_count')} cost=${row.get('cost_usd')}"
             )
-            if RUN_CONFIG.llm_mode == "real":
-                await asyncio.sleep(60)
+            if index < len(queries) - 1:
+                await _pace_between_queries(ctx)
 
     if args.mode == "memory":
         agg = aggregate_memory(rows)
@@ -826,7 +1637,6 @@ async def main() -> None:
         agg = aggregate(rows)
         release_criteria = check_release_criteria(agg)
 
-    run_date = args.date or datetime.now(UTC).strftime("%Y-%m-%d")
     payload = {
         "date": run_date,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -865,6 +1675,8 @@ async def main() -> None:
         # The top-level `aggregate`/`release_criteria`/`results` stay the shipped baseline,
         # exactly as in a plain run, so a reader of the existing schema reads it unchanged.
         payload["candidate"] = candidate_section(candidate, candidate_rows)
+    if args.case_id is not None:
+        payload["method"]["case_id"] = args.case_id
     if judging:
         # Only where a judge ran. A scripted run calls no judge, and naming one it never
         # called is the "model id you did not call" rule the `models` note above follows.
@@ -872,16 +1684,62 @@ async def main() -> None:
             JUDGE_ROUTE, rows, candidate_rows if candidate is not None else None
         )
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    out = Path(args.out) if args.out else _result_path(run_date, custom_spec=candidate is not None)
-    if out.exists():
-        # Only reachable via an explicit --out; `_result_path` never returns a live path.
-        # Refuse rather than overwrite: a committed result is evidence (AGENTS.md).
-        raise SystemExit(
-            f"{out} already exists and eval results are write-once. "
-            f"Pass a new --out, or omit --out to get an auto-numbered filename."
+    if ctx is not None:
+        judged_rows = rows + candidate_rows
+        judge_states = [
+            r.get("judge_status") for r in judged_rows if r.get("completed") and judging
+        ]
+        if ctx.save_failed:
+            reliability_status = long_run.ARTIFACT_SAVE_FAILED
+        elif any(r.get("research_state") == long_run.RESEARCH_FAILED for r in judged_rows):
+            reliability_status = long_run.RESEARCH_FAILED
+        elif not judging:
+            reliability_status = (
+                long_run.RESEARCH_DRAFT_READY
+                if all(r.get("completed") for r in judged_rows)
+                else long_run.RESEARCH_FAILED
+            )
+        elif not judge_states or any(s == long_run.JUDGE_FAILED for s in judge_states):
+            reliability_status = long_run.JUDGE_FAILED
+        elif any(s != long_run.JUDGE_COMPLETED for s in judge_states):
+            reliability_status = long_run.JUDGE_PARTIAL
+        else:
+            reliability_status = long_run.JUDGE_COMPLETED
+        reliability_reason = ctx.stop.reason or (
+            "incomplete_judge"
+            if reliability_status
+            in (long_run.JUDGE_PARTIAL, long_run.JUDGE_FAILED, long_run.ARTIFACT_SAVE_FAILED)
+            else None
         )
-    out.write_text(json.dumps(payload, indent=2) + "\n")
+        try:
+            long_run.write_root_status(
+                progress_root,
+                status=reliability_status,
+                reason=reliability_reason,
+                extra={"exit_code": ctx.exit_code, "judge_route": JUDGE_ROUTE},
+            )
+        except OSError as exc:
+            reliability_status = long_run.ARTIFACT_SAVE_FAILED
+            ctx.exit_code = long_run.EXIT_ARTIFACT_SAVE_FAILED
+            ctx.note(f"root_status_failed:{type(exc).__name__}")
+        payload["reliability"] = long_run.reliability_section(
+            ctx, status=reliability_status, reason=reliability_reason
+        )
+        # A partial measurement must not clear the 0.95 gate on the few claims that
+        # happened to answer. Legacy `aggregate`/`judge` fields stay exactly as they were.
+        if reliability_status in (
+            long_run.JUDGE_PARTIAL,
+            long_run.JUDGE_FAILED,
+            long_run.ARTIFACT_SAVE_FAILED,
+        ):
+            release_criteria["citation_support_ok"] = None
+            if candidate is not None:
+                payload["candidate"]["release_criteria"]["citation_support_ok"] = None
+
+    # 检查后仍可能有另一个进程占用同名路径；独占创建保护既有评测证据。
+    with trace_span("result.save", kind="artifact_write", inputs={"case_count": len(rows)}):
+        with out.open("x", encoding="utf-8") as result_file:
+            result_file.write(json.dumps(payload, indent=2) + "\n")
     print(f"\nAggregate: {json.dumps(_for_display(agg))}")
     if judging:
         judge = payload["judge"]
@@ -906,6 +1764,42 @@ async def main() -> None:
     except ValueError:
         shown = out
     print(f"Wrote {shown}")
+    if ctx is not None and ctx.exit_code:
+        # A named partial/failed state, not a silent success. The result and all progress
+        # artifacts are already on disk before this non-zero exit.
+        raise SystemExit(ctx.exit_code)
+
+
+async def main() -> None:
+    root = os.environ.get("RF_EVAL_EXECUTION_ROOT")
+    try:
+        if root and os.environ.get("RF_EVAL_CONTENT_TRACE") == "1":
+            from evals.agent_eval_ext.execution_observer import execution_scope
+
+            with execution_scope(
+                Path(root),
+                os.environ.get("RF_EVAL_TRACE_RUN_ID") or uuid.uuid4().hex,
+                "harness.run",
+            ):
+                await _main()
+        else:
+            await _main()
+    except long_run.ResumeRejected as exc:
+        ctx = long_run.current()
+        if ctx is not None:
+            try:
+                long_run.write_root_status(
+                    ctx.root,
+                    status=long_run.JUDGE_FAILED,
+                    reason=f"resume_rejected:{exc}",
+                    extra={"exit_code": long_run.EXIT_JUDGE_FAILED},
+                )
+            except OSError:
+                pass
+        print(f"Resume refused: {exc}; no model calls were made")
+        raise SystemExit(long_run.EXIT_JUDGE_FAILED) from exc
+    finally:
+        long_run.deactivate()
 
 
 if __name__ == "__main__":

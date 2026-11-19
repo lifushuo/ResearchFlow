@@ -1,13 +1,4 @@
-/**
- * Marks a session as produced by scripted models rather than real research (docs/17 §6.2).
- *
- * Uses `--warning` rather than the accent or a muted grey. A demo is not a neutral
- * attribute like depth or cost — it is the one fact that invalidates everything else on
- * the card, so it has to read as a caution at a glance and survive being scanned past.
- *
- * `title` carries the full sentence because the badge itself is two words, and two words
- * cannot carry "none of this was researched".
- */
+/** 标识由脚本模型生成、而非真实研究的演示会话（docs/17 §6.2）。使用警告色而非普通强调色或灰色，因为演示会使卡片上的其他研究结论失去实际意义；标题补充完整说明，不能仅靠短徽标表达未进行研究。 */
 export function DemoBadge({ className = "" }: { className?: string }) {
   const c = "var(--warning)";
   return (
@@ -18,9 +9,9 @@ export function DemoBadge({ className = "" }: { className?: string }) {
         backgroundColor: `color-mix(in srgb, ${c} 10%, var(--bg-surface))`,
         borderColor: `color-mix(in srgb, ${c} 35%, var(--border))`,
       }}
-      title="Scripted models and fixture sources — nothing here was researched or verified."
+      title="使用脚本模型和固定示例来源，未进行实际研究或核验。"
     >
-      Demo
+      演示
     </span>
   );
 }

@@ -1,27 +1,15 @@
-"""
-Per-user and per-session model routing (docs/12 M8).
+"""用户与会话模型路由（docs/12 M8）。
 
-Three layers, most specific wins:
-
-1. the session's snapshot — what this run was started with,
-2. the user's saved preference,
-3. the deployment's `MODEL_*` environment routing.
-
-Kept in a service rather than the endpoint because the worker resolves the same thing
-when it builds a run's `RunConfig`, and the two must not drift.
-"""
+优先级为会话开始快照、用户偏好、部署 MODEL_*。服务层统一实现，确保接口和 Worker 解析一致。"""
 
 from __future__ import annotations
 
 from app.config import settings
 from app.models.user import User
 
-# The rule itself lives in the engine so the desktop host can apply the identical one —
-# `sidecar.validate_routing` had its own copy, which never learned to accept
-# endpoint-defined providers and so rejected every OmniRoute and tagged-Ollama route on
-# the packaged app. Re-exported here because this is where the server's call sites have
-# always referred to it.
-from research_engine.routing_rules import (  # noqa: F401  (re-export)
+# 规则实现在引擎层，桌面复用同一实现。
+# 此处重新导出兼容既有服务端调用位置，避免桌面复制后漏掉自定义端点和带标签的 Ollama 路由。
+from research_engine.routing_rules import (  # noqa: F401 — 重新导出共用实现
     ENDPOINT_DEFINED_PROVIDERS,
     InvalidRouting,
     validate,
@@ -29,14 +17,10 @@ from research_engine.routing_rules import (  # noqa: F401  (re-export)
 
 
 def available_providers(user: User) -> list[str]:
-    """Providers this user can actually reach right now.
+    """列出用户有密钥、部署有密钥或无需密钥即可使用的供应商。
 
-    A provider is usable when the user has their own key for it, when the deployment has
-    a server key, or when it needs no key at all (local models). The UI uses this to mark
-    a model as selectable rather than hiding it — a user who adds a key should see the
-    same list they saw before, now enabled.
-    """
-    usable: set[str] = {"ollama"}  # local inference needs no key
+    界面据此标记不可选，而非隐藏模型，添加密钥后可在同一列表中启用。"""
+    usable: set[str] = {"ollama"}  # 本地推理不需要密钥。
 
     if user.api_key_provider:
         usable.add(user.api_key_provider)
@@ -50,14 +34,10 @@ def available_providers(user: User) -> list[str]:
         if server_key:
             usable.add(provider)
 
-    # A custom OpenAI-compatible endpoint is configured by its URL rather than by a key —
-    # a local proxy commonly needs no key at all — so its presence is what makes it usable.
+    # 自定义兼容端点可能不需要密钥，是否配置 URL 才是其可用配置依据。
     #
-    # Neither this provider nor `openrouter` has catalog entries, because their model lists
-    # belong to the endpoint and change without us. That is exactly why they have to be
-    # named here: a deployment whose whole routing is `custom:` (the shipped `.env` does
-    # this) otherwise reports no custom provider available and the picker cannot offer the
-    # models the run will actually use.
+    # custom 和 openrouter 的模型列表属于端点，不在固定目录中，也必须列入可用供应商。
+    # 否则全自定义路由部署的选择器反而看不到它实际使用的模型。
     if settings.custom_base_url:
         usable.add("custom")
 
@@ -65,7 +45,7 @@ def available_providers(user: User) -> list[str]:
 
 
 def deployment_default() -> dict[str, str]:
-    """The routing a run uses when neither the session nor the user specifies one."""
+    """运行与用户均未指定时采用的部署路由。"""
     return {
         "planner": settings.model_planner,
         "executor": settings.model_executor,
@@ -76,5 +56,5 @@ def deployment_default() -> dict[str, str]:
 
 
 def resolve(*, session_routing: dict | None, user_routing: dict | None) -> dict[str, str]:
-    """Session snapshot → user preference → deployment default."""
+    """按会话快照、用户偏好、部署默认值顺序解析。"""
     return session_routing or user_routing or deployment_default()

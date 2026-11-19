@@ -1,15 +1,7 @@
-"""
-Search-cache indirection (docs/13 §4, docs/12 M6 step 3).
+"""检索缓存的间接访问层，见 docs/13 §4、docs/12 M6。
 
-`retrievers.search` used to reach into `app.db.redis` directly — the last import that
-tied the engine to the server's data plane. It now goes through a `Cache` port held in a
-`ContextVar`, exactly like the event emitter in `events.py`.
-
-The default is a null cache, so an un-hosted engine (tests, the desktop build before its
-SQLite cache exists, a bare CLI run) works with no cache at all — which is already how
-the retriever chain behaved when Redis was absent, since every cache touch there is
-best-effort.
-"""
+检索器通过 ContextVar 中的 Cache 端口访问缓存，不直接导入服务端 Redis。
+默认空缓存，让测试、桌面端和独立 CLI 即使没有缓存服务也能运行。"""
 
 from __future__ import annotations
 
@@ -19,9 +11,9 @@ from research_engine.ports import Cache
 
 
 class NullCache:
-    """Caches nothing. The default, so no host is required."""
+    """不缓存任何内容，作为无需宿主配置的默认实现。"""
 
-    async def get(self, key: str) -> str | None:  # noqa: ARG002 - protocol shape
+    async def get(self, key: str) -> str | None:  # noqa: ARG002 - 保留协议要求的参数形式
         return None
 
     async def set(self, key: str, value: str, ttl: int) -> None:  # noqa: ARG002
@@ -34,7 +26,7 @@ _cache: ContextVar[Cache] = ContextVar("engine_cache", default=_NULL)
 
 
 def set_cache(cache: Cache):
-    """Install a cache for the current context. Returns a token for `reset_cache`."""
+    """为当前上下文安装缓存，返回可供 reset_cache 恢复的令牌。"""
     return _cache.set(cache)
 
 

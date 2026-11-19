@@ -1,21 +1,14 @@
-"""
-The research agent pipeline as a real compiled LangGraph StateGraph
-(docs/architecture/04-agent-architecture.md). No hand-rolled loop, no fail-open behavior.
+"""以真实编译的 LangGraph StateGraph 实现研究流水线（docs/architecture/04-agent-architecture.md），
+不自行编排循环，也不在校验失败后放行。
 
-    planner → executor(all pending tasks, in parallel) → critic(all, in parallel) ─┐
-                     ▲                       (any task failed, retries remain)     │
-                     └─────────────────────────────────────────────────────────────┘
-    (every task passed or out of retries) → contradiction_detector → synthesizer → hitl_gate
-    hitl_gate --interrupt--> (approve) finalizer / (reject) synthesizer
-    budget/time breach anywhere → failer
+planner → executor（并行研究全部待办任务）→ critic（并行评审）
+评审未通过且尚可重试 → executor；全部通过或重试耗尽 → contradiction_detector → synthesizer → hitl_gate。
+hitl_gate 通过 interrupt 暂停；批准后进入 finalizer，拒绝后返回 synthesizer。
+任何位置超出预算或时间限制均进入 failer。
 
-Research runs in *rounds* rather than per-task pipelines (docs/12 M7): a round researches
-every pending task concurrently, grades them all, and the failures retry together in the
-next round. A per-task pipeline would let a fast task start its retry while a slow one is
-still on its first pass, but it would also move the retry loop out of the graph and into
-hand-rolled orchestration. Rounds are capped at `max_critic_loops`, so the barrier costs
-little and the retry path stays a conditional edge in the compiled graph.
-"""
+研究按轮次推进，而非为每个子任务建立独立流水线（docs/12 M7）。每轮并行研究全部待办任务，
+统一评审后在下一轮重试失败项。逐任务推进虽能让快任务提前重试，却会将重试编排移出图。
+max_critic_loops 限制轮数，使同步等待开销有限，并让重试路径保持为编译图中的条件边。"""
 
 from __future__ import annotations
 
@@ -36,6 +29,7 @@ from pydantic import BaseModel, Field, model_validator
 from research_engine import claims, contradictions, grounding, grounding_repair, outlines, prompts
 from research_engine.concurrency import gather_or_cancel
 from research_engine.corpus import parse_corpus_url
+from research_engine.eval_trace import trace_span, traced_ainvoke, traced_node
 from research_engine.events import emit
 from research_engine.llm_factory import (
     estimate_cost,
@@ -60,77 +54,60 @@ from research_engine.tools import EXECUTOR_TOOLS
 logger = structlog.get_logger()
 
 _TOOLS_BY_NAME = {t.name: t for t in EXECUTOR_TOOLS}
-#: Tool rounds and pages a single task may spend, by research depth.
+#: 按研究深度限制每个任务的工具调用轮数和抓取页数。
 #:
-#: **A round is one model call, and that is the whole cost of a run.** A page fetch is
-#: capped at 10s and several run concurrently; a model turn on a hosted router was measured
-#: at two to four and a half *minutes*. So wall-clock is `rounds x model latency` and
-#: nothing else, and the only lever that matters is asking the model fewer times.
+#: 一轮对应一次模型调用，是主要费用和等待来源。页面抓取限时 10 秒且可并发，
+#: 托管路由上的模型响应却可能需要数分钟，因此减少模型调用次数才是主要优化手段。
 #:
-#: Depth used to be a word in the planner's prompt and nothing more: `fast` and
-#: `comprehensive` bought the same eight rounds and the same five pages per task, so the
-#: control the interface offers as "a quick scan — fewer sources, lowest cost" changed
-#: neither the time nor the spend except by however many tasks the planner happened to
-#: emit. These make it mean what it says.
+#: fast 和 comprehensive 曾都允许八轮、五页，仅在提示词中名称不同，
+#: 并未兑现界面关于速度与成本的说明；此处限制使深度选择实际影响执行。
 _DEPTH_LIMITS: dict[str, tuple[int, int]] = {
-    # depth: (max tool rounds, max pages fetched) per task
+    # 每项研究深度对应单个任务的（最大工具轮数，最大抓取页数）。
     "fast": (3, 3),
     "balanced": (5, 5),
     "comprehensive": (8, 8),
 }
 
-#: Used for an unknown depth, and as the ceiling the loop falls back to.
+#: 未知研究深度及循环回退时使用的轮数上限。
 _MAX_TOOL_ROUNDS = 8
 
-#: How many pages one task may open before it must stop reading and submit what it has.
+#: 限制单任务可打开的页数，达到后必须停止阅读并提交已有内容。
 #:
-#: A termination control, not a cost one. A model under no obligation to conclude will
-#: graze: run `96a16137` spent every round of every retry on another search or fetch and
-#: submitted nothing, twice. Reading is bounded so the task always reaches the extraction
-#: step with the sources it has, rather than reaching the end of its rounds with none.
+#: 这是终止控制：模型可能持续搜索和抓取，却不主动总结提交。
+#: 限制阅读次数可保证它带着已有来源进入提取步骤，而非耗尽轮数后仍无证据。
 _MAX_PAGES_PER_TASK = 5
 
 
 def _limits_for(depth: str | None) -> tuple[int, int]:
-    """`(rounds, pages)` for a depth, falling back to balanced for anything unknown.
+    """返回研究深度对应的 (rounds, pages)，未知值回退到 balanced。
 
-    Unknown rather than invalid on purpose: a depth this build does not recognise is a
-    run started by an older client, and answering it with the middle setting is better
-    than refusing it or silently giving it the most expensive one.
-    """
+    未知深度可能来自旧客户端；使用中等配置比拒绝任务或默默采用最昂贵配置更合适。"""
     return _DEPTH_LIMITS.get((depth or "").strip().lower(), _DEPTH_LIMITS["balanced"])
 
 
-#: Per-source ceiling on the text handed to the forced extraction pass.
+#: 强制提取阶段向模型提供的单个来源文本长度上限。
 #:
-#: Truncating here is safe in the one way that matters: `verify_evidence_snippets` checks
-#: quotations against the *whole* of `seen_text`, so a snippet taken from the part we sent
-#: always verifies. The cap bounds one request, it does not narrow what counts as seen.
+#: 此处截断只限制请求大小，不缩小已读文本的核验范围；
+#: verify_evidence_snippets 仍对完整 seen_text 检查逐字引文。
 _FORCED_SUBMIT_SOURCE_CHARS = 6_000
 
-#: How many sources the forced extraction pass is shown, richest first.
+#: 强制提取阶段展示的来源数量上限，优先选择文本最丰富的来源。
 #:
-#: A task accumulates far more one-line search hits than read pages, and handing a model
-#: nineteen sources of which fourteen are a sentence long buries the page bodies that
-#: actually carry quotable text. Bounded for focus, not for cost.
+#: 大量单行搜索摘要会掩盖真正含有可引用正文的网页；此限制用于聚焦内容，而非控制费用。
 _FORCED_SUBMIT_SOURCES = 8
 
 
-# ── Structured-output helper ──────────────────────────────────────────────────────
+# ── 结构化输出辅助函数 ──────────────────────────────────────────────
 
-# Provider errors observed inside `_structured`. The call itself still returns a
-# parse-shaped result (fail-closed, docs/11 §1), but a caller that cares WHY it got
-# nothing — the planner, whose "invalid task list" message masked an exhausted API
-# quota for 8 of 10 eval queries — reads this to report the real cause.
+# 记录 _structured 捕获的提供方错误。函数仍返回解析结果形状并保守失败（docs/11 §1），
+# 调用方可读取真实原因，避免将配额耗尽误报为规划器未能生成有效任务列表。
 _last_api_error: ContextVar[str | None] = ContextVar("last_api_error", default=None)
 
 
 def _looks_like_quota(msg: str) -> bool:
-    """Whether a provider error is a spend/quota exhaustion — hopeless to retry.
+    """判断提供方错误是否表示费用或配额耗尽，此类错误无法靠重试恢复。
 
-    Matched on class names and message text so the engine stays provider-agnostic
-    (no google/openai/anthropic import in its dependency tree, docs/12 M6).
-    """
+    匹配异常类名和消息，使引擎不依赖具体提供方的 SDK（docs/12 M6）。"""
     m = msg.lower()
     return any(
         marker in m
@@ -147,34 +124,57 @@ def _looks_like_quota(msg: str) -> bool:
 
 
 async def _structured(role: str, messages: list, schema):
-    """Invoke a role's model and return (parsed_model_or_None, cost, in_tok, out_tok).
+    """调用指定角色的模型，返回 (parsed_model_or_None, cost, in_tok, out_tok)。
 
-    Real models use with_structured_output(include_raw=True) so usage_metadata is
-    available for cost; fake models return JSON content we parse directly.
-    """
+    真实模型通过 with_structured_output(include_raw=True) 保留 usage_metadata 以计算费用；
+    模拟模型直接返回 JSON 内容，由此处解析。"""
+    with trace_span(
+        f"structured.{role}", kind="structured_output", metadata={"role": role}
+    ) as span:
+        if span.writer is not None and span.writer.capture_content:
+            try:
+                span.observe(expected_schema=schema.model_json_schema())
+            except Exception as exc:  # noqa: BLE001 — 数据结构观测不能改变解析流程
+                span.observe(schema_observation_error=type(exc).__name__)
+        result = await _structured_impl(role, messages, schema)
+        span.add(schema_status="parsed" if result[0] is not None else "unparsed")
+        if result[0] is None:
+            span.status = "business_error"
+        return result
+
+
+async def _structured_impl(role: str, messages: list, schema):
     _last_api_error.set(None)
     model = get_llm(role)
     if get_run_config().llm_mode == "fake":
-        resp = await model.ainvoke(messages)
+        resp = await traced_ainvoke(model, messages, role=role)
         cost = estimate_cost(resp, role)
         i, o = token_counts(resp)
         try:
-            parsed = schema.model_validate_json(resp.content)
+            with trace_span(
+                f"schema.{role}", kind="schema_validation", metadata={"strategy": "fake_json"}
+            ):
+                parsed = schema.model_validate_json(resp.content)
         except Exception:
             parsed = None
         return parsed, cost, i, o
 
-    structured = model.with_structured_output(schema, include_raw=True)
+    route = get_run_config().model_for(role)
+
+    if route.startswith("custom:deepseek"):
+        structured = model.with_structured_output(
+            schema,
+            method="function_calling",
+            include_raw=True,
+        )
+    else:
+        structured = model.with_structured_output(schema, include_raw=True)
     try:
-        result = await structured.ainvoke(messages)
+        result = await traced_ainvoke(structured, messages, role=role)
     except Exception as e:  # noqa: BLE001
-        # with_structured_output can RAISE (not just set parsing_error) when a model
-        # returns output the schema rejects — e.g. a local 7B emitting an out-of-range
-        # field — or when the PROVIDER rejects the request outright (429 quota,
-        # network). Treat both as an unparseable result so the calling node fails
-        # CLOSED (docs/11 §1), instead of letting the exception crash the whole
-        # pipeline — but record the message so provider errors are reported as
-        # provider errors, not misread as garbage output.
+        # with_structured_output 在字段不合规则或提供方拒绝请求时可能直接抛异常，
+        # 而不仅设置 parsing_error。统一按无法解析处理，让节点保守失败（docs/11 §1），
+        # 同时保留异常消息，避免把网络或配额错误误判为模型输出格式错误。
         _last_api_error.set(str(e)[:400])
         return None, 0.0, 0, 0
     raw = result.get("raw")
@@ -189,12 +189,20 @@ async def _structured(role: str, messages: list, schema):
                 cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
                 cleaned = re.sub(r"\s*```$", "", cleaned)
             try:
-                parsed = schema.model_validate_json(cleaned)
+                with trace_span(
+                    f"schema.{role}", kind="schema_validation", metadata={"strategy": "raw_json"}
+                ):
+                    parsed = schema.model_validate_json(cleaned)
             except Exception:
                 match = re.search(r"\{.*\}", cleaned, re.DOTALL)
                 if match:
                     try:
-                        parsed = schema.model_validate_json(match.group(0))
+                        with trace_span(
+                            f"schema.{role}",
+                            kind="schema_validation",
+                            metadata={"strategy": "json_object"},
+                        ):
+                            parsed = schema.model_validate_json(match.group(0))
                     except Exception:
                         pass
     return parsed, cost, i, o
@@ -208,7 +216,7 @@ def _acc(state: AgentState, cost: float, i: int, o: int) -> dict:
     }
 
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────────
+# ── 图节点 ────────────────────────────────────────────────────────
 
 
 async def planner_node(state: AgentState) -> dict:
@@ -222,10 +230,8 @@ async def planner_node(state: AgentState) -> dict:
         detail={
             "query": state["original_query"],
             "depth": state.get("research_depth", "balanced"),
-            # Requirement 1 (docs/04): the full role→route mapping, disclosed at plan
-            # time — before a single task or dollar is spent — not just in the finished
-            # report. `model` on every node's own kickoff event (below) is this same
-            # data, one role at a time, for a node emitted well after this one.
+            # 按 docs/04 要求，在研究花费发生前的规划阶段披露完整角色到模型路由映射。
+            # 后续各节点启动事件中的 model 记录同一信息中对应角色的路由，不只在最终报告中展示。
             "models": dict(cfg.models),
             "model": cfg.model_for("planner"),
         },
@@ -241,28 +247,36 @@ async def planner_node(state: AgentState) -> dict:
         ),
     ]
 
-    async def _attempt():
+    async def _attempt(attempt: int):
         _last_api_error.set(None)
         try:
-            parsed, cost, i, o = await _structured("planner", messages, PlannerOutput)
+            with trace_span(
+                "planner.attempt",
+                kind="attempt",
+                metadata={
+                    "role": "planner",
+                    "attempt": attempt,
+                    "strategy": "initial" if attempt == 1 else "retry_once",
+                },
+            ) as span:
+                parsed, cost, i, o = await _structured("planner", messages, PlannerOutput)
+                if parsed is None:
+                    span.status = "business_error"
         except Exception as e:  # noqa: BLE001
-            # Defence in depth: `_structured` is fail-closed and normally never raises,
-            # but if it ever does the planner must report the provider error, not crash.
+            # 纵深防御：即使通常不抛异常的 _structured 意外失败，也应返回提供方错误而非掩盖原因。
             return None, 0.0, 0, 0, str(e)[:400]
         return parsed, cost, i, o, _last_api_error.get()
 
-    parsed, cost, i, o, api_err = await _attempt()
+    parsed, cost, i, o, api_err = await _attempt(1)
     if api_err and _looks_like_quota(api_err):
-        # An exhausted spend cap will not recover within this run; a retry only spends
-        # time. Surface the provider's own message — the eval run that read "could not
-        # produce a valid task list" eight times was actually this.
+        # 费用上限或配额耗尽不会在本次研究中自行恢复，重试只会延长等待；直接展示提供方原始消息。
         logger.error("planner_quota_exhausted", session_id=sid, error=api_err)
         return {
             "error": f"planner: provider error — {api_err}",
             **_acc(state, cost, i, o),
         }
     if parsed is None:
-        parsed2, c2, i2, o2, api_err2 = await _attempt()  # one retry
+        parsed2, c2, i2, o2, api_err2 = await _attempt(2)  # 最多重试一次。
         cost, i, o = cost + c2, i + i2, o + o2
         parsed, api_err = parsed2, api_err2
     if parsed is None:
@@ -275,10 +289,8 @@ async def planner_node(state: AgentState) -> dict:
         return {"error": "planner: could not produce a valid task list", **_acc(state, cost, i, o)}
 
     tasks = [t.model_dump() for t in parsed.tasks]
-    # An explicitly chosen template outranks whatever the model proposed: the researcher
-    # picked a structure before the run started, and quietly replacing it with the
-    # planner's own idea would make the picker decorative. With no template chosen this
-    # is empty and the planner's proposal stands, which is today's behaviour.
+    # 用户显式选择的大纲模板优先于模型提案，否则模板选择器形同虚设。
+    # 未选择模板时此处为空，保留规划器建议的结构。
     outline = outlines.sections_for(cfg.outline_template) or [
         s.model_dump() for s in parsed.proposed_outline
     ]
@@ -301,23 +313,17 @@ async def planner_node(state: AgentState) -> dict:
     }
 
 
-# ── Parallel research rounds (docs/12 M7) ─────────────────────────────────────────
+# ── 并行研究轮次（docs/12 M7）───────────────────────────────────────
 
 
 class _BudgetGuard:
-    """Shared spend accounting for the tasks running in one round.
+    """同一轮并行任务共享的费用记账。
 
-    Concurrency and a hard spend cap are in tension: N tasks that each check the budget
-    before starting can all pass the check and then all spend. This guard narrows the
-    window as far as it can be narrowed without pre-reserving budget — every task adds
-    its cost the moment a model call returns, and every task re-checks before its next
-    tool round or before being dispatched at all.
-
-    So overshoot is *bounded by the calls already in flight*, not eliminated. Note the
-    sequential version had the same property, just with a window of one: `_over_budget`
-    was only consulted between tasks, after the spend had happened. Setting
-    `max_parallel_tasks=1` restores exactly that.
-    """
+    并发与硬性费用上限存在冲突：N 个任务可能同时通过预算检查，然后同时花费。
+    不预先保留预算时，只能在每次模型响应后立即累加费用，并在下一轮工具调用或派发前重新检查。
+    因此超支最多来自已经发出的调用，无法彻底消除。
+    原先顺序执行的 _over_budget 也只在任务间检查，只是窗口为一次调用；
+    max_parallel_tasks=1 会恢复这一行为。"""
 
     def __init__(self, spent: float, limit: float) -> None:
         self._spent = spent
@@ -329,9 +335,7 @@ class _BudgetGuard:
             self._spent += cost
 
     def exceeded(self) -> bool:
-        # 0 = unlimited, matching `_over_budget`. Without the guard on `_limit`, a zero
-        # cap reads as "already exceeded" at zero spend and every task is skipped before
-        # it runs — the second home of this rule, and the one easy to miss.
+        # 0 表示无限制，与 _over_budget 一致；必须先检查限制非零，否则零花费也会被判为超限并跳过全部任务。
         return bool(self._limit) and self._spent >= self._limit
 
     @property
@@ -339,14 +343,12 @@ class _BudgetGuard:
         return self._spent
 
 
-# Typographic substitutions a faithful quoter still makes: re-wrapping lines, or a model
-# straightening curly quotes. Folding these is not leniency about fabrication — it stops
-# the check firing on quotes that ARE in the source.
+# 统一换行、弯引号等排版差异，避免误拒绝来源中真实存在的引文；此归一化不会放宽对伪造内容的检查。
 _QUOTE_FOLD = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-"})
 
 
 def _norm_text(text: str) -> str:
-    """Whitespace- and case-insensitive form, with smart punctuation folded to ASCII."""
+    """忽略空白和大小写，并将智能标点折叠为 ASCII，得到用于匹配的文本形式。"""
     return " ".join((text or "").translate(_QUOTE_FOLD).split()).lower()
 
 
@@ -364,27 +366,18 @@ def _norm_url(url: str) -> str:
 def record_tool_output(
     seen: dict[str, str], tool_name: str, observation, grades: dict[str, str] | None = None
 ) -> None:
-    """Accumulate what each tool actually returned, keyed by URL.
+    """按 URL 累积工具实际返回的文本，这是执行器真正看到过什么的唯一记录。
 
-    This is the only record of what the executor really saw. `submit_evidence` arguments
-    are model-authored end to end — `source_url`, `source_title` and `snippet` alike — and
-    engine code overwrites exactly one field afterwards (`task_id`). Without this record
-    there is nothing to check a quotation against.
+    submit_evidence 的 source_url、source_title 和 snippet 都由模型编写，
+    引擎随后只覆盖 task_id；缺少这份记录便无法核查引文。
 
-    Keyed by the URL **as the tool reported it**, scheme and all. Matching is
-    case/scheme-insensitive and happens at lookup (`_seen_get`, `verify_evidence_snippets`),
-    so normalising the key here would only discard the one thing a citation needs: a URL a
-    reader can open. Storing the normalised form cost exactly that — snippet repair wrote
-    `a.example/paper` into `source_url` and every downstream link stopped resolving.
+    键保留工具报告的原始 URL，包括协议。匹配时才由 _seen_get 和 verify_evidence_snippets
+    忽略协议及大小写；若存储时就归一化，会丢掉读者能直接打开的地址。
+    此前片段修复曾将 a.example/paper 写回 source_url，导致下游链接失效。
 
-    `grades` is optional and additive: when given, it records *how* each URL was seen — a
-    fetched page body is stronger evidence than a search-result snippet, and
-    `Evidence.attested_against` (`ATTESTATION_GRADES`) exists to say which one a citation
-    rests on. `read_webpage` always sets `FETCHED_BODY`, overwriting any earlier
-    `SEARCH_SNIPPET` for the same URL — the body is strictly the better source, seen later
-    or not. `web_search` uses `setdefault` for the reverse reason: a snippet must never
-    downgrade a URL this task already opened in full.
-    """
+    可选的 grades 记录来源是网页正文还是搜索摘要，供 Evidence.attested_against 使用。
+    read_webpage 总是写入 FETCHED_BODY 并覆盖旧的 SEARCH_SNIPPET，因为正文的证据等级更高；
+    web_search 使用 setdefault，不能让摘要降低已经抓取过正文的 URL 的等级。"""
     if tool_name == "read_webpage" and isinstance(observation, dict):
         body = observation.get("text") or ""
         for key in (observation.get("url"), observation.get("final_url")):
@@ -393,8 +386,7 @@ def record_tool_output(
                 if grades is not None:
                     grades[key] = "FETCHED_BODY"
     elif tool_name == "web_search" and isinstance(observation, list):
-        # A snippet may legitimately be quoted from a search result rather than a fetched
-        # page, so search hits count as seen text too.
+        # 片段也可合法引用搜索摘要，因此搜索结果同样计入已见文本。
         for hit in observation:
             if isinstance(hit, dict) and hit.get("url"):
                 key = hit["url"]
@@ -404,7 +396,7 @@ def record_tool_output(
 
 
 def _seen_get(seen: dict[str, str], url: str | None) -> str:
-    """Text fetched for `url`, matched without regard to scheme, case or trailing slash."""
+    """读取 URL 对应的已抓取文本；匹配时忽略协议、大小写和结尾斜杠。"""
     target = _norm_url(url or "")
     if not target:
         return ""
@@ -412,12 +404,10 @@ def _seen_get(seen: dict[str, str], url: str | None) -> str:
 
 
 def _seen_grade(grades: dict[str, str], url: str | None) -> str | None:
-    """The strongest attestation grade recorded for `url`, matched like `_seen_get`.
+    """按 _seen_get 的匹配规则读取 URL 的最高核验等级。
 
-    `FETCHED_BODY` wins over `SEARCH_SNIPPET` when a URL was seen both ways — matching
-    `record_tool_output`'s own precedence, so a snippet that verifies against the merged
-    text of a page we both searched and fetched is graded on the stronger of the two.
-    """
+    同一 URL 既被搜索又被抓取时，FETCHED_BODY 优先于 SEARCH_SNIPPET，
+    与 record_tool_output 的优先级一致；合并文本中的有效引文按更强的来源核验。"""
     target = _norm_url(url or "")
     if not target:
         return None
@@ -432,42 +422,22 @@ def _seen_grade(grades: dict[str, str], url: str | None) -> str | None:
 def verify_evidence_snippets(
     evidence: list[dict], seen: dict[str, str], grades: dict[str, str] | None = None
 ) -> list[dict]:
-    """Blank every snippet that does not occur in what the tools actually returned.
+    """清空未出现在工具实际返回文本中的片段。
 
-    An unresolvable citation renders a ⚠ chip and tells the reader it failed. A fabricated
-    snippet renders clean, resolves to a real URL, and shows a quotation in quote marks
-    that was never written — strictly worse, and precisely the failure this product exists
-    to prevent.
+    无法解析的引用会显示警告；伪造片段却可能指向真实 URL，并把从未出现的文字显示成引文，
+    这更违背产品的可验证性承诺。真实运行曾将不在 PMC3543521 中的文字归给该论文，
+    而界面因缺少逐字校验显示为正常引用。
 
-    Not hypothetical. On 2026-08-16 a real-model run attributed "For overlap heatmaps
-    prefer Morisita-Horn (abundance-weighted, depth-robust) over Jaccard (presence/absence,
-    depth-biased), and normalize depth first" to PMC3543521. That paper contains no such
-    sentence, and the citation rendered clean because nothing checked it.
+    只清空 snippet，不删除整个证据块：key_fact 和 URL 仍可能有效；_number_sources
+    会跳过空片段，使引用失去引文而不是展示伪造内容。返回未通过的证据块，供日志记录。
 
-    Blanking rather than dropping the chunk: `key_fact` and the URL may still be sound, and
-    `_number_sources` already skips empty snippets, so the citation loses its quote instead
-    of displaying an invented one. Returns the chunks that failed, for logging.
+    若片段逐字存在于恰好一个其他已抓取来源中，则修正 URL，并用 snippet_reattributed
+    保留模型原先声称的来源，让读者能看见修复过程。必须恰好命中一个来源；
+    多页同时包含该句时不能猜测出处，仍须清空。写回的 URL 必须保留工具报告的完整协议。
 
-    Repair, not laundering: a model that quotes a page faithfully but labels it with the
-    wrong URL has made a citation error, and blanking a genuine quotation over it throws
-    away real evidence. So a snippet that is verbatim in exactly ONE other fetched source
-    is re-pointed at that source — and the URL the model claimed is kept on the chunk under
-    `snippet_reattributed`, because a repair a reader cannot see is a silent rewrite of what
-    the model said. Two conditions keep this from becoming a guess:
-
-    - **exactly one** match, or the chunk is blanked like any other unverifiable quote. A
-      sentence appearing in several fetched pages has no determinable source, and taking
-      whichever the dict yielded first would attribute the same run differently on a rerun.
-    - the URL written back is the one the tool reported, scheme intact — see
-      `record_tool_output` on why `seen` is keyed that way.
-
-    `grades`, when supplied, is where this function's verdict actually gets recorded for a
-    reader: a chunk that verifies is stamped `attestation_grade` (`FETCHED_BODY` or
-    `SEARCH_SNIPPET`), so `record_evidence` can persist `ATTESTED`/`attested_against`
-    instead of the `UNCHECKED` it would otherwise write for a citation this function just
-    finished checking. Optional so every existing caller — including this module's own
-    tests — keeps working unchanged; the production call site always passes it.
-    """
+    传入 grades 时，为通过核验的证据写入 attestation_grade（FETCHED_BODY 或 SEARCH_SNIPPET），
+    使 record_evidence 能持久化 ATTESTED 和 attested_against，而不是继续标记 UNCHECKED。
+    该参数保持可选以兼容现有调用和测试，生产调用始终传入。"""
     fabricated: list[dict] = []
 
     for chunk in evidence:
@@ -485,8 +455,7 @@ def verify_evidence_snippets(
             continue
 
         matches = [url for url, text in seen.items() if norm_snip in _norm_text(text)]
-        # Several keys can be the same page (a redirect records both `url` and
-        # `final_url`), which is one source, not an ambiguity.
+        # 重定向可能同时记录 url 与 final_url，多个键指向同一页面仍算一个来源，不构成出处歧义。
         if len({_norm_url(u) for u in matches}) == 1:
             chunk["source_url"] = matches[0]
             chunk["snippet_reattributed"] = claimed
@@ -503,12 +472,12 @@ def verify_evidence_snippets(
 
 
 def _task_key(task: dict) -> str:
-    """Verdicts and retries are keyed by string — the checkpointer stores state as JSON."""
+    """评审结果与重试次数使用字符串键，因为检查点按 JSON 存储状态。"""
     return str(task.get("id"))
 
 
 def _pending(state: AgentState, max_retries: int) -> list[dict]:
-    """Tasks still needing work: never passed, and not yet out of retries."""
+    """返回尚未通过评审、且重试次数未耗尽的待研究任务。"""
     verdicts = state.get("verdicts") or {}
     retries = state.get("retries") or {}
     out = []
@@ -523,7 +492,7 @@ def _pending(state: AgentState, max_retries: int) -> list[dict]:
 
 
 class submit_evidence(BaseModel):
-    """Submit the final gathered evidence for the task."""
+    """提交此任务最终收集到的证据。"""
 
     evidence: list[EvidenceChunk] = Field(default_factory=list, description="List of cited facts")
 
@@ -548,12 +517,10 @@ class submit_evidence(BaseModel):
 
 
 def _parse_submission(args: Any) -> list[dict]:
-    """Validate one `submit_evidence` payload into evidence dicts. Raises on rejection.
+    """将一次 submit_evidence 的参数校验为证据字典；不合格时抛出异常。
 
-    Truncate to the configured cap before validation (internal/07 Phase 3) — this can only
-    tighten `EvidenceChunk.snippet`'s own max_length=500, never loosen it, since the
-    config's default (500) equals that ceiling and nothing here raises it.
-    """
+    校验前按配置截断片段（internal/07 Phase 3）。该限制只能收紧 EvidenceChunk.snippet
+    自身的 max_length=500，不能放宽；配置默认值也为 500。"""
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -581,38 +548,24 @@ def _parse_submission(args: Any) -> list[dict]:
 async def _forced_submit(
     sid: str, task: dict, seen_text: dict[str, str], guard: _BudgetGuard
 ) -> tuple[list[dict], float, int, int]:
-    """Ask for the evidence directly, when the model never offered it.
+    """模型未主动提交证据时，明确要求它从已有来源中提取。
 
-    The executor's tool loop *invites* `submit_evidence`; nothing obliges a model to
-    accept. Run `96a16137` searched and fetched successfully and then simply kept
-    searching until it ran out of rounds — evidence `[]`, twice, and a failed run whose
-    stated reason was to go check a search provider that had answered every query. A model
-    declining to call one tool must not be able to discard text the engine already holds.
+    工具循环允许调用 submit_evidence，却不能保证模型会选择它。真实运行曾成功搜索和抓取，
+    却持续搜索直到轮数耗尽，两次得到空证据，最后错误地建议用户检查正常工作的搜索提供方。
+    模型不愿调用某个工具，不能成为丢弃引擎已获取文本的理由。
 
-    Two constraints make this an extraction step rather than a second opinion:
+    此步骤只接收 seen_text，且返回结果仍由 verify_evidence_snippets 核验，
+    因此模型记忆不能绕过来源校验成为引用。
 
-    - it is handed **only** `seen_text`, so there is no route by which model memory can
-      become a citation, and
-    - `verify_evidence_snippets` still rules on what comes back, exactly as it does for a
-      voluntary submission.
-
-    **Two mechanisms, because one is not reliable on a router alias.** `custom:auto/*`
-    resolves per call — a single task was served by three different models in one observed
-    run — and a named `tool_choice` that most honour, some silently ignore, returning an
-    assistant message with no tool call. So a refusal is retried as structured output,
-    which is a differently shaped request rather than the same one twice.
-
-    Returns empty when nothing was fetched. A task with no sources in hand has nothing to
-    quote, and asking anyway is asking a model to invent one.
-    """
+    custom:auto/* 每次调用可能解析到不同模型；有些模型忽略指定的 tool_choice，
+    只返回无工具调用的消息。因此先强制选择提交工具，不成功再采用结构化输出，
+    以不同请求形状补救，而非原样重复。未抓取到任何来源时直接返回空列表，避免要求模型编造。"""
     sources = {url: text for url, text in seen_text.items() if (text or "").strip()}
     if not sources or guard.exceeded():
         return [], 0.0, 0, 0
 
-    # Richest sources first. A run accumulates far more search hits than read pages, and a
-    # one-line hit crowds out the page bodies that actually carry quotable text. Dropping
-    # the tail costs nothing: `verify_evidence_snippets` still rules against the whole of
-    # `seen_text`, so anything quoted from what we send verifies either way.
+    # 优先提供文本最丰富的来源，避免单行搜索命中挤掉可引用的网页正文。
+    # 裁去尾部只缩小发送内容，verify_evidence_snippets 仍对完整 seen_text 核验。
     ranked = sorted(sources.items(), key=lambda kv: len(kv[1]), reverse=True)
     digest = json.dumps(
         {url: text[:_FORCED_SUBMIT_SOURCE_CHARS] for url, text in ranked[:_FORCED_SUBMIT_SOURCES]},
@@ -639,12 +592,10 @@ async def _forced_submit(
     evidence: list[dict] = []
 
     async def charge(delta: float, di: int, do: int) -> None:
-        """Bill one call, once. The guard takes the delta, never the running total.
+        """每次调用只记账一次；预算检查接收本次增量，不能接收累计总额。
 
-        Both mechanisms can run, so charging an accumulator would bill the first attempt
-        again on the second — a spend the run never made, reported as one it did. That is
-        the same honesty class as recording a model that was not called.
-        """
+        两种提取机制可能先后运行；若提交累计数，第二次会重复计算第一次的花费，
+        记录研究并未实际发生的支出，违背记录真实调用的原则。"""
         nonlocal cost, i_tot, o_tot
         cost += delta
         i_tot += di
@@ -656,13 +607,11 @@ async def _forced_submit(
             break
         try:
             if mechanism == "tool_choice":
-                # Preferred: reuses the schema, validation and truncation the voluntary
-                # path already goes through, so both routes into `evidence` are one code
-                # path.
+                # 优先复用主动提交路径的模式、校验和截断逻辑，使两条写入 evidence 的路径共用实现。
                 model = get_llm("executor").bind_tools(
                     [submit_evidence], tool_choice="submit_evidence"
                 )
-                resp = await model.ainvoke(messages)
+                resp = await traced_ainvoke(model, messages, role="executor")
                 await charge(estimate_cost(resp, "executor"), *token_counts(resp))
                 calls = [
                     c
@@ -679,7 +628,17 @@ async def _forced_submit(
                         text=(text_of(resp) or "")[:200],
                     )
                     continue
-                evidence = _parse_submission(calls[0]["args"])
+                with trace_span(
+                    "submit_evidence",
+                    kind="tool",
+                    inputs=calls[0]["args"],
+                    metadata={
+                        "tool_name": "submit_evidence",
+                        "tool_call_id": calls[0].get("id", ""),
+                    },
+                ) as submit_span:
+                    evidence = _parse_submission(calls[0]["args"])
+                    submit_span.observe(output=evidence)
             else:
                 parsed, c, di, do = await _structured("executor", messages, ExecutorOutput)
                 await charge(c, di, do)
@@ -696,8 +655,7 @@ async def _forced_submit(
                     {"evidence": [e.model_dump() for e in parsed.evidence]}
                 )
         except Exception as e:  # noqa: BLE001
-            # Fail closed and *say so*. A provider error here costs the task its evidence,
-            # so it must never be reported as "the sources supported nothing".
+            # 失败时保守处理并明确记录：提供方错误导致未能提取证据，不能说成来源没有支持任何结论。
             logger.warning(
                 "forced_submit_failed",
                 session_id=sid,
@@ -730,7 +688,7 @@ async def _forced_submit(
 
 
 async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> dict:
-    """Gather evidence for a single task. Returns {evidence, cost, tokens_in, tokens_out}."""
+    """为单个任务收集证据，返回 evidence、cost、tokens_in 和 tokens_out。"""
     sid = state["session_id"]
     feedback = ((state.get("verdicts") or {}).get(_task_key(task)) or {}).get(
         "feedback_for_executor"
@@ -761,15 +719,11 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
     i_tot = o_tot = 0
     evidence: list[dict] = []
     submitted = False
-    # What the tools actually returned, keyed by URL — the only record of what the
-    # executor really saw. See `verify_evidence_snippets`.
+    # 按 URL 保存工具真正返回的文本，作为执行器已读内容的唯一记录；供 verify_evidence_snippets 核验。
     seen_text: dict[str, str] = {}
-    # How each URL in `seen_text` was seen — fetched body or search snippet — so a
-    # verified citation can be persisted as attested-to-what, not just attested.
+    # 记录各 URL 来自正文抓取还是搜索摘要，以便持久化引用具体经过哪种来源的核验。
     seen_grades: dict[str, str] = {}
-    # Pages already opened this task, so a second request for one is answered from
-    # `seen_text` instead of the network. The observed run re-read one arXiv page five
-    # times inside a single task, spending a round and a fetch each time to learn nothing.
+    # 记录本任务已打开的页面；重复请求从 seen_text 返回，避免反复抓取同一页面并浪费模型轮次。
     fetched: set[str] = set()
     max_rounds, max_pages = _limits_for(state.get("research_depth"))
     for _round in range(max_rounds):
@@ -777,10 +731,10 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
             logger.warning("executor_budget_stop", session_id=sid, task_id=task["id"])
             break
         if len(fetched) >= max_pages:
-            # Enough sources are in hand; the forced pass below turns them into evidence.
+            # 已获取足够来源，交给后续强制提取步骤生成证据。
             logger.info("executor_read_limit", session_id=sid, task_id=task["id"])
             break
-        resp = await model.ainvoke(messages)
+        resp = await traced_ainvoke(model, messages, role="executor")
         round_cost = estimate_cost(resp, "executor")
         cost += round_cost
         await guard.add(round_cost)
@@ -793,23 +747,27 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
             break
         is_done = False
 
-        # ── Run this turn's tool calls concurrently ───────────────────────────────
+        # 并发执行本轮工具调用。
         #
-        # They used to run one after another. A model that asks for three pages in one
-        # turn then paid three fetch timeouts end to end, and — worse — the prompt's
-        # step-by-step recipe encouraged it to ask for them in three separate *turns*
-        # instead, each costing a full model round-trip. Fetches are the cheap part; the
-        # round-trip is minutes. So the prompt now asks for the reads in one turn, and
-        # this makes that turn cost one fetch's latency rather than N.
-        #
-        # Order is preserved throughout: results are consumed in `tool_calls` order, so
-        # `seen_text`, the emitted log and the appended `ToolMessage`s are identical to
-        # the sequential version regardless of which fetch finishes first.
+        # 顺序抓取会串行累积多个页面的超时；分散到多个模型轮次则还会增加昂贵的模型往返。
+        # 同一轮并发抓取只承担最慢一次抓取的等待时间。
+        # 结果仍按 tool_calls 顺序消费，使 seen_text、日志及 ToolMessage 与顺序版本保持一致，
+        # 不受抓取完成先后影响。
         pending_calls: list[dict] = []
         for call in tool_calls:
             if call["name"] == "submit_evidence":
                 try:
-                    evidence = _parse_submission(call["args"])
+                    with trace_span(
+                        "submit_evidence",
+                        kind="tool",
+                        inputs=call["args"],
+                        metadata={
+                            "tool_name": "submit_evidence",
+                            "tool_call_id": call.get("id", ""),
+                        },
+                    ) as submit_span:
+                        evidence = _parse_submission(call["args"])
+                        submit_span.observe(output=evidence)
                     thought_snippet = text_of(resp) if resp else ""
                     await emit(
                         sid,
@@ -826,9 +784,7 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
                     is_done = True
                     break
                 except Exception as e:  # noqa: BLE001
-                    # Report it. Swallowed into a tool observation, a model calling this
-                    # with bad arguments every round was indistinguishable from one that
-                    # never called it — the two have completely different remedies.
+                    # 明确记录参数校验失败；只写入工具观察会让反复传错参数与从未提交证据无法区分，两者处理方法不同。
                     logger.warning(
                         "submit_evidence_rejected",
                         session_id=sid,
@@ -851,37 +807,45 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
             break
 
         async def _observe(call: dict, *, cached: bool) -> object:
-            """One tool call's observation. Never raises — a failure is an observation."""
+            """返回一次工具调用的观察结果；不抛出异常，失败也作为观察结果交给模型。"""
             if cached:
-                # Already open in `seen_text`; refetching cannot produce new text, and the
-                # round it costs is a round not spent concluding.
+                # seen_text 已包含该页面，重复抓取不会增加信息，却会挤占用于总结的模型轮次。
                 url = (call.get("args") or {}).get("url")
-                return {
+                observation = {
                     "url": url,
                     "text": _seen_get(seen_text, url),
                     "error": None,
                     "note": "already read this page — quote it or move on",
                 }
+                with trace_span(call["name"], kind="tool_cache", inputs=call.get("args")) as span:
+                    span.observe(output=observation)
+                return observation
             tool = _TOOLS_BY_NAME.get(call["name"])
             if tool is None:
                 return f"unknown tool {call['name']}"
             try:
-                return await tool.ainvoke(call["args"])
+                with trace_span(
+                    call["name"],
+                    kind="tool",
+                    inputs=call.get("args"),
+                    metadata={"tool_name": call["name"], "tool_call_id": call.get("id", "")},
+                ) as span:
+                    observation = await tool.ainvoke(call["args"])
+                    span.observe(output=observation)
+                    if isinstance(observation, dict) and observation.get("error"):
+                        span.status = "business_error"
+                    return observation
             except Exception as e:  # noqa: BLE001
                 return f"tool error: {e}"
 
-        # Cached-or-not is decided per call, before anything is dispatched, and never from
-        # a set the batch shares: marking a duplicate as cached in a shared set marks its
-        # own first occurrence too, and the whole turn then reads from an empty cache
-        # having fetched nothing. The first request for a URL fetches; a repeat — in this
-        # turn or an earlier one — is answered from `seen_text`.
+        # 派发前逐次决定是否命中缓存，不能从整个批次共享的集合判断。
+        # 否则将重复 URL 标记为缓存命中时，首次请求也会被误标记，整轮从空缓存读取且没有真正抓取。
+        # 首次请求抓取，当前轮或之前轮次的重复请求才从 seen_text 读取。
         seen_before = set(fetched)
         dispatch: list[tuple[dict, bool]] = []
         for call in pending_calls:
             url = (call.get("args") or {}).get("url")
-            # Model-authored and not yet validated: a list, number or object here is the
-            # tool's schema to reject as an observation the model can correct, and a
-            # normalising `.strip()` on it would fail the whole node instead.
+            # 参数尚由模型提供且未经校验；列表、数字等错误形状应交给工具模式拒绝并允许模型修正，不能先 strip 导致整个节点失败。
             if call["name"] == "read_webpage" and isinstance(url, str) and url.strip():
                 norm = _norm_url(url)
                 dispatch.append((call, norm in seen_before))
@@ -919,23 +883,18 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
                 ToolMessage(content=json.dumps(observation, default=str), tool_call_id=call["id"])
             )
 
-    # The model finished its turns without ever submitting. Ask it directly rather than
-    # letting the text we already fetched fall on the floor — see `_forced_submit`.
+    # 工具轮数耗尽仍未提交时，显式请求提取；不能丢弃已经获取的文本，见 _forced_submit。
     if not submitted:
         evidence, fcost, fi, fo = await _forced_submit(sid, task, seen_text, guard)
         cost += fcost
         i_tot += fi
         o_tot += fo
 
-    # Before anything downstream can render these as verbatim quotations.
+    # 在下游将片段作为逐字引文展示前进行核验。
     #
-    # Real mode only, and that is a limitation rather than a design choice. Scripted fake
-    # executors submit evidence without necessarily calling a tool first, so `seen_text`
-    # is empty and every fixture snippet would be blanked — which broke the corpus
-    # contradiction test. The right fix is self-consistent fixtures (a fake that quotes
-    # only what its fake tools returned), and until then this check does not run where CI
-    # runs, so it cannot catch a regression in it. The danger it guards is real models
-    # inventing quotations, so guarding real mode is where the value is.
+    # 当前仅在真实模式启用，这是模拟数据的限制：脚本执行器可能未调用工具就提交证据，
+    # seen_text 为空，会使全部模拟引文被清空。理想修复是让模拟来源和引用自洽；
+    # 在此之前，CI 的模拟模式无法覆盖本检查的回归，而真实模型伪造引文的风险仍必须防护。
     fabricated = (
         verify_evidence_snippets(evidence, seen_text, grades=seen_grades)
         if get_run_config().llm_mode != "fake"
@@ -960,9 +919,7 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
             detail={"task_id": task["id"], "urls": [c.get("source_url", "") for c in fabricated]},
         )
 
-    # A repaired citation is not a clean one. `verify_evidence_snippets` re-points a quote
-    # it found in a different fetched page, and that changes what the model said its source
-    # was — so it is reported here rather than left to be noticed in a diff of the bundle.
+    # 引用重新归属也属于修复，不能显示成未经改动的原始输出；显式报告来源变更，让用户知道发生了什么。
     repaired = [c for c in evidence if c.get("snippet_reattributed")]
     if repaired:
         logger.warning(
@@ -1003,9 +960,7 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
             "evidence": evidence,
         },
     )
-    # `sources` is what retrieval actually delivered, which is a different question from
-    # what the executor made of it. Reported so a run that gathered nothing can say which
-    # of the two failed instead of guessing — see `_no_research_reason`.
+    # sources 记录检索实际取得的来源数，与执行器从中提取的证据不同；据此区分检索失败和提取失败，见 _no_research_reason。
     return {
         "evidence": evidence,
         "cost": cost,
@@ -1016,7 +971,7 @@ async def _research_one(state: AgentState, task: dict, guard: _BudgetGuard) -> d
 
 
 async def executor_node(state: AgentState) -> dict:
-    """Research every pending task concurrently, bounded by `max_parallel_tasks`."""
+    """并行研究全部待办任务，并以 max_parallel_tasks 限制并发数。"""
     sid = state["session_id"]
     cfg = get_run_config()
     pending = _pending(state, cfg.max_critic_loops)
@@ -1046,19 +1001,15 @@ async def executor_node(state: AgentState) -> dict:
                 return {"evidence": [], "cost": 0.0, "in": 0, "out": 0, "sources": 0}
             return await _research_one(state, task, guard)
 
-    # Results come back in argument order regardless of completion order, which is what
-    # keeps the merge below deterministic. Not `asyncio.gather`: a task that raises must not
-    # leave its siblings researching — and writing through the host's session — after the
-    # node has failed (research_engine/concurrency.py).
+    # 结果按参数顺序返回，保持后续合并确定性。
+    # 使用 gather_or_cancel 而非 asyncio.gather，确保一项失败后其余任务不会继续研究，
+    # 也不会在宿主关闭数据库会话后继续写入事件（research_engine/concurrency.py）。
     results = await gather_or_cancel(*(bounded(t) for t in pending))
 
     fresh = {_task_key(t): r["evidence"] for t, r in zip(pending, results, strict=True)}
     previous = state.get("evidence") or []
 
-    # Rebuild the whole evidence list in task-definition order: a task researched this
-    # round contributes its new evidence, any other task keeps what it already had. Order
-    # must not depend on which task finished first or the synthesizer would renumber
-    # citations between otherwise identical runs.
+    # 按任务定义顺序重建证据列表，本轮任务使用新证据，其他任务保留旧证据；不能因完成顺序改变而导致相同研究的引用编号漂移。
     merged: list[dict] = []
     for task in state.get("tasks") or []:
         key = _task_key(task)
@@ -1070,8 +1021,7 @@ async def executor_node(state: AgentState) -> dict:
     cost = sum(r["cost"] for r in results)
     i_tot = sum(r["in"] for r in results)
     o_tot = sum(r["out"] for r in results)
-    # Highest reading of the run, not this round's: a later round that searched worse must
-    # not erase the evidence that retrieval did work earlier.
+    # 保留整个研究过程中观测到的最大来源数，不能让后续较差的检索结果抹掉此前成功检索的事实。
     sources_seen = max(state.get("sources_seen", 0), sum(r.get("sources", 0) for r in results))
     return {
         "evidence": merged,
@@ -1088,9 +1038,7 @@ async def _criticize_one(
         e for e in state.get("evidence", []) if str(e.get("task_id")) == _task_key(task)
     ]
 
-    # A configured floor (internal/07 Phase 3; 0 = no floor, today's behaviour) fails
-    # closed without spending a model call — evidence that is already too thin to meet
-    # the floor cannot become sufficient by asking a model to grade it.
+    # 已知证据不足配置下限时直接保守判失败，不浪费模型调用；0 表示未启用下限（internal/07 Phase 3）。
     min_sources = get_run_config().min_sources_per_task
     if min_sources > 0 and len(task_evidence) < min_sources:
         verdict = CriticVerdict(
@@ -1105,8 +1053,7 @@ async def _criticize_one(
     allowed = get_run_config().corpus_allowed_ids
     selection_note = ""
     if allowed is not None:
-        # After the user's critic prompt, never replacing it: a one- or two-file selection
-        # cannot meet a two-independent-sources rule (internal/rfcs/V3.1 §9, AC-19).
+        # 在用户评审提示之后补充，不覆盖用户指令；只有一两个文件的指定范围无法满足两个独立来源的规则（internal/rfcs/V3.1 §9，AC-19）。
         messages.append(SystemMessage(content=system_prompt("critic.selection_addendum")))
         selection_note = (
             f"Selected files: {len(allowed)}. A passing task needs evidence from "
@@ -1120,7 +1067,7 @@ async def _criticize_one(
     ]
     parsed, cost, i, o = await _structured("critic", messages, CriticVerdict)
     if parsed is None:
-        # Fail closed (docs/11 §1 rule 2): invalid critic output is a failure, not a pass.
+        # 保守失败（docs/11 §1 rule 2）：无效评审结果算未通过，不能默认放行。
         parsed = CriticVerdict(
             passed=False,
             confidence=0.0,
@@ -1131,7 +1078,7 @@ async def _criticize_one(
 
 
 async def critic_node(state: AgentState) -> dict:
-    """Grade every task researched this round, concurrently."""
+    """并行评审本轮研究过的全部任务。"""
     sid = state["session_id"]
     cfg = get_run_config()
     pending = _pending(state, cfg.max_critic_loops)
@@ -1182,82 +1129,51 @@ async def critic_node(state: AgentState) -> dict:
     }
 
 
-# ── Citation-fidelity verification (docs/12 M5) ──────────────────────────────────
+# ── 引用忠实度核验（docs/12 M5）────────────────────────────────────
 #
-# The eval judge rules on a claim against the snippets of its cited sources — and the
-# baseline run measured the synthesizer shipping claims its own snippets do not back
-# (postgres-vs-mysql at 0.5256). The drift enters through the executor's key_fact, which
-# the synthesizer follows past the verbatim snippet. So before a draft reaches the human
-# gate, every cited claim gets the SAME ruling here: supported → untouched; not supported
-# → its markers are stripped and the claim is flagged, because a citation the evidence
-# does not back is worse than an admitted gap.
+# 评测按主张所引来源的片段判断支持情况；综合器可能沿用执行器的 key_fact 改写，
+# 写出逐字片段并不支持的主张。因此在进入人工审核前采用同一规则逐项检查：
+# 支持则保留，不支持则移除引用标记并明确提示，避免空有引用造成可信假象。
 
-# Must END with a sentence terminator: the eval judge splits sentences on [.!?] +
-# whitespace, and a note without one gets merged into the FOLLOWING sentence — measured
-# as a supported claim ruled NO because it carried the previous claim's note (run #3).
+# 提示必须以句末标点结束，否则评测按标点加空白切句时，会将提示并入下一句，使下一条有支持的主张被误判。
 _VERIFIED_NOTE = " *(citation could not be verified)*."
-# The claim split MUST mirror the eval judge's `claims.split_sentences`/`claim_lines`
-# exactly (lookahead on the next sentence's opener + abbreviation rejoin): this pass is
-# measured by that judge, so it must rule on the same claims, not fragments of them.
-#
-# It now does so by *importing the same objects* rather than restating the patterns —
-# four regexes were duplicated here and in `evals.metrics`, with a comment asserting they
-# matched and nothing checking it. `tests/test_claim_extraction_parity.py` pins both the
-# identity of these primitives and the sentence-for-sentence agreement of the two scans.
+# 切句必须与评测的 claims.split_sentences 和 claim_lines 完全一致，包括句首前瞻及缩写重组。
+# 此处直接导入相同对象，不再复制正则；tests/test_claim_extraction_parity.py
+# 同时检查对象身份和逐句提取结果，防止核验与评测面对不同片段。
 _VSPLIT_RE = claims.SENTENCE_SPLIT_RE
 _VABBREV_TAIL_RE = claims.ABBREV_TAIL_RE
 _VLIST_MARKER_RE = claims.LIST_MARKER_RE
-# Limitations is where the synthesizer writes what the evidence does NOT cover; its
-# sentences are hedging, not factual claims — the eval judge excludes them (metrics v3),
-# so this pass must too.
+# Limitations 描述证据未覆盖的范围，是保留性说明而非事实主张；此处与评测 v3 一样排除该部分。
 _VLIMITATIONS_HEADING_RE = claims.LIMITATIONS_HEADING_RE
-# A cited sentence opening with a deictic ("This is detailed in Article 55 [4].") is
-# judged by the eval harness as a STANDALONE claim — and an anaphor with its referent
-# in the previous sentence reads as unsupported. Measured as 4 of 11 NO rulings in the
-# second Ollama eval. The claim split still mirrors the judge (separate sentences), and
-# the verify pass strips such markers deterministically.
+# 以指代词开头的引用句在评测中被单独判断，前句的指代对象不在上下文中，会显得无据。
+# 保持与评测相同的独立切句规则，并确定性移除此类引用。
 _VDEICTIC_RE = re.compile(r"^(?:This|These|Those|That|It|Such)\b", re.I)
-# A bold label prefix ("**Cost**: ...") starts 3 of 8 NO rulings in run #3: the judge
-# rules on the sentence as a whole, and no snippet contains the label — the sentence as
-# written always exceeds its evidence. Stripped like deictics; prompt rule 6 forbids it.
+# 加粗标签前缀会让整句超出来源片段包含的文字；与指代句一样移除引用，综合器提示规则 6 也禁止这种写法。
 _VLABEL_RE = re.compile(r"^\*\*[^*]+\*\*\s*:")
-# Mechanical fidelity pre-check: every number-like token in a claim must appear verbatim
-# in one of the cited snippets. A local 7B verifier rubber-stamps plausible prose (the
-# second Ollama eval scored 0.8142 with the verifier approving 7 claims the judge later
-# rejected); literal number/percentage/year matching is deterministic and catches the
-# drift class the judge actually ruled NO on — invented figures and wrong magnitudes.
+# 确定性预检：主张中的每个数字类词元都必须逐字出现在至少一个所引片段中。
+# 小型本地核验器可能放行貌似合理的杜撰数字；对数字、百分比和年份做字面匹配可捕获该类偏差。
 _VNUM_RE = re.compile(r"\d+(?:\.\d+)?%?|\b\d{4}\b")
 
 
 def _claim_numbers(claim: str) -> list[str]:
-    """Number-like tokens in a claim, citation markers excluded."""
+    """提取主张中的数字类词元，排除引用标记。"""
     return _VNUM_RE.findall(re.sub(r"\[\d+(?:\s*,\s*\d+)*\]", "", claim))
 
 
 def _numbers_grounded(claim: str, snippets: str) -> bool:
-    # Word-bounded containment: "5" must not be grounded by "50%", or every short
-    # number would false-positive and the check would pass nothing.
+    # 按词边界匹配，不能用 50% 为数字 5 提供依据，否则短数字会产生误匹配。
     return all(
         re.search(rf"(?<![0-9.]){re.escape(n)}(?![0-9.])", snippets) for n in _claim_numbers(claim)
     )
 
 
-#: This pass's own sources-section boundary, and the one place it deliberately differs
-#: from `claims.SOURCES_HEADING_RE` (`#{1,6}`): a **bare** `Sources` line with no Markdown
-#: heading marker also ends the body here. Kept local rather than pushed into `claims`
-#: because widening the shared pattern would change what the eval judge counts as a claim,
-#: which is a metrics-definition change and needs a `METRICS_VERSION` bump to be honest.
-#: `tests/test_claim_extraction_parity.py` pins the divergence so it stays deliberate.
+#: 此处独有的来源区块边界：除 Markdown 标题外，单独一行 Sources 也结束正文。
+#: 不扩大共享的 claims.SOURCES_HEADING_RE，因为那会改变评测对主张的定义，
+#: 需要同时递增 METRICS_VERSION；tests/test_claim_extraction_parity.py 固定此有意差异。
 #:
-#: The two branches are not interchangeable, and collapsing them to one optional `#`
-#: (`#{0,6}`) is what issue #48 was: with the marker optional the pattern also matched
-#: ordinary prose that merely *starts* with the word — "Sources of error were considered
-#: [1]." — so the scan broke there and every remaining claim went unchecked. Unchecked
-#: means its citation markers are never stripped, so the report renders *more* verified
-#: than it is, which is the one failure class this project refuses outright. The heading
-#: branch therefore stays open-ended (so `## Sources and References` still ends the body,
-#: exactly as it does for the judge), while the bare-label branch must consume the whole
-#: line — a label is all a label line contains.
+#: 两条分支不能合并为可选的 #（#{0,6}）：可选标记会把以 Sources 开头的普通正文也当作边界，
+#: 导致后续主张跳过核验而显得更可信。标题分支允许 Sources and References 等后缀，
+#: 无标题标记的分支则必须匹配整行，确保它只是一行标签。
 _VSOURCES_RE = re.compile(
     r"(?i)(?:"
     r"#{1,6}\s*(?:sources|references|citations|bibliography)\b"
@@ -1268,31 +1184,21 @@ _VSOURCES_RE = re.compile(
 
 
 def _cited_claims(draft: str) -> list[str]:
-    """Cited factual sentences in the draft body, sources section excluded.
+    """提取草稿正文中带引用的事实句，排除来源列表。
 
-    Sentence splitting, list-marker stripping, the length floor and the citation pattern
-    all come from `research_engine.claims` — the same definitions the eval judge uses, so
-    this pass rules on the same claims it is measured against rather than on fragments.
+    句子切分、列表标记清理、长度下限和引用模式均来自 research_engine.claims，
+    与评测使用同一套定义，避免测量和检查面对不同的句子片段。
 
-    Two scanning differences from `claims.claim_lines` remain, both deliberate:
-
-    1. A **bare** `Sources` line ends the body here (`_VSOURCES_RE`), where the judge
-       requires a `#` heading. Only a line that is *nothing but* the label counts; prose
-       opening with the word is a claim like any other (issue #48).
-    2. The judge also skips the engine-rendered *Conflicting evidence* block. This pass
-       does not need to: the block is appended by `synthesizer_node` *after* the fidelity
-       check has already run, so it is never present in the draft this function sees.
-    """
+    此处有两个有意保留的差异：
+    1. 单独一行的 Sources 也会结束正文（_VSOURCES_RE），而评测要求 Markdown 标题。
+       只有整行仅含该标签才算边界，以 Sources 开头的普通句子仍是主张（issue #48）。
+    2. 评测还会跳过引擎生成的 Conflicting evidence 区块；此处无需处理，
+       因为 synthesizer_node 会在忠实度检查结束后才附加该区块。"""
     out: list[str] = []
     skipping = False
     for raw in (draft or "").splitlines():
         line = raw.strip()
-        # Tested BEFORE the heading guard below. That guard `continue`s on anything
-        # starting with '#', which left this break unreachable for the `## Sources`
-        # heading the synthesizer actually emits — so the source list was judged as
-        # claims, and each line failed `_numbers_grounded` on the digits in its own URL
-        # (arXiv ids, years). Every report shipped with the unverified note appended to
-        # every line of its own bibliography.
+        # 必须先判断来源边界，再跳过其他标题；否则 ## Sources 被 continue 提前跳过，来源列表会被误当主张，URL 中的数字又让全部书目被标成未核验。
         if _VSOURCES_RE.match(line):
             break
         if not line or line.startswith("#"):
@@ -1314,13 +1220,11 @@ def _cited_claims(draft: str) -> list[str]:
 async def _verifier_verdicts(
     claim_evidence: list[tuple[str, str]],
 ) -> tuple[list[bool], float, int, int]:
-    """Ask the critic model whether each claim is supported by its evidence.
-    Returns (verdicts, cost, tokens_in, tokens_out).
+    """请求评审模型判断各主张是否受到对应证据支持，返回 (verdicts, cost, tokens_in, tokens_out)。
 
-    Real-mode path; fake mode answers YES for every claim (fakes.py). Mirrors the eval
-    judge's prompt and line format (evals/harness.judge_citation_support) on purpose:
-    the pass is measured by that judge, so the in-graph check must rule like it.
-    """
+    真实模式调用模型；模拟模式在 fakes.py 中对全部主张回答 YES。
+    提示词和逐行格式有意与 evals/harness.judge_citation_support 一致，
+    使图内核验和测量该核验效果的评测遵循同一判定规则。"""
     llm = get_llm("critic")
     BATCH = 4
     verdicts: list[bool] = []
@@ -1331,11 +1235,13 @@ async def _verifier_verdicts(
             f"Claim {i}: {claim}\nEvidence {i}:\n{snippets}"
             for i, (claim, snippets) in enumerate(batch, start=1)
         ]
-        resp = await llm.ainvoke(
+        resp = await traced_ainvoke(
+            llm,
             [
                 SystemMessage(content=system_prompt("critic.citation_verify")),
                 HumanMessage(content="\n\n".join(blocks)),
-            ]
+            ],
+            role="critic",
         )
         cost += estimate_cost(resp, "critic")
         di, do = token_counts(resp)
@@ -1347,8 +1253,7 @@ async def _verifier_verdicts(
             for m in re.finditer(r"Claim\s+(\d+)\s*:\s*(YES|NO)", text, re.IGNORECASE)
         }
         for i in range(1, len(batch) + 1):
-            # A claim the verifier failed to rule on keeps its citations: stripping is
-            # only for claims explicitly judged unsupported.
+            # 核验器未作出判断时保留引用；只有明确判为不支持的主张才移除标记。
             verdicts.append(ruled.get(i, True))
     return verdicts, cost, i_tot, o_tot
 
@@ -1356,8 +1261,7 @@ async def _verifier_verdicts(
 async def _verify_citation_fidelity(
     sid: str, draft: str, sources: list[dict]
 ) -> tuple[str, float, int, int]:
-    """Check every cited claim against its own sources' snippets; strip markers the
-    evidence does not back. Returns (draft, cost, tokens_in, tokens_out)."""
+    """逐项核对主张及其所引来源片段，去掉证据不支持的引用标记；返回草稿、费用及输入输出词元数。"""
     claims = _cited_claims(draft)
     if not claims or not sources:
         return draft, 0.0, 0, 0
@@ -1367,18 +1271,14 @@ async def _verify_citation_fidelity(
     mechanically_unsupported: set[str] = set()
     for claim in claims:
         if _VDEICTIC_RE.match(claim) or _VLABEL_RE.match(claim):
-            # The judge rules on this sentence ALONE (anaphor without referent / label
-            # no snippet contains), where it reads unsupported. Strip deterministically;
-            # synthesizer rules 5–6 forbid both constructions upstream, so this is
-            # residual defence.
+            # 评测单独判断此句时，缺少指代对象或片段未包含标签会使它无据；这里确定性移除，补充综合器规则 5–6 的防护。
             mechanically_unsupported.add(claim)
             continue
         nums: list[int] = []
         for m in re.finditer(r"\[(\d+(?:\s*,\s*\d+)*)\]", claim):
             nums.extend(int(p) for p in m.group(1).split(","))
         if any(by_index.get(n) is None for n in nums):
-            # A marker pointing at no source cites nothing — judged against empty
-            # evidence it can only fail (measured: resolution_rate 0.6667, run #5).
+            # 指向不存在来源的标记没有引用任何证据；以空证据判断只能失败。
             mechanically_unsupported.add(claim)
             continue
         snippets = "\n".join(
@@ -1388,9 +1288,7 @@ async def _verify_citation_fidelity(
             if s
             for t in (s.get("snippets") or ([s["snippet"]] if s.get("snippet") else []))
         )
-        # Deterministic pre-check before any model rules: a number the cited snippets do
-        # not contain verbatim can never be "supported", whatever a small local verifier
-        # says (it rubber-stamped invented figures in the second Ollama eval).
+        # 在模型判定前先作确定性数字检查：片段未逐字包含的数字不可能受到支持，不能由模型的肯定回答补救。
         if not _numbers_grounded(claim, snippets):
             mechanically_unsupported.add(claim)
         claim_evidence.append((claim, snippets))
@@ -1399,14 +1297,12 @@ async def _verify_citation_fidelity(
     try:
         verdicts, cost, i_tot, o_tot = await _verifier_verdicts(todo)
     except Exception as e:  # noqa: BLE001
-        # A verifier failure keeps every citation in place — the ⚠ chip and the eval
-        # judge still rule on them — EXCEPT the mechanically unsupported ones, which no
-        # model opinion can rescue.
+        # 核验器失败时保留引用，仍由警告标记和评测揭示问题；但机械检查已确认无依据的引用仍须移除。
         logger.warning("citation_verify_unavailable", session_id=sid, error=str(e)[:200])
         verdicts, cost, i_tot, o_tot = [], 0.0, 0, 0
 
     ok_by_claim: dict[str, bool] = {}
-    if verdicts:  # empty on verifier failure — nothing was ruled, nothing is stripped
+    if verdicts:  # 核验失败时为空；未作出判断便不据此移除引用。
         for (claim, _), ok in zip(todo, verdicts, strict=True):
             ok_by_claim[claim] = ok
 
@@ -1416,7 +1312,7 @@ async def _verify_citation_fidelity(
         if ok_by_claim.get(claim, claim not in mechanically_unsupported):
             continue
         stripped += 1
-        # The note carries its own terminator (see _VERIFIED_NOTE), so drop the claim's.
+        # 提示自身包含结束标点（见 _VERIFIED_NOTE），因此去掉主张末尾原有标点。
         cleaned = re.sub(r"\s*\[\d+(?:\s*,\s*\d+)*\]", "", claim).strip().rstrip(".!?")
         result = result.replace(claim, cleaned + _VERIFIED_NOTE, 1)
 
@@ -1432,17 +1328,11 @@ async def _verify_citation_fidelity(
 
 
 async def contradiction_detector_node(state: AgentState) -> dict:
-    """Surface conflicting claims across evidence (docs/12 M11). Never resolves them.
+    """展示证据之间的冲突主张（docs/12 M11），不替用户裁决。
 
-    One bounded call over the capped snippet set — cost scales with the run, not with
-    the square of the source count. Runs on the critic's model routing: this is a
-    temperature-0 adjudication-style judgment, the same class of task the critic does,
-    and adding a sixth routed role would ripple through every host's model config for
-    one call per run.
-
-    Fail-closed: an unavailable or unparseable detector surfaces NOTHING (and says so
-    in the agent log) — a fabricated conflict is the worst possible error here.
-    """
+    对数量受限的片段集合只做一次有界调用，费用随研究规模增长，而非随来源数量的平方增长。
+    使用评审器的模型路由，因为这是同类的零温度判断任务；不为每次研究的一次调用新增第六个角色。
+    检测器不可用或结果无法解析时不展示任何冲突，并在智能体日志中说明；不能编造冲突。"""
     sid = state["session_id"]
     by_source = contradictions.group_snippets_by_source(state.get("evidence", []))
     if len(by_source) < 2:
@@ -1488,12 +1378,9 @@ async def contradiction_detector_node(state: AgentState) -> dict:
 
 
 def _number_sources(evidence: list[dict]) -> tuple[list[dict], dict[str, int]]:
-    """Numbered source list + url→index map, in first-appearance order.
+    """按首次出现的顺序建立编号来源列表及 URL 到编号的映射。
 
-    Shared by the synthesizer (citation numbering) and the conflict-block renderer
-    (docs/12 M11), so the [n] markers in the block always match the report's source
-    list — one numbering implementation, no drift.
-    """
+    综合器与冲突区块渲染器共用此实现（docs/12 M11），确保区块中的 [n] 与报告来源列表一致。"""
     sources: list[dict] = []
     seen: dict[str, int] = {}
     for e in evidence:
@@ -1532,13 +1419,10 @@ async def synthesizer_node(state: AgentState) -> dict:
         detail={"model": get_run_config().model_for("synthesizer")},
     )
 
-    # Build a numbered source list from unique evidence URLs; the draft cites [n].
+    # 按不同证据 URL 建立编号来源列表，供草稿用 [n] 引用。
     #
-    # Every distinct snippet from a source is kept, not just the first (docs/12 M5, D3).
-    # One page commonly backs several different facts and the executor extracts a separate
-    # verbatim quote for each; retaining only one meant a citation chip could display text
-    # unrelated to the claim it was attached to — the same source is cited for roughly
-    # eight different claims per report.
+    # 同一来源的全部不同片段都要保留（docs/12 M5，D3），而非只保留第一条。
+    # 一页通常支持多个事实；只留一条会让引用提示展示与当前主张无关的文字。
     sources, seen = _number_sources(state.get("evidence", []))
 
     numbered_evidence = [
@@ -1552,14 +1436,10 @@ async def synthesizer_node(state: AgentState) -> dict:
 
     evidence_lines: list[str] = []
     for ev in numbered_evidence:
-        # Snippet only — no key_fact. The executor's key_fact is a paraphrase, and a
-        # small synthesizer model that sees both writes from the paraphrase: the claim
-        # drifts past the verbatim text, and both this graph's fidelity check and the
-        # eval judge rule on the snippet alone (measured as the residual NO class in
-        # the second Ollama eval). What can be cited is exactly what is shown.
+        # 只传 snippet，不传 key_fact：后者是执行器的转述，小型综合模型容易沿转述偏离原文；图内核验与评测都只认可逐字片段。
         evidence_lines.append(f'[{ev["n"]}] Snippet: "{ev["snippet"]}"')
         evidence_lines.append(f"    Source: {ev['url']}")
-        evidence_lines.append("")  # blank separator
+        evidence_lines.append("")  # 用空行分隔。
     evidence_text = "Evidence for citation:\n" + "\n".join(evidence_lines)
 
     messages = [
@@ -1569,22 +1449,18 @@ async def synthesizer_node(state: AgentState) -> dict:
                 state["original_query"],
                 evidence_text,
                 state.get("human_feedback"),
-                # The reviewer's edited outline, not the planner's proposal — the gate
-                # writes its decision back over this key (`plan_gate_node`). Empty when
-                # the gate was skipped, which is the ungated report structure.
+                # 使用审核者编辑后的大纲；plan_gate_node 会覆盖提案。跳过审核关卡时为空，保留原有无关卡结构。
                 state.get("proposed_outline"),
             )
         ),
     ]
     model = get_llm("synthesizer")
-    resp = await model.ainvoke(messages)
+    resp = await traced_ainvoke(model, messages, role="synthesizer")
     draft = text_of(resp)
     cost = estimate_cost(resp, "synthesizer")
     i, o = token_counts(resp)
 
-    # Citation repair pass: fix uncited claims if any exist.
-    # Inline uncited-count to avoid a cross-package dependency on evals.metrics:
-    # count sentences that contain assertive text but carry no [n] marker.
+    # 引用修复：处理没有 [n] 标记的断言句。计数内联实现，避免引擎依赖 evals.metrics。
     _claim_re = re.compile(r"\[\d+\]")
     uncited = 0
     for _sentence in re.split(r"(?<=[.!?])\s+", draft):
@@ -1601,14 +1477,14 @@ async def synthesizer_node(state: AgentState) -> dict:
                 f"Numbered evidence:\n{evidence_text}"
             ),
         ]
-        repair_resp = await model.ainvoke(repair_messages)
+        repair_resp = await traced_ainvoke(model, repair_messages, role="synthesizer")
         draft = text_of(repair_resp)
         repair_cost = estimate_cost(repair_resp, "synthesizer")
         ri, ro = token_counts(repair_resp)
         cost += repair_cost
         i += ri
         o += ro
-        resp = repair_resp  # the repair pass's response is the last one actually served
+        resp = repair_resp  # 修复响应是最后一次实际返回的模型响应。
         await emit(
             sid,
             "agent_log",
@@ -1619,10 +1495,7 @@ async def synthesizer_node(state: AgentState) -> dict:
     grounding_report = None
     allowed = get_run_config().corpus_allowed_ids
     if allowed is not None:
-        # A selected-files run (internal/rfcs/V3.1-corpus-scope.md §9): every claim is
-        # checked, uncited ones included, and what fails is rewritten out — never kept with
-        # a note. Replaces the fidelity pass below, which judges cited sentences only and
-        # keeps every citation when its verifier is down.
+        # 指定文件的研究会检查全部主张，包括未引用者；失败内容必须重写移除，不能仅附提示。此分支替代只检查带引用句子的忠实度核验（internal/rfcs/V3.1-corpus-scope.md §9）。
         outcome = await grounding_repair.ground(
             draft,
             sources,
@@ -1652,20 +1525,13 @@ async def synthesizer_node(state: AgentState) -> dict:
             detail={k: v for k, v in grounding_report.items() if k != "claims"},
         )
     else:
-        # Citation-fidelity check (docs/12 M5): every remaining cited claim is judged against
-        # the snippets of its own cited sources, exactly as the eval judge rules. Runs after
-        # the repair pass so a repair-introduced drift is caught too. Unsupported claims lose
-        # their markers and carry a visible note rather than shipping a hollow citation.
+        # 在修复后逐项核验剩余主张与其来源片段（docs/12 M5），同时捕获修复引入的偏差；无据主张移除引用并显示说明。
         draft, vcost, vi, vo = await _verify_citation_fidelity(sid, draft, sources)
         cost += vcost
         i += vi
         o += vo
 
-    # Conflicting-evidence block (docs/12 M11): rendered deterministically from the
-    # detector's validated pairs and inserted before the reference list. Appended AFTER
-    # the repair and fidelity passes so those claim checkers never judge the block's
-    # meta-prose — and because the LLM never authors it, it can neither omit nor
-    # "resolve" a conflict. Absent contradictions, the draft is untouched.
+    # 从已验证的冲突对确定性生成冲突区块，放在参考文献前（docs/12 M11）。在引用修复和核验之后插入，避免核验器评审说明性文字，也避免模型遗漏或擅自解决冲突；无冲突时不修改草稿。
     if state.get("contradictions"):
         block = contradictions.render_block(state["contradictions"], seen)
         draft = contradictions.insert_block(draft, block)
@@ -1685,13 +1551,7 @@ async def synthesizer_node(state: AgentState) -> dict:
             "word_count": len(draft.split()),
             "sources_count": len(sources),
             "preview": draft[:1200] + ("..." if len(draft) > 1200 else ""),
-            # The model id the provider actually reported serving, when it discloses one
-            # (llm_factory.served_model_id) — distinct from `model` above, which is the
-            # configured route. `None` in fake mode (no `response_metadata` at all); on
-            # a real call it ordinarily matches the configured model and would only
-            # diverge from it once a role is routed through a router alias (AGENTS.md,
-            # "auto/* are not pinned models") — no such alias exists in this codebase
-            # yet, so this field is presently descriptive rather than load-bearing.
+            # 记录提供方实际披露的模型 ID（llm_factory.served_model_id），区别于配置路由 model。模拟模式无 response_metadata，因此为 None；真实调用通常与配置相同，但 auto/* 路由别名可能每次由不同模型响应，不能将别名当成固定模型。
             "served_model": served_model_id(resp),
         },
     )
@@ -1703,8 +1563,7 @@ async def synthesizer_node(state: AgentState) -> dict:
     }
     if grounding_report is not None:
         if grounding_report["status"] == "complete":
-            # Over the text exactly as presented — the conflicts block included — so the
-            # gate and the approval route can refuse any other text (§9.6).
+            # 对最终展示的全文（含冲突区块）计算校验值，使关卡和批准接口能够拒绝任何其他文本（§9.6）。
             grounding_report["validated_text_sha256"] = hashlib.sha256(
                 draft.encode("utf-8")
             ).hexdigest()
@@ -1715,15 +1574,12 @@ async def synthesizer_node(state: AgentState) -> dict:
 
 
 def plan_gate_node(state: AgentState) -> dict:
-    """Pause after the planner for the user to edit subtopics and the outline before
-    any search spends money (internal/07 Phase 4). Mirrors `hitl_gate_node` exactly:
-    `interrupt()` persists the checkpoint and suspends; a resume carries the decision.
+    """规划完成后暂停，让用户在搜索花费发生前编辑子主题与大纲（internal/07 Phase 4）。
+    与 hitl_gate_node 一样，interrupt() 持久化检查点并挂起，恢复时携带审核决定。
 
-    Resumed with `{"tasks": [...], "outline": [...]}` — both optional; an absent key
-    means "unedited, use what the planner proposed". `include: false` on a task drops
-    it from what the executor runs, which is the whole point of a *review* gate rather
-    than a rubber stamp: the reviewer's edits change the run, not just what is shown.
-    """
+    恢复参数为 {"tasks": [...], "outline": [...]}，两个字段均可省略；
+    缺失表示未编辑，保留规划器的提议。任务的 include: false 会使执行器跳过它，
+    从而让审核实际改变研究过程，而不只是改变显示内容。"""
     decision = interrupt(
         {
             "type": "PLAN_READY",
@@ -1742,36 +1598,29 @@ def plan_gate_node(state: AgentState) -> dict:
 
 
 def route_after_plan_gate(state: AgentState) -> str:
-    # An approved plan with every subtopic excluded researches nothing, and a run that
-    # researched nothing must not reach the synthesizer: with no evidence in hand it
-    # writes the report out of the model's own memory and the repair pass then decorates
-    # it with markers that resolve to nothing. `submit_plan_review` rejects this at the
-    # API first; this is the guard for a resume that reaches the graph another way — a
-    # checkpoint written before that check existed, or a caller that bypassed the route.
+    # 审核后若所有子主题都被排除，则没有可研究任务，必须阻止无证据综合；否则模型会凭记忆写作，再装饰无法解析的引用。API 的 submit_plan_review 先行拒绝，此处防护旧检查点或绕过接口的恢复路径。
     if not state.get("tasks"):
         return "failer"
     return "executor"
 
 
 def hitl_gate_node(state: AgentState) -> dict:
-    """Pause for human review. interrupt() persists the checkpoint and suspends."""
+    """暂停等待人工审核；interrupt() 持久化检查点并挂起。"""
     refused = _grounding_refusal(state)
     if refused:
-        # `route_after_synthesizer` already sends these to the failer; reaching here means
-        # some other path did not. Raised, so the run fails instead of pausing for approval.
+        # route_after_synthesizer 本应将这些情况送入 failer；其他路径意外到达这里时抛出异常，使研究失败而非停在批准关卡。
         raise RuntimeError(refused)
     decision = interrupt(
         {
             "type": "HITL_READY",
             "word_count": len((state.get("draft_report") or "").split()),
             "source_count": len(state.get("sources", [])),
-            # M11: how many unresolved conflicts the reviewer is approving alongside the
-            # draft. The report surfaces them; the gate makes the count impossible to miss.
+            # M11：审核者批准草稿时也会面对尚未解决的冲突；关卡明确显示数量，避免遗漏。
             "contradiction_count": len(state.get("contradictions") or []),
             "cost_usd": round(state.get("cost_usd", 0.0), 4),
         }
     )
-    # Resumed: decision = {"approved": bool, "feedback": str | None}
+    # 恢复参数：decision = {"approved": bool, "feedback": str | None}。
     if decision.get("approved"):
         return {"approved": True}
     return {
@@ -1786,9 +1635,7 @@ def finalizer_node(state: AgentState) -> dict:
 
 
 def failer_node(state: AgentState) -> dict:
-    # Recomputed here because a router cannot write state: whichever guard sent us here
-    # still reads the same way from the same state. A generic "budget or loop limit
-    # exceeded" made the user open the source to find which limit tripped and by how much.
+    # 路由不能写入状态，因此从同一状态重新计算触发限制的原因，向用户说明具体限制及超出数值，而非笼统提示预算或循环超限。
     return {
         "error": state.get("error")
         or _over_budget(state)
@@ -1797,20 +1644,16 @@ def failer_node(state: AgentState) -> dict:
     }
 
 
-# ── Conditional routing ────────────────────────────────────────────────────────────
+# ── 条件路由 ────────────────────────────────────────────────────
 
 
 def _over_budget(state: AgentState) -> str | None:
-    """The breach reason if a guard has tripped, else None. **0 disables a guard.**
+    """返回触发限制的原因，未触发时返回 None；0 表示禁用该限制。
 
-    Every limit is opt-in (docs/04 §6). The token ceiling was hardcoded at 1_000_000 and
-    reachable from no config, so on a provider whose pricing the catalog does not carry —
-    `estimate_cost()` returns 0.0 for openrouter/custom, which makes the dollar cap inert
-    — it was the only guard that could fire, and it killed a real run at 1,003,721 tokens.
-
-    Returning the reason rather than a bare bool is the point: "budget or loop limit
-    exceeded" made a user read the source to learn which of three numbers was crossed.
-    """
+    所有限制均需显式启用（docs/04 §6）。旧实现将词元上限硬编码为 1_000_000，
+    无法配置；openrouter/custom 未被定价，estimate_cost() 为 0.0，费用限制不起作用，
+    因此该隐藏上限曾在 1,003,721 个词元时终止真实研究。
+    返回具体原因而非布尔值，让用户直接知道哪项超限及超出多少。"""
     cfg = get_run_config()
 
     cost, cost_cap = state.get("cost_usd", 0.0), cfg.max_cost_per_session_usd
@@ -1830,20 +1673,14 @@ def _over_budget(state: AgentState) -> str | None:
 
 
 def _no_research_reason(state: AgentState) -> str | None:
-    """Why this run cannot honestly produce a report, if it cannot.
+    """说明研究为何无法在保持诚实的前提下生成报告。
 
-    Three failures, deliberately worded apart because the remedy differs: a plan with
-    nothing selected never searched; a plan that searched and found nothing did; and a
-    plan that fetched sources but turned none of them into a citable quotation did neither.
-    Collapsing them would send a user to check their search providers when what actually
-    happened is that they unchecked every subtopic — or, as in run `96a16137`, when the
-    providers had answered every query and it was the executor model that returned nothing.
-    A false diagnosis is the P0 class here, not a cosmetic one.
+    区分三种需要不同处理的情况：计划未选中任何任务、搜索后没有结果、
+    获得来源却未提取出可引用的片段。混为一谈会让取消了全部子主题的用户去检查搜索服务，
+    也会把执行器未提交证据误诊为正常工作的提供方失效。
 
-    This is the *reason* half of the guards in `route_after_plan_gate`,
-    `route_after_planner` and `route_after_critic`; the routers decide, and a router
-    cannot write state, so the text is recomputed here from the same state they read.
-    """
+    此函数为 route_after_plan_gate、route_after_planner 和 route_after_critic
+    提供原因文本。路由函数不能写状态，因此这里从相同状态重新计算原因。"""
     if not state.get("tasks"):
         return (
             "no research tasks were selected — every subtopic was excluded at the design "
@@ -1871,44 +1708,35 @@ def _no_research_reason(state: AgentState) -> str | None:
 def route_after_planner(state: AgentState) -> str:
     if state.get("error"):
         return "failer"
-    # A planner that produced no tasks has nothing to gate and nothing to execute. Failing
-    # here rather than at the gate keeps the two "nothing to research" paths — a planner
-    # that proposed nothing, and a reviewer who excluded everything — reporting the same
-    # way, instead of the skip-gate path sliding through to an evidence-free report.
+    # 规划器未生成任何任务时，既无计划可审核也无任务可执行；在此统一失败，防止跳过审核的路径生成无证据报告。
     if not state.get("tasks"):
         return "failer"
-    # Opt-out, not opt-in (internal/07 Phase 4) — the extra pause is the default.
+    # 默认启用计划审核，用户可显式跳过，而非需要主动开启（internal/07 Phase 4）。
     if get_run_config().skip_plan_gate:
         return "executor"
     return "plan_gate"
 
 
 def route_after_critic(state: AgentState) -> str:
-    """Another research round, or synthesize.
+    """决定继续下一轮研究还是进入综合。
 
-    A task leaves the pending set when it passes *or* runs out of retries — so a task
-    whose evidence never satisfies the critic still contributes what it found, exactly as
-    it did when tasks ran one at a time.
-    """
+    任务通过评审或重试次数耗尽后退出待办集合；即便证据始终未通过评审，
+    任务收集到的内容仍会保留，与原先逐任务执行的行为一致。"""
     if _over_budget(state):
         return "failer"
     if _pending(state, get_run_config().max_critic_loops):
         return "executor"
-    # Every task is done and none of them yielded anything citable. Stopping here is the
-    # difference between "we could not answer this" and a fluent report sourced from the
-    # synthesizer's training data — the latter is what the citation-repair pass turns into
-    # an artifact that *looks* verified while resolving to nothing.
+    # 全部任务结束却没有可引用内容时必须停止；否则综合器会凭训练记忆生成流畅报告，再被引用修复装饰成看似可验证的成果。
     if not state.get("evidence"):
         return "failer"
     return "contradiction_detector"
 
 
 def _grounding_refusal(state: AgentState) -> str | None:
-    """Why a selected-files draft may not reach the approval gate, or None (§9.6).
+    """返回指定文件范围的草稿无法进入批准关卡的原因，符合条件时返回 None（§9.6）。
 
-    Decided on the recorded grounding report and the text it validated, so no retry,
-    resume, fallback or alternate rendering can carry an unmeasured claim to approval.
-    """
+    判定同时依赖已记录的依据核验报告和被核验的原文，防止重试、恢复、
+    回退或其他渲染路径将未经测量的主张送交批准。"""
     if get_run_config().corpus_allowed_ids is None:
         return None
     report = state.get("grounding_report") or {}
@@ -1929,23 +1757,25 @@ def route_after_synthesizer(state: AgentState) -> str:
 def route_after_gate(state: AgentState) -> str:
     if state.get("approved"):
         return "finalizer"
-    return "synthesizer"  # rework with human_feedback
+    return "synthesizer"  # 携带 human_feedback 返回重写。
 
 
-# ── Build ──────────────────────────────────────────────────────────────────────────
+# ── 构建图 ──────────────────────────────────────────────────────
 
 
 def build_graph(checkpointer):
     g = StateGraph(AgentState)
-    g.add_node("planner", planner_node)
-    g.add_node("plan_gate", plan_gate_node)
-    g.add_node("executor", executor_node)
-    g.add_node("critic", critic_node)
-    g.add_node("contradiction_detector", contradiction_detector_node)
-    g.add_node("synthesizer", synthesizer_node)
-    g.add_node("hitl_gate", hitl_gate_node)
-    g.add_node("finalizer", finalizer_node)
-    g.add_node("failer", failer_node)
+    g.add_node("planner", traced_node("planner", planner_node))
+    g.add_node("plan_gate", traced_node("plan_gate", plan_gate_node))
+    g.add_node("executor", traced_node("executor", executor_node))
+    g.add_node("critic", traced_node("critic", critic_node))
+    g.add_node(
+        "contradiction_detector", traced_node("contradiction_detector", contradiction_detector_node)
+    )
+    g.add_node("synthesizer", traced_node("synthesizer", synthesizer_node))
+    g.add_node("hitl_gate", traced_node("hitl_gate", hitl_gate_node))
+    g.add_node("finalizer", traced_node("finalizer", finalizer_node))
+    g.add_node("failer", traced_node("failer", failer_node))
 
     g.add_edge(START, "planner")
     g.add_conditional_edges(

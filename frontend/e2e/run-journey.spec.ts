@@ -79,9 +79,9 @@ test.describe("research journey", () => {
 
     // 2. Open Research and start a run.
     await page.goto("/research");
-    await expect(page.getByRole("heading", { name: "Research" })).toBeVisible();
-    await page.getByLabel("Research question").fill(QUESTION);
-    await page.getByRole("button", { name: "Start research" }).click();
+    await expect(page.getByRole("heading", { name: "研究", exact: true })).toBeVisible();
+    await page.getByLabel("研究问题").fill(QUESTION);
+    await page.getByRole("button", { name: "开始研究", exact: true }).click();
 
     // 3. The run page opens on a real run id, and reports real state — not a spinner the
     // frontend invented.

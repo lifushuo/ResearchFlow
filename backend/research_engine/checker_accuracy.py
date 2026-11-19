@@ -1,16 +1,8 @@
-"""
-How accurate the claim checker was measured to be on a checking route (RFC V3.1 §17, D-24).
+"""披露引用检查器在指定路由上的已测准确性，见 RFC V3.1 §17、D-24。
 
-A selection run's report is only as trustworthy as the model that checked it, and the G-6
-benchmark measured that for a few routes only. A route below the threshold is **labelled,
-not refused**, and a route never benchmarked says "not measured": the label must never imply
-a number nobody measured (the unmeasured-vs-zero rule, applied to a whole model).
-
-`MEASURED` is copied from the newest valid G-6 result for each route under
-`backend/evals/results/`, and `tests/task/test_checker_accuracy.py` fails when the two
-disagree. The engine cannot read that directory at run time — the desktop bundle does not
-ship `evals/` — so the verdict is restated here and the test keeps it honest.
-"""
+低于门槛只标注，不拒绝；没有测过则明确显示未测量。
+MEASURED 来自最新有效 G-6 成绩，由测试与 evals/results 核对；
+引擎运行时不能读取评测目录，因为桌面包不包含 evals。"""
 
 from __future__ import annotations
 
@@ -18,8 +10,7 @@ MEETS = "meets_threshold"
 BELOW = "below_threshold"
 NOT_MEASURED = "not_measured"
 
-#: route → (status, result file). Only valid runs count: one with more than 5% of claims
-#: unmeasured is invalid by §17 and measured nothing.
+#: 路由对应的状态与成绩来源；未测量 Claim 超过 5% 的运行无效，不作为测量依据。
 MEASURED: dict[str, tuple[str, str]] = {
     "custom:auto/best-fast": (MEETS, "eval-2026-11-02-custom-auto-best-fast-grounding-run1.json"),
     "custom:agy/gemini-3-flash": (
@@ -36,12 +27,9 @@ _WORDS = {
 
 
 def for_route(route: str | None) -> dict:
-    """The recorded verdict for the route that checked a run, with the words to show for it.
+    """返回指定检查路由的已记录结论和展示文字。
 
-    A `custom:` route is named by whoever runs the endpoint, so the same name on another
-    gateway may be served by another model. Its verdict is kept, and the label says where it
-    was measured rather than vouching for an endpoint nobody benchmarked.
-    """
+    custom 路由名称由网关维护者定义，同名不保证同一模型；标签说明测量来源，不替其他网关背书。"""
     status, result = MEASURED.get(route or "", (NOT_MEASURED, None))
     label = f"checker accuracy on this model: {_WORDS[status]}"
     if status != NOT_MEASURED and (route or "").startswith("custom:"):

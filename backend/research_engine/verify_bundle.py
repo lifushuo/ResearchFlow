@@ -1,30 +1,11 @@
-"""
-Standalone research bundle verifier (docs/12 M12).
+"""独立研究证据包核验器，见 docs/12 M12。
 
-No AI. No network. No app installed. Reads a `.bundle.json`, runs every integrity
-check, prints a human-readable report, and exits 0 (pass) or 1 (fail).
+无需 AI、网络或应用安装，读取 .bundle.json，输出可读或 JSON 报告，退出 0 表示通过、1 表示失败。
+运行方式：python -m research_engine.verify_bundle path/to/bundle.json，可加 --format json。
+除 Pydantic 证据包结构外仅需标准库，Python 3.14+ 可运行。
 
-    python -m research_engine.verify_bundle path/to/bundle.json
-    python -m research_engine.verify_bundle path/to/bundle.json --format json
-
-The only import from the engine is the bundle schema (Pydantic models). Everything
-else is stdlib. A third party on a bare machine with Python 3.14+ and pydantic can run this.
-
-Checks:
-  1. Schema validity
-  2. Bundle integrity (bundle_hash)
-  3. Report integrity (report_hash)
-  4. Evidence integrity (per-snippet content_hash)
-  5. Citation resolution (every [n] in the report body points at a source)
-  6. Claim–evidence linkage (every cited source has evidence)
-  7. Approval chain integrity (approved entry links to this report)
-  8. Trace status (informational, not a failure)
-
-Reads bundle versions 1 and 2. v2 additionally records, per research-run purpose, the
-system prompt that purpose actually ran under and its SHA-256; check 2 covers both. A
-verifier built before v2 existed refuses a v2 bundle and cannot be taught otherwise, which
-is why this reader ships ahead of any producer.
-"""
+检查数据结构、证据包哈希、报告哈希、片段哈希、引用解析、Claim 与证据联系、审批链；
+轨迹状态仅作信息披露。兼容 v1、v2，v2 另含受哈希保护的实际提示词及摘要。"""
 
 from __future__ import annotations
 
@@ -40,30 +21,23 @@ from research_engine.bundle import (
     content_hash,
 )
 
-# Minimal citation regex — deliberately a local copy of `research_engine.claims`'s
-# patterns rather than an import, so this module keeps its promise above: stdlib plus the
-# bundle schema, nothing else. `tests/test_claim_extraction_parity.py` asserts the copies
-# stay pattern-identical to the canonical ones, so the duplication cannot drift silently.
+# 有意保留 claims 引用模式的本地副本，维持独立核验器的最小依赖。
+# 一致性测试保证副本不偏离唯一标准，不能各自修改。
 _CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 _SOURCES_HEADING_RE = re.compile(r"^#{1,6}\s*(sources|references|citations|bibliography)\b", re.I)
 
-#: The one approval action that authorizes a report — and therefore an artifact.
+#: 唯一能够授权报告及其产物的批准动作。
 REPORT_APPROVAL_ACTION = "approved"
-#: Actions taken at the plan gate. They are recorded in the chain and authorize nothing.
+#: 计划关卡动作仅记入审批链，不授予报告发布权限。
 PLAN_GATE_ACTIONS = frozenset({"plan_approved", "plan_rework_requested", "plan_rejected"})
 
 
-# ── Result types ──────────────────────────────────────────────────────────────────
+# ── 核验结果类型 ──
 
 
-#: Bundle formats this verifier admits. v2 adds AgentSpec prompt provenance and nothing
-#: else; every check below runs identically on both, which is why one verifier serves them
-#: rather than a branch per version.
+#: 核验器支持的格式版本。v2 只增加提示词来源，其余检查对两个版本相同。
 #:
-#: **Widening this set is a one-way door.** A verifier already on someone's machine admits
-#: exactly the versions it shipped with and will refuse a newer bundle permanently — there
-#: is no upgrade path for an artifact already handed to a third party. That is the reason
-#: the dual-version verifier ships before any producer emits v2, not alongside it.
+#: 已发布的旧核验器不会自动接受新格式，因此先发布支持新版本的核验器，再让生成端输出新版包。
 SUPPORTED_BUNDLE_VERSIONS: frozenset[int] = frozenset({1, 2})
 
 
@@ -80,42 +54,25 @@ class VerifyResult:
     checks: list[CheckResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
-    # Whether the bundle records itself as a demo (docs/17 §6.2). Carried alongside
-    # `passed` rather than inside `notes`, because a demo bundle verifies perfectly well —
-    # its hashes match and its citations resolve — and would otherwise print a clean PASS
-    # with nothing to say that none of it was real research.
+    # 演示状态与 passed 并列披露。脚本证据包也能完整通过哈希核验，不能只显示 PASS 让人误以为是真研究。
     demo: bool = False
 
-    # The AgentSpec provenance the bundle records (scope freeze §10). Beside `passed` for
-    # the same reason `demo` is: a bundle whose planner ran on a replaced prompt verifies
-    # perfectly — its hashes match and its citations resolve — and a bare PASS would say
-    # nothing about the instructions that produced it. Empty for every v1 bundle.
+    # 提示词来源与通过状态并列，避免完整性通过掩盖角色指令已被替换；v1 无此信息。
     prompt_provenance: list = field(default_factory=list)
 
-    # `NONE` / `APPLIED` / `UNUSABLE`, copied from the bundle, or None for v1. `UNUSABLE`
-    # is why this is carried separately from the list above: a run whose snapshot could not
-    # be used has shipped prompts in its provenance and is not the same as a run that was
-    # never customised.
+    # 直接复制 NONE、APPLIED、UNUSABLE；v1 为 None。
+    # 快照不可用后采用默认提示词，不等于从未配置自定义提示词，因此状态单独保留。
     prompt_overrides_status: str | None = None
 
 
-# ── Individual checks ─────────────────────────────────────────────────────────────
+# ── 各项核验 ──
 
 
 def _check_bundle_integrity(bundle: BundleManifest) -> CheckResult:
-    """The bundle is internally consistent: its own hash, and every hash it carries.
+    """核对证据包自身哈希及内部各摘要一致性。
 
-    **Two assertions, one check, on purpose.** The bundle hash already catches a bundle
-    edited after assembly, because `compute_bundle_hash` covers every field including the
-    provenance records. What it cannot catch alone is a bundle *rebuilt* around a lie: edit
-    an `effective_prompt`, leave its `effective_prompt_sha256` as it was, recompute
-    `bundle_hash` over the result, and the outer hash agrees with itself while the
-    provenance says two different things about the same prompt.
-
-    That belongs here rather than in a seventh check: the verification check set is six, and
-    "this artifact is internally consistent" is what this check already means. A v1 bundle
-    carries no provenance, so the loop below is empty and v1 behaviour is byte-identical.
-    """
+    外层哈希能发现组装后篡改，但攻击者若修改提示词再重算包哈希，仍可能留下旧提示词摘要。
+    因此这里同时复算来源摘要。v1 无提示词来源，不改变其原有行为。"""
     expected = compute_bundle_hash(bundle)
     if bundle.bundle_hash != expected:
         return CheckResult(
@@ -125,11 +82,8 @@ def _check_bundle_integrity(bundle: BundleManifest) -> CheckResult:
             f"but computed {expected[:16]}… — the bundle was modified after assembly",
         )
 
-    # A bundle may not carry fields from a version later than the one it declares. The hash
-    # is taken over the declared version's field set, so provenance on a *v1* bundle would
-    # sit outside it entirely — editable without breaking anything, while a v2-aware reader
-    # displays it as though it were covered. Declaring v1 is also how such a file would slip
-    # past verifiers too old to know what these fields are.
+    # 不能携带声明版本之后才引入的字段。否则 v1 中的新版来源字段不受哈希保护，
+    # 新读取器却可能误当作已核验内容，旧核验器也无法发现。
     if bundle.bundle_version < 2 and (bundle.prompt_provenance or bundle.prompt_overrides_status):
         return CheckResult(
             "bundle_integrity",
@@ -225,7 +179,7 @@ def _check_claim_evidence_linkage(bundle: BundleManifest) -> CheckResult:
                 )
     if not gaps:
         return CheckResult("claim_evidence_linkage", True)
-    # Deduplicate — multiple claims citing the same gapped source.
+    # 多条 Claim 引用同一个缺证据来源时，去重展示。
     unique = sorted(set(gaps))
     return CheckResult(
         "claim_evidence_linkage",
@@ -242,14 +196,9 @@ def _check_approval_chain(bundle: BundleManifest) -> CheckResult:
             "No approval records — this report was never human-reviewed",
         )
 
-    # Only a REPORT approval authorizes anything. `plan_approved` is a decision about a
-    # research plan, taken before any draft existed, and its `draft_hash` has never been
-    # verified by anything — so it must not be counted here, and its presence must not be
-    # able to satisfy the report check below.
+    # 只有 REPORT 批准可以授权报告。plan_approved 发生时草稿尚不存在，其 hash 不能满足报告审批检查。
     #
-    # This was already true by string inequality; naming the exclusion makes it a decision
-    # rather than a coincidence, and gives an assembler that renames a plan approval
-    # something to fail against.
+    # 显式排除计划批准，防止未来重命名后不小心获得报告授权。
     approved_entries = [
         a
         for a in bundle.approval_chain
@@ -270,8 +219,7 @@ def _check_approval_chain(bundle: BundleManifest) -> CheckResult:
             f"{len(empty_hashes)} approval record(s) have an empty draft_hash",
         )
 
-    # The load-bearing check: at least one approved entry's draft_hash matches the
-    # report_hash, proving the approval applies to THIS report.
+    # 关键检查：至少有一条批准记录的 draft_hash 与当前 report_hash 一致，证明批准针对这份报告。
     linked = any(a.draft_hash == bundle.report_hash for a in approved_entries)
     if not linked:
         return CheckResult(
@@ -284,20 +232,15 @@ def _check_approval_chain(bundle: BundleManifest) -> CheckResult:
     return CheckResult("approval_chain", True)
 
 
-#: The trace entry a selected-files run's bundle opens with (app/run_bundle.py).
+#: 指定文件运行的证据包首条轨迹记录类型，见 app/run_bundle.py。
 CORPUS_SELECTION_EVENT = "corpus_selection"
 
 
 def _check_corpus_selection(bundle: BundleManifest) -> CheckResult | None:
-    """Every source of a selected-files run is one of the document versions it selected.
+    """检查指定文件运行的每个来源都属于冻结选择中的文档版本。
 
-    Runs only when the bundle records a selection, so a bundle with none is reported
-    exactly as before. The selection entry and the sources are both covered by
-    `bundle_hash`, so `bundle_integrity` catches an edit to either; this check catches a
-    bundle that is internally consistent but cites outside what the run was allowed to read.
-    A 3.0.x verifier does not know this check and still verifies the bundle: it is an
-    addition, not a format change (internal/rfcs/V3.1-corpus-scope.md §8.6).
-    """
+    仅在证据包记录选择时执行；外层哈希保护选择和来源，
+    此检查进一步发现内容自洽却越过授权文件范围的包，见 RFC V3.1 §8.6。"""
     entries = [
         t for t in bundle.trace if isinstance(t, dict) and t.get("event") == CORPUS_SELECTION_EVENT
     ]
@@ -330,13 +273,13 @@ def _check_corpus_selection(bundle: BundleManifest) -> CheckResult | None:
     )
 
 
-# ── Top-level verify ──────────────────────────────────────────────────────────────
+# ── 顶层核验入口 ──
 
 
 def verify(bundle: BundleManifest) -> VerifyResult:
-    """Run all checks. Returns a VerifyResult with per-check detail."""
+    """执行全部检查，返回含逐项详情的 VerifyResult。"""
     checks = [
-        CheckResult("schema_validity", True),  # we already parsed it
+        CheckResult("schema_validity", True),  # 此前已经解析过数据结构。
         _check_bundle_integrity(bundle),
         _check_report_integrity(bundle),
         _check_evidence_integrity(bundle),
@@ -368,7 +311,7 @@ def verify(bundle: BundleManifest) -> VerifyResult:
 
 
 def verify_file(path: str | Path) -> VerifyResult:
-    """Load a .bundle.json and verify it. Schema parse failure is a check failure."""
+    """加载并核验 .bundle.json，结构解析失败也算核验失败。"""
     p = Path(path)
     try:
         data = json.loads(p.read_text("utf-8"))
@@ -403,27 +346,21 @@ def verify_file(path: str | Path) -> VerifyResult:
     return verify(bundle)
 
 
-# ── Human-readable output ─────────────────────────────────────────────────────────
+# ── 人工可读输出 ──
 
 
-#: Every non-ASCII character this module emits, and what it degrades to.
+#: 固定非 ASCII 图符及其在不支持终端上的替代文字。
 #:
-#: The verifier is the one program in this repository a stranger runs — offline, on their
-#: own machine, to check an artifact they were handed — so it has to produce a verdict on
-#: whatever they run it on. On Windows `sys.stdout` defaults to cp1252, which cannot encode
-#: `\u2713`, and printing it raised `UnicodeEncodeError` *after* every check had already
-#: passed: a traceback in place of the word PASS. The verdict was correct and the reader
-#: never saw it.
+#: 第三方可能在任意终端离线核验。Windows 某些编码无法打印勾号，
+#: 曾导致全部检查已通过却在输出时抛 UnicodeEncodeError，用户看不到结论。
 #:
-#: Deliberately not `errors="replace"`, which renders `?` beside each check and leaves a
-#: reader unable to tell a pass from a failure — the one distinction this output exists to
-#: make. A check's own `detail` can carry anything, so it is transliterated by codec and
-#: only these fixed glyphs get a chosen replacement.
+#: 不统一替换成问号，否则用户无法区分通过与失败。
+#: 固定图符用明确替代，任意详情文字另按编码转换。
 _ASCII_FALLBACK = {"✓": "[PASS]", "✗": "[FAIL]", "ℹ": "[note]", "—": "--", "…": "..."}
 
 
 def _encodable(stream) -> bool:
-    """Whether this stream can render the glyphs below without raising."""
+    """检查输出流能否无异常地显示这些图符。"""
     encoding = getattr(stream, "encoding", None) or "ascii"
     try:
         "".join(_ASCII_FALLBACK).encode(encoding)
@@ -433,7 +370,7 @@ def _encodable(stream) -> bool:
 
 
 def _degrade(text: str) -> str:
-    """The same report, in characters any console can print."""
+    """生成任意终端都能打印的同一份报告。"""
     for glyph, plain in _ASCII_FALLBACK.items():
         text = text.replace(glyph, plain)
     return text.encode("ascii", "replace").decode("ascii")
@@ -451,9 +388,7 @@ def format_text(result: VerifyResult, stream=None) -> str:
     for note in result.notes:
         lines.append(f"  ℹ {note}")
     if result.prompt_provenance:
-        # A summary, not the prompts themselves: the full text is in the file for anyone who
-        # wants it, and dumping five prompts of up to 2,500 characters each would bury the
-        # verdict this program exists to deliver.
+        # 这里只输出提示词摘要；完整正文保留在证据包中，避免长提示词淹没核验结论。
         customised = [r for r in result.prompt_provenance if getattr(r, "overridden", False)]
         lines.append(
             f"  ℹ AgentSpec provenance: {len(result.prompt_provenance)} purposes recorded, "
@@ -470,10 +405,7 @@ def format_text(result: VerifyResult, stream=None) -> str:
     verdict = "PASS" if result.passed else "FAIL"
     lines.insert(0, f"Bundle verification: {verdict}")
     if any(getattr(r, "overridden", False) for r in result.prompt_provenance):
-        # Above the verdict for the same reason the demo banner is: every integrity check
-        # passes — the hashes are real hashes of what really ran — so PASS is true and, on
-        # its own, incomplete. Whoever reads this must know the agents were reconfigured
-        # before they read what the agents concluded.
+        # 在 PASS 前展示配置改动。哈希通过只证明产物一致，读者仍需先知道代理指令被自定义。
         lines.insert(
             0,
             "!! CUSTOMISED AGENTS — one or more prompts were replaced by the run's owner.\n"
@@ -481,9 +413,7 @@ def format_text(result: VerifyResult, stream=None) -> str:
             "!! unmodified since assembly, not that they were sound.\n",
         )
     if result.demo:
-        # Above the verdict, not below it. A demo bundle passes every integrity check —
-        # the hashes are real hashes of scripted output — so "PASS" is true and, on its
-        # own, dangerously misleading. Whoever reads this must see what it is first.
+        # 在结论前显示演示标记。脚本产物也能通过完整性检查，不能让单独 PASS 误导成真实研究。
         lines.insert(
             0,
             "!! DEMO BUNDLE — scripted models and fixture sources. NOT REAL RESEARCH.\n"
@@ -520,7 +450,7 @@ def format_json(result: VerifyResult) -> str:
     )
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────────
+# ── 命令行入口 ──
 
 
 def main(argv: list[str] | None = None) -> int:

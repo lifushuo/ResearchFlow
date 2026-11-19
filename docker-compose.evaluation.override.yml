@@ -1,0 +1,84 @@
+# Only compose with docker-compose.full.yml. Does NOT modify original .env.
+# Start it using: docker compose -f docker-compose.full.yml -f docker-compose.evaluation.override.yml up -d --build api frontend
+services:
+  api:
+    environment:
+      RF_EVAL_JOB_ROOT: /app/evaluation-jobs
+      # v1.3.2: RF_EVAL_ONLINE_ENABLED / RF_EVAL_JUDGE_ROUTE are now optional overrides.
+      # When unset, the online lane reuses .env's LLM_MODE=real and EVAL_JUDGE_MODEL.
+      # Set RF_EVAL_ONLINE_ENABLED=0 to force-disable online evaluation.
+      RF_EVAL_ONLINE_ENABLED: ${RF_EVAL_ONLINE_ENABLED:-}
+      RF_EVAL_JUDGE_ROUTE: ${RF_EVAL_JUDGE_ROUTE:-}
+    volumes:
+      - type: volume
+        source: rf_eval_job_data
+        target: /app/evaluation-jobs
+
+# BEGIN UNIFIED PIPELINE v1.3
+  eval-pipeline-offline:
+    build:
+      context: ./backend
+      target: worker
+      # 与 API、业务 Worker 使用相同的本地构建身份，避免评测进程版本显示 unknown。
+      args:
+        BUILD_STAMP: local
+        BUILD_VERSION: ${BUILD_VERSION:-}
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
+        BUILD_DIRTY: ${BUILD_DIRTY:-}
+    command: ["python", "-m", "evals.agent_eval_ext.evaluation_pipeline_worker_v13", "--lane", "offline"]
+    environment:
+      RF_EVAL_JOB_ROOT: /app/evaluation-jobs
+      LLM_MODE: fake
+      PYTHONUNBUFFERED: "1"
+    network_mode: none
+    read_only: true
+    healthcheck: { disable: true }
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 64
+    mem_limit: 2g
+    volumes:
+      - type: volume
+        source: rf_eval_job_data
+        target: /app/evaluation-jobs
+    restart: unless-stopped
+
+  eval-pipeline-online:
+    profiles: ["eval-online"]
+    build:
+      context: ./backend
+      target: worker
+      args:
+        BUILD_STAMP: local
+        BUILD_VERSION: ${BUILD_VERSION:-}
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
+        BUILD_DIRTY: ${BUILD_DIRTY:-}
+    command: ["python", "-m", "evals.agent_eval_ext.evaluation_pipeline_worker_v13", "--lane", "online"]
+    env_file: [.env]
+    environment:
+      RF_EVAL_JOB_ROOT: /app/evaluation-jobs
+      # v1.3.2: optional overrides; unset => reuse .env LLM_MODE=real + EVAL_JUDGE_MODEL.
+      RF_EVAL_ONLINE_ENABLED: ${RF_EVAL_ONLINE_ENABLED:-}
+      RF_EVAL_JUDGE_ROUTE: ${RF_EVAL_JUDGE_ROUTE:-}
+      LLM_MODE: real
+      PYTHONUNBUFFERED: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    healthcheck: { disable: true }
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 128
+    mem_limit: 3g
+    volumes:
+      - type: volume
+        source: rf_eval_job_data
+        target: /app/evaluation-jobs
+    restart: unless-stopped
+# END UNIFIED PIPELINE v1.3
+
+volumes:
+  rf_eval_job_data:
+    name: researchflow_eval_job_data

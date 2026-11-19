@@ -13,22 +13,7 @@ import { ApiError } from "@/lib/api";
 import { customisedRoles } from "@/lib/promptOverrides";
 import type { AgentRole } from "@/lib/types";
 
-/**
- * Settings → Agents: how each agent behaves (scope freeze §12).
- *
- * Models answers "what model should this role use"; this page answers "how should this
- * agent behave", and the two stay apart. The model a role runs on is shown here read-only,
- * with a link to where it is changed — a second selector would be a second place to change
- * one setting.
- *
- * **The agents are the five public roles, from the API.** The list is whatever
- * `GET /models/prompt-defaults` returns, which is exactly the overridable surface — so a
- * protected purpose cannot appear here, and nothing on this page can create an agent: the
- * pipeline's roles are fixed, and user-defined agents are deferred beyond V3.
- *
- * One editor is open at a time. Five full-length prompts on one page would bury the
- * question each card answers — shipped or customized — under text nobody asked to read.
- */
+/** 设置中的智能体页面只管理行为（范围约定 §12），模型选择仍由模型页负责；这里只读展示当前模型并提供链接，避免同一设置出现两个编辑入口。可编辑角色严格来自 GET /models/prompt-defaults，即五个公开角色，不展示受保护的用途，也不提供创建新角色。一次只打开一个编辑器，避免长提示词掩盖每张卡片的默认或自定义状态。 */
 export function AgentsSection() {
   const { data: me, isLoading: meLoading } = useMe();
   const defaults = usePromptDefaults();
@@ -42,7 +27,7 @@ export function AgentsSection() {
   const overrides = me?.preferences.prompt_overrides ?? null;
   const customised = new Set(customisedRoles(overrides));
 
-  // `null` is the reset (§12): the API merges per role, so this touches no other agent.
+  // null 表示重置（§12）；API 按角色合并，不影响其他智能体。
   const write = async (role: AgentRole, text: string | null) => {
     await updateProfile.mutateAsync({ preferences: { prompt_overrides: { [role]: text } } });
   };
@@ -51,12 +36,12 @@ export function AgentsSection() {
     setResetError(null);
     try {
       await write(role, null);
-      toast.success(`${ROLE_COPY[role].label} is back on the shipped prompt.`);
+      toast.success(`${ROLE_COPY[role].label}已恢复内置提示词。`);
       return true;
     } catch (err) {
       setResetError({
         role,
-        message: err instanceof ApiError ? err.message : "Could not reach the server.",
+        message: err instanceof ApiError ? err.message : "无法连接服务端。",
       });
       return false;
     }
@@ -65,28 +50,22 @@ export function AgentsSection() {
   const loading = meLoading || defaults.isLoading;
 
   return (
-    <Section title="Agents" description="Customize how your research agents behave.">
+    <Section title="智能体" description="自定义研究智能体的行为。">
       <div className="space-y-5">
         <p className="text-xs leading-relaxed text-text-muted">
-          Each agent follows its shipped instructions unless you give it your own. Saved
-          instructions apply to research you start afterwards — a run keeps the instructions
-          it started with — and follow-up chat uses them straight away. A run&apos;s
-          verification bundle records them in full, so anyone you share it with can read
-          them. Bundles from this release use format v2, which a verifier from before this
-          release refuses: check them with the current one.
+          智能体默认遵循内置指令，也可使用你保存的指令。新指令用于此后启动的研究；已开始的研究保留启动时的版本，追问对话则立即使用最新指令。验证包会完整记录指令，分享对象也能阅读。本版本使用 v2 格式，旧版验证器会拒绝，请使用当前版本核验。
         </p>
 
         {loading && <div className="h-40 animate-pulse border border-border bg-bg-surface" />}
 
         {!loading && (defaults.isError || !defaults.data || !me) && (
           <p className="text-sm text-text-secondary">
-            The agents&apos; shipped instructions could not be loaded, so nothing here can be
-            edited right now. Nothing was changed.
+            无法加载智能体内置指令，当前不能编辑。未作任何更改。
           </p>
         )}
 
         {!loading && defaults.data && me && (
-          <ul className="space-y-3" aria-label="Agents">
+          <ul className="space-y-3" aria-label="智能体">
             {defaults.data.roles.map((shipped) => {
               const role = shipped.role;
               const isCustom = customised.has(role);
@@ -113,16 +92,16 @@ export function AgentsSection() {
                               : "border-border text-text-muted"
                           }`}
                         >
-                          {isCustom ? "Customized" : "Shipped"}
+                          {isCustom ? "已自定义" : "内置默认"}
                         </span>
                       </div>
                       <p className="text-xs leading-relaxed text-text-muted">
                         {ROLE_COPY[role].blurb}
                       </p>
                       <p className="font-mono text-[0.6875rem] text-text-muted">
-                        Model: {model ?? "not available"} ·{" "}
+                        模型：{model ?? "不可用"} ·{" "}
                         <Link href="/settings/models" className="text-accent hover:underline">
-                          Change in Models
+                          前往模型设置修改
                         </Link>
                       </p>
                     </div>
@@ -143,7 +122,7 @@ export function AgentsSection() {
                             setEditing(role);
                           }}
                         >
-                          {isCustom ? "Edit instructions" : "Customize"}
+                          {isCustom ? "编辑指令" : "自定义"}
                         </button>
                       </div>
                     )}
@@ -164,8 +143,8 @@ export function AgentsSection() {
                         onSave={(text) => write(role, text)}
                         onClose={() => setEditing(null)}
                         onReset={async () => {
-                          // Closed only once the override is really gone; a refusal shows on
-                          // the card and leaves the editor, and its text, where they were.
+                          // 只有覆盖值确实清除后才关闭编辑器；请求被拒绝时，
+                          // 在卡片上显示错误，并保留编辑器及其文本。
                           if (await reset(role)) setEditing(null);
                         }}
                       />

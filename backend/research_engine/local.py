@@ -1,22 +1,9 @@
-"""
-The local host's adapters (docs/13 §4, docs/12 M6 step 4).
+"""本地宿主适配器，见 docs/13 §4、docs/12 M6。
 
-The server's implementations of the engine's ports live in `app/adapters.py` and speak
-Postgres and Redis. These are their laptop equivalents: a SQLite search cache and an
-in-process event sink. Together with LangGraph's `AsyncSqliteSaver` they are everything
-needed to run the full pipeline — gate included — on a machine with no Docker, no
-Postgres, no Redis, and no login.
-
-Shipped inside the engine package rather than a separate host because they are the
-*reference* local host: `research_engine.cli` uses them to prove the extraction worked
-(M6's Definition of Done), and the desktop sidecar (docs/12 M9) will use the same two
-classes behind a Tauri shell. That is a deliberate exception to "hosts live outside the
-engine" — the alternative is a second package that exists only to hold 80 lines.
-
-The SQLite cache uses stdlib `sqlite3` on a worker thread, not `aiosqlite`, so it adds no
-dependency to the engine's core install. The checkpointer does need
-`langgraph-checkpoint-sqlite` — the `[local]` extra in `pyproject.toml`.
-"""
+SQLite 搜索缓存和进程内事件发送器，配合 AsyncSqliteSaver，
+让完整研究及审批无需 Docker、Postgres、Redis 或登录即可运行。
+作为 CLI 与桌面共用的参考实现放在引擎包中。
+缓存使用线程内标准库 sqlite3；检查点另需 pyproject.toml 的 local 扩展依赖。"""
 
 from __future__ import annotations
 
@@ -37,36 +24,26 @@ _PROVIDER_ENV = {
     "custom": "CUSTOM_API_KEY",
 }
 
-# Local inference (Ollama) and self-hosted OpenAI-compatible endpoints (custom)
-# authenticate with nothing, or with a token the endpoint itself defines. Routing to
-# them must not demand a hosted-provider key — mirrors `_KEYLESS_PROVIDERS` in
-# app/config.py so the CLI and the server agree on what "no key needed" means.
+# 本地 Ollama 和自托管 custom 可不带供应商密钥。
+# 与服务端 app/config.py 的 _KEYLESS_PROVIDERS 保持同一含义。
 _KEYLESS_PROVIDERS = ("ollama", "custom")
 
 
 def providers_missing_a_key(models: dict[str, str], keys: dict[str, str]) -> list[str]:
-    """The routed providers that cannot run for want of a key, or `[]` when this routing can.
+    """返回因缺密钥而不能运行的供应商列表；全部可用时为空。
 
-    Only providers that need a key count — routing every role at Ollama or a custom
-    endpoint is a complete, keyless configuration. One home for every host that builds a
-    `RunConfig` from its own key store: this module and `desktop.sidecar.sidecar_run_config`
-    both ask it, so the CLI and the desktop cannot disagree about what "no key" means.
-    """
+    只检查确实需要密钥的供应商；CLI 和桌面共用，避免拒绝完整的无密钥本地配置。"""
     routed = sorted({m.split(":", 1)[0] for m in models.values()})
     needs_key = [p for p in routed if p not in _KEYLESS_PROVIDERS]
-    # `custom_base_url` is an endpoint, not a credential — it must not count as one.
+    # custom_base_url 是地址而非凭据，不能算作密钥。
     have_a_key = any(name != "custom_base_url" for name in keys)
     return needs_key if not have_a_key else []
 
 
 def usable_providers(keys: dict[str, str]) -> list[str]:
-    """The providers reachable with these keys — `model_routing.available_providers` for
-    hosts that hold their own keys, as the desktop does.
+    """返回当前密钥及地址支持的供应商，供自行管理密钥的宿主使用。
 
-    Ollama is always usable, as on the server: local inference needs no key. Answering from
-    keys alone left it out on the desktop, so Settings offered no local preset on a machine
-    running Ollama. A custom endpoint is usable once its URL is set, key or not.
-    """
+    Ollama 始终可用；custom 配有地址即可，不强制密钥，与服务端规则一致。"""
     usable = {"ollama"} | {p for p in keys if p != "custom_base_url"}
     if keys.get("custom_base_url"):
         usable.add("custom")
@@ -74,70 +51,54 @@ def usable_providers(keys: dict[str, str]) -> list[str]:
 
 
 def load_env_file(path: str | Path = "../.env") -> bool:
-    """Load a `.env` into the process environment, if one exists. Returns whether it did.
+    """宿主显式请求时加载 .env，返回是否成功加载。
 
-    Real environment variables always win over the file, so an explicit `KEY=… make eval`
-    or a CI secret is never clobbered by a stale local file.
-
-    This exists because decoupling the engine from `app.config` (docs/12 M6 step 5) also
-    removed pydantic-settings' implicit `.env` loading from the eval and CLI paths — which
-    silently made `LLM_MODE=real make eval` stop finding a key that was sitting right
-    there. Hosts opt in explicitly; the engine still reads nothing on its own.
-
-    python-dotenv is imported lazily and a missing dependency is a no-op, so it stays out
-    of the engine's required dependency set.
-    """
+    已有环境变量优先，不能被旧文件覆盖；引擎不自行读取环境。
+    python-dotenv 延迟导入，依赖缺失时跳过，避免成为引擎必需依赖。"""
     env_path = Path(path)
     if not env_path.is_file():
         return False
     try:
         from dotenv import load_dotenv
-    except ImportError:  # pragma: no cover - optional convenience
+    except ImportError:  # pragma: no cover — 可选的环境加载便利功能
         return False
     return bool(load_dotenv(env_path, override=False))
 
 
 def provider_keys_from_env() -> dict[str, str]:
-    """The provider keys in the environment, and the custom endpoint they belong to.
+    """统一读取供应商密钥及 custom_base_url，供 CLI 与桌面共用。
 
-    One reader for the CLI and the desktop. The custom provider needs its endpoint as well
-    as its key, and `llm_factory` reads it from `provider_keys` under `custom_base_url`
-    (the contract `app/runtime.py` follows). The desktop once restated the key names and
-    left the endpoint out, so a custom route had a key and no address.
-    """
+    自定义路由必须同时传递地址；只传密钥会造成客户端没有正确端点。"""
     keys = {p: os.environ[env] for p, env in _PROVIDER_ENV.items() if os.environ.get(env)}
     if os.environ.get("CUSTOM_BASE_URL"):
         keys["custom_base_url"] = os.environ["CUSTOM_BASE_URL"]
     return keys
 
 
-def run_config_from_env(*, fake: bool) -> RunConfig:
-    """Build the engine's config from the process environment.
+def run_config_from_env(*, fake: bool, model_routes: dict[str, str] | None = None) -> RunConfig:
+    """从进程环境构造引擎配置，供本地 CLI 和评测宿主共用。
 
-    The local host's counterpart to `app/runtime.py`: same job, different source, and no
-    pydantic-settings — so it needs no `DATABASE_URL` and no `JWT_SECRET_KEY` to exist.
-    The desktop build (docs/12 M9) swaps these `os.environ` reads for a config file plus
-    the OS keychain and nothing else about the engine changes.
-
-    Used by `research_engine.cli` and by the eval harness, which is why it lives here
-    rather than in either one.
-
-    **`skip_plan_gate` is deliberately not set here**, in either branch, so both callers
-    take `RunConfig`'s own default of True and never reach the research design gate
-    (internal/07 Phase 4). That is not an oversight to tidy up: neither the CLI nor the
-    harness can render a plan for a human or resume past that interrupt, so switching it
-    on here would hang an unattended eval run at a gate nobody is watching. The two
-    *hosted* paths — `pipeline_runner._run_config_for` and `sidecar._drive_session` —
-    are where a run gets a real opinion about it, sourced from `Session.skip_plan_gate`.
-    """
+    对应服务端 app/runtime.py，但无需数据库或 JWT 配置。
+    这里故意不设置 skip_plan_gate，保留 RunConfig 默认 True；
+    CLI 与无人值守评测无法展示计划审批，打开关卡会让任务停住无人处理。
+    真正的服务端和桌面运行则从会话明确读取该选项。"""
     if fake:
         return RunConfig(llm_mode="fake")
 
-    models = {role: os.environ.get(f"MODEL_{role.upper()}", DEFAULT_MODELS[role]) for role in ROLES}
+    # 辅助单用途调用可指定各自路由，同时复用研究运行的供应商、本地地址及环境策略。
+    models = (
+        model_routes
+        if model_routes is not None
+        else {role: os.environ.get(f"MODEL_{role.upper()}", DEFAULT_MODELS[role]) for role in ROLES}
+    )
+    if model_routes is not None and (
+        set(models) != set(ROLES)
+        or any(not isinstance(route, str) or ":" not in route for route in models.values())
+    ):
+        raise ValueError("model_routes must specify a provider:model route for every role")
     keys = provider_keys_from_env()
 
-    # An upfront guard for the common "forgot to export anything" case; per-provider
-    # coverage is still enforced later, with an actionable message, by `llm_factory._build`.
+    # 先拦截完全忘配密钥的常见情况；具体供应商缺失仍由工厂给出明确提示。
     if needs_key := providers_missing_a_key(models, keys):
         wanted = ", ".join(_PROVIDER_ENV.get(p, f"{p.upper()}_API_KEY") for p in needs_key)
         raise SystemExit(
@@ -151,16 +112,10 @@ def run_config_from_env(*, fake: bool) -> RunConfig:
         provider_keys=keys,
         tavily_api_key=os.environ.get("TAVILY_API_KEY", ""),
         brave_api_key=os.environ.get("BRAVE_API_KEY", ""),
-        # Same policy as the server host (app/runtime.py): strict in production, relaxed
-        # otherwise. The field defaults to True, and nothing here used to set it — so the
-        # CLI and eval paths applied the *production* guard to a laptop, and the guard's
-        # port allowlist (80/443/8080/8443) rejected every local model proxy: Ollama on
-        # 11434, OmniRoute on 20128. The guard exists for agent-controlled fetches of
-        # untrusted web URLs, not for an endpoint the operator configured themselves.
+        # 与服务端一致：生产启用严格 SSRF，开发放宽。否则笔记本上的 Ollama、
+        # 本地代理端口会被仅允许常用 Web 端口的生产策略拦截。
         enforce_ssrf_guards=os.environ.get("ENVIRONMENT", "development") == "production",
-        # A laptop run reaches Ollama on localhost; the `.env` shipped for Docker points at
-        # host.docker.internal, which does not resolve outside a container. Honouring the
-        # variable here lets one file serve both without editing it per-context.
+        # 本机用 localhost，Docker 常用 host.docker.internal；读取环境变量使同一套配置可覆盖两种场景。
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL")
         or RunConfig.__dataclass_fields__["ollama_base_url"].default,
         **run_limits_from_env(),
@@ -168,15 +123,10 @@ def run_config_from_env(*, fake: bool) -> RunConfig:
 
 
 def run_limits_from_env() -> dict:
-    """Every per-run limit, from the environment, for the CLI and the desktop alike.
+    """统一从环境读取各运行限制，供 CLI 与桌面共用。
 
-    0 = unlimited (docs/04 §6), and the defaults are `app/config.py`'s — the server and
-    local paths are the pair AGENTS.md warns drifts. The desktop once restated these with a
-    600 s wallclock and a $0.50 spend cap, and never read `MAX_INPUT_TOKENS`: a local model
-    can be an order of magnitude slower than a hosted one, and that cap stopped a Fast run
-    on the desktop's default local model mid-research (v3.0.3 record, Finding 13). A host
-    that wants a ceiling sets the variable; the engine itself never reads the environment.
-    """
+    0 表示无限制，默认与 app/config.py 一致，见 docs/04 §6。
+    不能在桌面私设时间或费用上限，也不能漏读 MAX_INPUT_TOKENS；需要上限时由宿主显式设置。"""
 
     def _int_env(name: str, default: int) -> int:
         raw = os.environ.get(name)
@@ -212,22 +162,15 @@ CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache (expires_at)
 
 
 def default_data_dir() -> Path:
-    """Where a local run keeps its database. Overridable by every caller."""
+    """返回本地运行数据库目录，调用方可以覆盖。"""
     return Path.home() / ".research-engine"
 
 
 class SqliteCache:
-    """Search-result cache in a SQLite file — the desktop counterpart of `RedisCache`.
+    """SQLite 搜索结果缓存，对应服务端 RedisCache。
 
-    Every operation runs on a worker thread so it never blocks the event loop, and each
-    one opens its own short-lived connection: SQLite connections are not safe to share
-    across threads, and the traffic here (a handful of reads per research task) makes
-    pooling pointless.
-
-    Expiry is enforced on read rather than by a background sweeper, and expired rows are
-    deleted opportunistically. `retrievers.search` treats the whole cache as advisory, so
-    a locked or corrupt database degrades a run to "uncached" instead of failing it.
-    """
+    每操作在线程里使用短连接，不跨线程共享连接。读取时检查过期，顺便删除过期项。
+    缓存只是性能优化，锁定或损坏时退化成无缓存，不让搜索失败。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -236,8 +179,7 @@ class SqliteCache:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
-        # WAL lets a reader and a writer coexist — matters once the desktop app runs
-        # research and serves its UI from the same file.
+        # WAL 允许读写并存，供桌面研究与界面同时访问。
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
@@ -275,15 +217,10 @@ class SqliteCache:
 
 
 class InProcessEventSink:
-    """Collects pipeline events in memory, optionally forwarding each one live.
+    """按顺序在内存收集事件，可同步转发到实时展示。
 
-    The server sink persists to `agent_logs` and publishes to Redis because its readers
-    are in other processes. On a laptop the reader is the same process — the desktop
-    sidecar streams these straight out over SSE, and the CLI prints them.
-
-    `on_event` is called synchronously as each event arrives, which is what makes a live
-    progress display possible; `events` keeps the full ordered history for replay.
-    """
+    服务端读者跨进程，因此需要落库与 Redis；本地读者同进程，可直接输出 CLI 或 SSE。
+    on_event 实时回调，events 保留完整顺序历史。"""
 
     def __init__(self, on_event: Callable[[dict], None] | None = None) -> None:
         self.events: list[dict] = []

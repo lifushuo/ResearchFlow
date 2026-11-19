@@ -1,11 +1,6 @@
-"""
-Deterministic fakes for LLM_MODE=fake (docs/08 §2).
+"""LLM_MODE=fake 的确定性替代实现，见 docs/08 §2。
 
-These let the whole pipeline run with no network, no API keys, and predictable
-output so the golden E2E and pipeline tests are fast and free. The scripted chat
-model inspects the system prompt to decide which node is calling and returns a
-schema-valid response for that node.
-"""
+让完整流程无需网络与密钥即可运行，返回可预测且符合数据结构的节点结果。"""
 
 from __future__ import annotations
 
@@ -41,13 +36,10 @@ def fake_read_webpage(url: str) -> dict:
 
 
 class ScriptedScenario(StrEnum):
-    """What a scripted call is standing in for.
+    """脚本调用所模拟的具体场景。
 
-    Named separately from `runconfig.ROLES` because the two are not the same set: three
-    scenarios route through the `critic` role (grading, contradiction detection, citation
-    verification) and two through `synthesizer` (drafting, citation repair). Collapsing
-    them would make the fake model answer the wrong contract for two of every five calls.
-    """
+    场景不等于角色：critic 同时承载评审、矛盾检测、引用核验；synthesizer 承载草稿与引用修复。
+    必须区分场景，否则同一角色会得到不符合当前契约的脚本回复。"""
 
     PLANNER = "planner"
     EXECUTOR = "executor"
@@ -64,10 +56,7 @@ class ScriptedScenario(StrEnum):
     CHAT = "chat"
 
 
-#: The prompt a call carries, when it is one of ours. Keyed on the **prompt constants
-#: themselves** rather than on fragments of their prose: rewording a prompt moves its key
-#: with it, where a hand-typed `"Orchestration Planner"` silently stopped matching. This is
-#: what separates the scenarios that share a role.
+#: 按完整提示词常量匹配场景，不依赖手写短语，避免提示词改写后脚本静默失配。
 SCENARIO_BY_PROMPT: dict[str, ScriptedScenario] = {
     prompts.PLANNER_PROMPT_V2: ScriptedScenario.PLANNER,
     prompts.EXECUTOR_PROMPT: ScriptedScenario.EXECUTOR,
@@ -79,7 +68,7 @@ SCENARIO_BY_PROMPT: dict[str, ScriptedScenario] = {
     prompts.CITATION_RELEVANCE_PROMPT: ScriptedScenario.CITATION_RELEVANCE,
     prompts.INFERENCE_VERIFY_PROMPT: ScriptedScenario.INFERENCE_VERIFY,
     prompts.SELECTION_REPAIR_PROMPT: ScriptedScenario.SELECTION_REPAIR,
-    # Sent beside the critic's own prompt, never alone, so it scripts as the critic does.
+    # 与评审提示词一同发送，因此采用评审脚本。
     prompts.SELECTION_CRITIC_ADDENDUM: ScriptedScenario.CRITIC,
     prompts.SYNTHESIZER_PROMPT_V2: ScriptedScenario.SYNTHESIZER,
     prompts.SYNTHESIZER_REPAIR_PROMPT: ScriptedScenario.SYNTHESIZER_REPAIR,
@@ -87,9 +76,7 @@ SCENARIO_BY_PROMPT: dict[str, ScriptedScenario] = {
     prompts.PROJECT_CHAT_PROMPT: ScriptedScenario.CHAT,
 }
 
-#: The fallback, and the reason this indirection exists at all: under a configurable agent
-#: platform the system prompt is the user's, so it matches nothing above. The role is what
-#: the caller stated and cannot be reworded away.
+#: 自定义提示词无法匹配预设常量时，以调用方明确提供的角色作为回退。
 SCENARIO_BY_ROLE: dict[str, ScriptedScenario] = {
     "planner": ScriptedScenario.PLANNER,
     "executor": ScriptedScenario.EXECUTOR,
@@ -100,31 +87,21 @@ SCENARIO_BY_ROLE: dict[str, ScriptedScenario] = {
 
 
 class _ScriptedModel(FakeMessagesListChatModel):
-    """A chat model whose reply depends on which agent role invoked it.
+    """按明确传入的角色和可识别场景返回脚本回复。
 
-    The role is **passed in**, not inferred: `get_llm(role)` already knows it, and the
-    version of this class that re-derived it by searching the system prompt for
-    `"Orchestration Planner"` returned `"{}"` the moment that line was reworded — a graph
-    that ran to completion on empty structured output rather than a failure naming its
-    cause. `usage_metadata` is populated so the cost accountant has non-zero tokens to sum.
-    Structured output (`with_structured_output`) is honored by returning parseable JSON.
-    """
+    不再从提示词中的固定短语猜角色，避免改写提示词后返回空 JSON。
+    填入模拟用量供费用累加流程使用；结构化调用返回可解析 JSON。"""
 
-    #: Required, with no default. A default would restore the implicit path this class was
-    #: changed to remove — a caller that forgets to say which agent it is would silently
-    #: get someone else's script.
+    #: 必须显式提供角色，不能用默认值掩盖调用方遗漏。
     role: str
 
     def __init__(self, role: str) -> None:
         super().__init__(responses=[AIMessage(content="")], role=role)
 
     def scenario_for(self, system: str) -> ScriptedScenario:
-        """Which script answers this call: the prompt if we recognise it, else the role.
+        """优先根据已知提示词选择场景，否则使用角色。
 
-        Raises rather than falling back to `"{}"`. An unscriptable request must fail where
-        it happens; empty structured output parses, so it surfaces several nodes later as
-        something unrelated.
-        """
+        无法选择时立即报错，不回退空 JSON，避免到后续节点才出现不相关错误。"""
         for prompt, scenario in SCENARIO_BY_PROMPT.items():
             if prompt in system:
                 return scenario
@@ -137,8 +114,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
             ) from None
 
     def bind_tools(self, tools, **kwargs):
-        # The scripted executor signals completion by emitting a submit_evidence tool
-        # call (see _reply), matching the real executor contract in graph.py.
+        # 脚本执行器通过 submit_evidence 工具调用表示完成，与真实执行器契约一致。
         return self
 
     def _reply(self, messages: list[BaseMessage]) -> AIMessage:
@@ -163,8 +139,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
                 }
             )
         elif scenario is ScriptedScenario.EXECUTOR:
-            # Evidence is only accepted through the submit_evidence tool call
-            # (docs/12 M7, commit 6ea7f21), so the scripted executor speaks that contract.
+            # 证据只能由 submit_evidence 提交，脚本也遵守同一契约，见 docs/12 M7。
             return AIMessage(
                 content="",
                 tool_calls=[
@@ -202,8 +177,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
         elif scenario is ScriptedScenario.CONTRADICTION_DETECTOR:
             content = self._contradiction_reply(human)
         elif scenario is ScriptedScenario.SYNTHESIZER_REPAIR:
-            # Every assertive line carries a [n] marker so the repair pass converges
-            # in one round (section headers stay under the 15-char claim threshold).
+            # 每条断言都带 [n]，让引用修复一次收敛；标题短于 Claim 长度阈值。
             content = (
                 "# Fixture Report\n\n## Summary\nDeterministic summary [1].\n\n"
                 "## Findings\nA citable fact [1]. A corroborating fact [2].\n\n"
@@ -212,10 +186,8 @@ class _ScriptedModel(FakeMessagesListChatModel):
                 "## Sources\n[1] https://example.com/fixture/1\n[2] https://example.com/fixture/2\n"
             )
         elif scenario is ScriptedScenario.CLAIM_DECOMPOSE:
-            # One claim per sentence, spanning all of it and carrying every marker it has —
-            # always structurally valid, so scripted selection runs exercise the whole
-            # validator. Rulings stay rubber stamps below, as `CITATION_VERIFY`'s are: fake
-            # mode proves the plumbing, and the adversarial tests bring their own judge.
+            # 每句生成一个覆盖完整句子的 Claim，并保留全部引用编号，让 fake 选择研究走完整校验流程。
+            # 脚本判断仅验证流程，质量对抗测试需另外提供 Judge。
             items = []
             for number, sentence in re.findall(r"Sentence (\d+): (.*)", human):
                 cites = sorted(
@@ -243,7 +215,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
             n_claims = len(re.findall(r"Claim \d+:", human)) or 1
             content = "\n".join(f"Claim {i}: SUPPORTED" for i in range(1, n_claims + 1))
         elif scenario is ScriptedScenario.SELECTION_REPAIR:
-            # Restate exactly the verified claims, nothing else.
+            # 仅复述已核验的 Claim，不添加内容。
             block = human.split("Verified claims in this passage:\n", 1)[-1].split("\n\n", 1)[0]
             kept = [line[2:] for line in block.splitlines() if line.startswith("- ")]
             content = " ".join(kept) or "REMOVE"
@@ -251,9 +223,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
             n_pairs = len(re.findall(r"Pair \d+:", human)) or 1
             content = "\n".join(f"Pair {i}: YES" for i in range(1, n_pairs + 1))
         elif scenario is ScriptedScenario.CITATION_VERIFY:
-            # The citation-fidelity verifier (graph._verify_citation_fidelity) asks for one
-            # YES/NO line per claim. Fixture claims all resolve, so rule YES for as many
-            # claims as the request carries — keeps fake-mode drafts byte-identical.
+            # 引用核验器逐 Claim 要求 YES/NO；固定数据均有支持，按请求数量返回 YES，保持演示草稿稳定。
             n_claims = len(re.findall(r"Claim \d+:", human)) or 1
             content = "\n".join(f"Claim {i}: YES" for i in range(1, n_claims + 1))
         elif scenario is ScriptedScenario.SYNTHESIZER:
@@ -274,18 +244,13 @@ class _ScriptedModel(FakeMessagesListChatModel):
 
     @staticmethod
     def _contradiction_reply(human: str) -> str:
-        """Scripted contradiction detector (docs/12 M11).
+        """脚本矛盾检测器，见 docs/12 M11。
 
-        Default: no conflicts — the fixture evidence is consistent, and keeping fake-mode
-        reports contradiction-free keeps the golden outputs byte-identical. A test that
-        wants the surfaced-conflict path plants the CONTRADICTION-FIXTURE sentinel in the
-        evidence text; the reply then pairs the first two sources the detector was shown,
-        quoting their actual snippets, so the validated pairs survive the graph's URL
-        check and the report block renders for real.
-        """
+        默认固定证据无冲突；测试插入 CONTRADICTION-FIXTURE 时，
+        使用实际提供的前两个来源和片段构造冲突，以便通过真实 URL 校验并渲染展示。"""
         if "CONTRADICTION-FIXTURE" not in human:
             return json.dumps({"pairs": []})
-        # One block per source, exactly as contradictions.build_detector_input shapes it.
+        # 每来源一块，与 contradictions.build_detector_input 的输入格式一致。
         blocks = re.findall(
             r"Source: (\S+)\n<untrusted_web_content>\n(.*?)\n</untrusted_web_content>",
             human,
@@ -328,7 +293,7 @@ class _ScriptedModel(FakeMessagesListChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     async def _reply_async(self, messages: list[BaseMessage]) -> AIMessage:
-        """Async-first reply: only the corpus-mode executor needs an await."""
+        """优先异步回复，只有资料库模式的执行器需要 await。"""
         from research_engine.runconfig import get_run_config
 
         system = "\n".join(str(m.content) for m in messages if getattr(m, "type", "") == "system")
@@ -337,13 +302,9 @@ class _ScriptedModel(FakeMessagesListChatModel):
         return self._reply(messages)
 
     async def _corpus_evidence(self, messages: list[BaseMessage]) -> AIMessage:
-        """Corpus-mode executor: search, then submit exactly what came back.
+        """资料库脚本执行器先检索，再逐字提交实际返回的证据。
 
-        The real executor's contract in one line — and it keeps a fake corpus run
-        HONEST: the submitted evidence carries real `corpus://` locations from the
-        installed store, so the synthesized source list's citations resolve to exact
-        document positions (internal/12 M10 DoD). Fixture URLs would prove nothing here.
-        """
+        引用携带真实 corpus:// 定位，才能验证导入到引用的完整链路；使用固定网页 URL 不能证明这一点。"""
         from research_engine.retrievers import search
 
         task_id, query = 1, ""
@@ -354,14 +315,14 @@ class _ScriptedModel(FakeMessagesListChatModel):
                     task_id, query = int(match.group(1)), match.group(2)
         try:
             results = await search(query or "corpus", max_results=2)
-        except Exception:  # noqa: BLE001 — fail closed: empty evidence, not fake URLs
+        except Exception:  # noqa: BLE001 — 失败时返回空证据，不编造 URL
             results = []
         evidence = [
             {
                 "task_id": task_id,
                 "source_url": r["url"],
                 "source_title": r["title"],
-                # EvidenceChunk caps snippets at 500 chars (schemas.py).
+                # EvidenceChunk 的片段上限为 500 字符，见 schemas.py。
                 "snippet": r["snippet"][:480],
                 "key_fact": r["snippet"][:80],
                 "retrieved_at": "2026-01-01T00:00:00Z",

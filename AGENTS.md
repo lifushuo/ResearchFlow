@@ -33,10 +33,65 @@ model id you did not call, never score a baseline against placeholder text.
 Both exclude unjudged claims from the denominator and return `None` when nothing was
 judged, so an exhausted quota can't masquerade as a quality collapse.
 
+Judge response numbers are **local to the current batch**, including a short tail:
+only `1..len(batch)` is valid. Both scoring entries use `evals/judge_labels.py`; preserve
+the last-valid-label-wins duplicate policy. Metrics v5 fixes out-of-range pollution,
+including `Claim 0` negative indexing. Do not apply that correction to saved v4 scores.
+
 **A committed eval result is evidence, and evidence is write-once.** Never modify a file
 under `backend/evals/results/`; add a new one named `eval-<date>-<routing>-run<N>.json` — a
 date alone is not a run identity (a past commit once overwrote and destroyed a real run's
 only record). CI enforces this (`ci.yml`, job `eval-artifacts`).
+
+评测工作台的总览、逐题、轨迹和候选比较必须使用同一个 Pipeline / dataset 选择，
+不能拿历史目录的 `EvaluationDetail` 填充新运行页面：曾出现本轮 Replay 已完成而总览只有空报告卡片、
+坏例与比较仍读取旧静态汇总。切换选择需清除旧证据并丢弃迟到响应；历史文件仅作为证据保留，工作台读本轮 Worker 结果。
+
+归因必须关联研究图与独立 Judge 的时间线，不能用第一条历史 `business_error` 填充终止阶段。
+一次实际运行中图已到审批关卡，却在 Judge 批间等待时触发整轮超时，页面和仅收到错误摘要的模型都误归到网页读取。
+早期症状与终止原因分开；旧记录的等待只能据时序推断，新记录显式记录请求/等待开始与结束。
+只读诊断保留有序脱敏事件与阶段统计，不自动发起付费归因。
+
+报告评测（`evals.harness`）的输出目录必须在任何模型调用前实际试写，不能仅检查目录是否存在或使用 `os.access`。
+Docker 挂载目录曾在单题研究完成后拒绝写入，`--rm` 又移除了仅存于进程内的结果。
+`evals.harness` 的预检和最终独占创建必须同时保留；容器评测优先写入容器内 `/tmp`，
+保留容器并通过 `docker cp` 导出，确认结果已落盘后再删除容器。
+
+Judge Trace 的闭合不等于评分完成。一次真实运行的 15 个尝试批次只完成 14 个，
+以已尝试的 60 条作分母显示 93.33%，却漏掉了完整输入的 74 条。整体覆盖率必须来自全量输入；
+没有分母就保持 null。并发续评必须共用批次提交目录，只跳过已校验且持久化的有效评分，
+不能以请求返回或取消记录代替提交证明，也不能承诺崩溃窗口内绝对零重复计费。
+
+评测产物读取不能复用任务请求的 256 KB 上限：真实十题报告达 611 KB，曾因此丢失错误和判定投影。
+产物使用独立有界读取；同数据集的逐题按钮清空证据时必须触发重新加载。坏例与案例分析绑定当前
+Pipeline、数据集和案例，不能用整轮其他案例的异常替代本题终止证据。
+
+Judge 空正文且输出 Token 等于上限不证明输出截断：曾有两批各用满 1000 Token，但未采集结束原因。
+响应诊断必须比较可观测的 HTTP JSON、SDK 已解析对象和消息转换后统计；缺失保持 `unavailable`。
+只允许安全字段投影，不为获得 `finish_reason` 整包保存消息元数据、正文、隐藏推理或响应头。
+
+独立 Judge 的输出预算不能再借用研究 Critic：真实复现已观察到 `length` 且 1000 个输出 Token
+均为供应商报告的推理 Token，最终正文为空。`EVAL_JUDGE_MAX_OUTPUT_TOKENS` 由两个评分入口共用，
+非旧版 1000 的值进入恢复指纹；改变预算只能校验复用草稿并全批重评，不能混用旧成功批次。
+同预算续评仍只补未完成批次，不自动增加收费重试，也不放宽全量覆盖门禁。
+
+本地 Docker 更新必须在构建覆盖服务标签之前固定旧镜像回滚标签，并验证标签能 inspect。
+本轮构建后旧容器仍在运行，但旧镜像元数据已不能按 ID 查询；不能以容器仍存活当作回滚镜像已保留，
+也不能为补救而把可能含运行时敏感文件的正式容器直接 commit 为镜像。
+
+评测 Trace 默认仅元数据；详细正文必须由评测宿主显式启用，并经 `research_engine.trace_content`
+脱敏、限额和缺失披露。当前工作台不提供正文外发给辅助归因模型的入口。
+曾因只提供摘要而把已恢复的网页错误归为终止原因；诊断必须关联实际执行阶段，不能把事件条数完整
+当作内容完整，也不能补造历史未采集的模型回复、工具返回或 SDK 内部重试。
+
+统一在线 Report 调用必须同时传递 `--trace` 与任务内的 `--trace-dir`，不能因 harness 已有
+Trace 功能就假定上层已采集。420 秒运行器超时曾只留下状态、没有过程证据。
+长任务可靠性不得靠提高这 420 秒硬上限解决：研究完成即落盘草稿与 Evidence，Judge 每批原子落盘，
+只在需要时等待并记录原因，超时/取消先协作停止保存进度、SIGKILL 仅作兜底。
+`MemorySaver` 不能跨进程恢复；续评必须校验报告与 Judge 配置版本，只重评未完成批次，
+绝不覆盖已完成批次或旧历史成绩，也不能把部分评分当作通过质量门禁。
+执行异常必须进入待排查入口；单案例可收集为质量 `unmeasured` 的 Bad Case，不能伪造失败分数，
+批次中断不能归咎于未确认开始的单题。根因候选须带证据与验证步骤，模型辅助结论也不能改分或自动标记修复。
 
 ## Docs are the build contract
 
@@ -424,6 +479,11 @@ best-effort step, not after it — `runs.submit_report_review` is the worked exa
 
 ## Never fake, never swallow
 
+长任务续评目录必须同时拥有已验证草稿和完整批次，不能只复制批次；第一次续评能成功不代表第二次也能恢复。
+基线与候选 Prompt 的进度目录和指纹必须隔离。保存预检失败要在模型调用前退出。
+协作停止宽限必须位于外层硬上限内；`signal.signal` 设置 asyncio Event 时还要唤醒 selector，
+只有模拟信号发送的单测无法证明在途请求能及时退出，需保留真实 Linux 进程组停止验收。
+
 - No `print` in application code — `structlog.get_logger()`, with `correlation_id` bound at
   the boundary. **`session_id` means a `sessions.id` and `run_id` means a `research_runs.id`;
   binding a run under `session_id` is a defect** (see `backend/AGENTS.md`).
@@ -639,6 +699,14 @@ page after a deploy, not just the one you changed: `/`, `/why`, `/docs`, `/relea
 
 ## Local development
 
+- **The dev and full Compose files share service keys and can share a project name.**
+  A bare `docker compose up` once replaced the full stack's pg16/Redis containers with
+  the dev pg15 definitions, leaving the app disconnected while the old named volumes
+  survived. Distinct volume names protect data, not container identity. For the evaluation
+  install use `./start-evaluation.ps1` on PowerShell, or explicitly pass **both**
+  `docker-compose.full.yml` and `docker-compose.evaluation.override.yml` with the same
+  project name. Never repair this with `down -v`, pruning or mounting the old pg16 data
+  into pg15; inspect the actual mount and `PG_VERSION` before restoring.
 - Whole stack: `./start.sh` (Docker; `--fake` for a keyless demo, `--stop`, `--reset`).
 - Frontend dev port is **3031**, not 3000. `FRONTEND_URL` in `.env` is the CORS allow-list
   and must match, or the API rejects the browser.

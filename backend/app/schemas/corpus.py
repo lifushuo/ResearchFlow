@@ -1,22 +1,7 @@
-"""
-Response bodies for the per-project corpus surface.
+"""项目语料接口共用的响应结构。
 
-**Why these live in `app/schemas/` rather than beside the routes.** The per-project corpus
-path is the canonical product contract and both hosts serve it — the server over one
-SQLite file per project, the desktop over its single `corpus.sqlite`. That difference is
-infrastructure and stays; the *shape* the client reads must not differ, and it did: the
-desktop returned `CorpusStore.documents()`'s own field names inside a `{"documents": [...]}`
-wrapper, `hooks/queries.ts::useCorpusDocuments` types the response as a bare array, and the
-Corpus page rendered "no documents" for a corpus that was never empty. No crash, no failing
-test (AGENTS.md).
-
-The desktop could not declare these models while they sat in `app/api/v1/corpus.py`: that
-module imports `app.config`, which an installed app cannot build (#50). So the shapes moved
-here and the route module re-exports them — the same relocation `download_headers` already
-made, for the same reason.
-
-Nothing in this module may import `app.config`, `app.db`, or anything reaching them.
-"""
+服务端和桌面底层布局可以不同，客户端字段和列表形状必须一致。此前桌面返回 documents 包装对象，前端按数组读取，导致有内容却显示为空。
+结构移到 schemas 后，桌面无需导入依赖 app.config 的服务端路由。禁止引入 app.config、app.db 或间接依赖它们的模块。"""
 
 from __future__ import annotations
 
@@ -29,22 +14,15 @@ class DocumentResponse(BaseModel):
     chunks: int
     created_at: str | None = None
     size_bytes: int | None = None
-    # False for documents ingested before originals were retained. The UI keys its
-    # Open/Download affordance off this rather than assuming every row has a file.
+    # 早期未保留原文件的文档为 False；界面据此决定是否提供打开和下载，不能假设每条都有文件。
     downloadable: bool = False
-    # "uploaded" or "generated" (app/services/report_corpus.py). The UI badges a
-    # generated document distinctly and must not let a user believe it is a source the
-    # way an upload is — retrieval already refuses to cite one (research_engine/corpus.py).
+    # 来源类型 uploaded 或 generated；生成报告必须单独标识，不能冒充上传的原始证据。检索不会将生成报告当作来源。
     origin: str = "uploaded"
-    # The logical document this row is a revision of, and which revision it is. `doc_key`
-    # is an opaque uuid minted by the store — never derived from the filename, because two
-    # unrelated papers can legitimately share one. It is returned because it is the only
-    # way a caller can later say "this upload replaces that document"; nothing else in the
-    # response identifies the document rather than the version.
+    # doc_key 是存储层生成的逻辑文档 UUID，不从文件名推断，另记具体版本。
+    # 客户端用它明确表达新上传替换哪个文档，避免同名论文被错误合并。
     doc_key: str | None = None
     version: int | None = None
-    # Whether retrieval can still reach this row. A superseded version stays readable, so
-    # citations made against it keep resolving, but it is no longer offered as evidence.
+    # 被替换版本保留供历史引用读取，但不再作为新检索的证据。
     is_current: bool = True
 
 
@@ -53,15 +31,13 @@ class CorpusStatusResponse(BaseModel):
     chunks: int
     chunks_by_model: dict[str, int]
     current_model: str
-    # Which corpus this is and what state it is in. A file path is host-specific (and on the
-    # desktop it moved in 3.1), so a path could never name it on both hosts; identity that
-    # lives in the data can.
+    # 用存于数据中的身份和状态识别语料库，不能用主机特有、可能移动的文件路径代替。
     corpus_id: str | None = None
     corpus_version: int | None = None
 
 
 class ExtractedTextResponse(BaseModel):
-    """The text a document's citations are verified against, for the citation preview."""
+    """引用核验所依据的文档正文，供预览高亮使用。"""
 
     filename: str
     kind: str
@@ -83,11 +59,7 @@ class MembershipResponse(BaseModel):
 
 
 class CorpusTreeResponse(BaseModel):
-    """Folders, documents, and which document is in which folder (RFC V3.1 §7.1).
-
-    Flat lists rather than a nested tree, so the client builds the tree once and the shape
-    stays the same on both hosts. A document with no membership sits at the root.
-    """
+    """平铺返回文件夹、文档和成员关系，由客户端统一构树；无成员关系的文档位于根目录（RFC V3.1 §7.1）。"""
 
     folders: list[FolderResponse]
     documents: list[DocumentResponse]
@@ -100,7 +72,7 @@ class FolderCreateRequest(BaseModel):
 
 
 class FolderUpdateRequest(BaseModel):
-    """`name` renames; `parent_id` moves (null moves to the root). Omit a field to keep it."""
+    """name 修改名称，parent_id 移动位置，空值表示根目录；未提供的字段不变。"""
 
     name: str | None = None
     parent_id: str | None = None

@@ -5,24 +5,12 @@ import Link from "next/link";
 import { useReadiness } from "@/hooks/queries";
 import { isDesktop } from "@/lib/desktop";
 
-/**
- * Shown when the user has no way to run research yet (docs/17 §8a).
- *
- * The trigger is computed, never stored. A "has seen onboarding" flag outlives the
- * condition it describes — still true after a key is revoked, still false after Ollama
- * starts — whereas this disappears the moment a model actually exists, and returns if one
- * stops existing.
- *
- * It routes to Settings rather than opening a wizard. A second key-entry surface would
- * diverge from the model picker the first time a provider is added; this codebase already
- * paid for that pattern once, when `map_local_host` existed in three copies and two were
- * wrong.
- */
+/** 用户尚无可用研究模型时显示（docs/17 §8a）。是否显示由当前配置计算，不能存储已看过引导的标记，因为撤销密钥或启动本地模型后条件会改变。引导统一进入设置，不另建密钥输入向导，以免两套配置界面随提供方变化而漂移。 */
 export function FirstRunNotice() {
   const { data } = useReadiness();
 
-  // Absent data is not "not ready" — a failed or in-flight request must not accuse the
-  // user of missing configuration they may well have.
+  // 数据未返回不等于尚未配置；请求进行中或失败时，
+  // 不能误告用户缺少实际上可能已经存在的配置。
   if (!data || data.ready) return null;
 
   return (
@@ -35,26 +23,22 @@ export function FirstRunNotice() {
       }}
     >
       <p className="text-sm font-semibold text-text-primary">
-        Connect a model to start researching
+        连接模型，开始研究
       </p>
       <p className="mt-1 max-w-2xl text-sm leading-relaxed text-text-secondary">
         {data.local_reachable ? (
           <>
-            A local model server is running — great for document embeddings. For
-            research-quality output, add a provider key (Anthropic, Google, or
-            OpenAI) in Settings.
+            本地模型服务正在运行，可用于文档嵌入。若需要更好的研究质量，请在设置中添加 Anthropic、Google 或 OpenAI 的提供方密钥。
           </>
         ) : (
           <>
-            You need one of: a provider API key, or a local model server. Nothing else is
-            required — web search falls back to a keyless provider, and the database is
-            bundled.
+            只需提供方 API 密钥或本地模型服务之一即可开始；网页搜索会回退到无需密钥的服务，数据库也已内置。
           </>
         )}
       </p>
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <Link href="/settings" className="btn btn-primary">
-          Connect a model
+          连接模型
         </Link>
         {/* The keyless path this build actually has, never a control that does not exist.
             A self-hosted stack has one: `./start.sh --fake` runs the real graph on scripted
@@ -64,9 +48,8 @@ export function FirstRunNotice() {
             that is not there. */}
         {!isDesktop && (
           <span className="font-mono text-xs text-text-muted">
-            or, with no key at all, start the stack with{" "}
-            <code className="font-semibold">./start.sh --fake</code> — scripted models on
-            fixture sources, and every run is stamped as a demo
+            也可以在不提供密钥的情况下启动服务，使用{" "}
+            <code className="font-semibold">./start.sh --fake</code> ——脚本模型搭配固定示例来源，所有研究都会标记为演示。
           </span>
         )}
       </div>

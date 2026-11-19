@@ -1,16 +1,7 @@
-"""
-Report versions and the claim graph.
+"""报告版本和结论关系图。
 
-`revisions` has **zero mutable columns**. `state` and `superseded_by_id` were
-removed once both were shown to derive from reviews, run status and version position —
-`state` had been mixing generation lifecycle, review decision, approval and supersession in
-one field. A table with no mutable columns cannot drift from facts it does not hold.
-
-`claim_evidence_links` is where the claim graph becomes a graph, and it is **authoritative**:
-the `[n]` markers in report prose are a rendering of this table, not the other way round
-That inversion is the single most important difference from the session path, where the markers
-*were* the data.
-"""
+revisions 不包含可修改字段，状态由审核、运行状态和版本位置推导，避免另存状态后不一致。
+claim_evidence_links 是权威结论关联，正文 [n] 是它的展示，不再只把文字标记当全部证据数据。"""
 
 from __future__ import annotations
 
@@ -49,12 +40,9 @@ LINK_ORIGINS = ("CITATION_MARKER", "MODEL_ASSERTED", "HUMAN_ASSERTED")
 
 
 class Revision(Base):
-    """One report version. Not a research-state snapshot.
+    """一版报告，不是整个研究状态快照。
 
-    Evidence and Sources belong to the Run, because rework re-synthesizes from the same
-    evidence — `graph.route_after_gate` sends a rejected draft back to the synthesizer, not
-    the executor.
-    """
+    证据和来源属于运行，返工只回到综合器，继续使用已有证据。"""
 
     __tablename__ = "revisions"
 
@@ -63,19 +51,14 @@ class Revision(Base):
         UuidType, ForeignKey("research_runs.id", ondelete="CASCADE"), nullable=False
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    # The bytes a human approves. Immutable, which is what makes
-    # `Review.reviewed_hash == report_hash` a permanent property rather than a coincidence
-    # that survived until the next rework.
+    # 保存人工批准的原文字节且不可变，使审核哈希永久对应报告，而不是下次返工前碰巧一致。
     report_markdown: Mapped[str] = mapped_column(Text, nullable=False)
     report_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    #: The typed view of this revision (`research_engine.document.ReportDocument`), derived
-    #: from `report_markdown` and never the other way round. NULL on revisions written
-    #: before it existed — an honest absence, not a document asserted retroactively.
-    #: Nothing authoritative reads it: the hash above is still taken over the Markdown.
+    # 结构化 ReportDocument 从 report_markdown 派生，不反过来修改正文。
+    # 早期版本为空，不能补造；权威哈希仍对 Markdown 原文计算。
     report_document: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
-    # The last `evidence.sequence` visible at synthesis. A threshold, not a count, so gaps
-    # in the sequence do not affect it. Not a foreign key: pointing it at a row would imply
-    # that row is special. 0 is legal — a failed run can synthesize against no evidence.
+    # 综合时可见的最大 evidence.sequence，是阈值而非条数，允许序号空缺。
+    # 不作为外键，也不赋予某条证据特殊身份；无证据时 0 合法。
     evidence_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -87,21 +70,15 @@ class Revision(Base):
         CheckConstraint("version >= 1", name="ck_revision_version"),
         CheckConstraint("length(report_hash) = 64", name="ck_revision_hash"),
         CheckConstraint("evidence_watermark >= 0", name="ck_revision_wm"),
-        # Latest revision for a run — the hot read on every session detail page.
+        # 按运行读取最新报告修订，是详情页常用查询。
         Index("ix_revision_run_version", "run_id", "version"),
     )
 
 
 class Claim(Base):
-    """One persisted assertion belonging to one revision.
+    """属于一个报告修订的持久结论。
 
-    `lineage_id` is reserved and **NULL in every row written today**.
-    Claims are derived from prose today, and nothing in that process observes that a
-    sentence in revision 2 *is* the assertion from revision 1. Assigning lineage by fuzzy
-    text matching would manufacture a relationship the system never observed — the same
-    error as marking evidence ATTESTED because it looks fine. It is populated only
-    once the synthesizer emits structured claims, and never backfilled by matching.
-    """
+    目前从正文提取，lineage_id 全部为空。无法仅凭相似文字证明新版与旧版是同一断言；只能在综合器真正输出结构化谱系后填写，不能模糊匹配回填。"""
 
     __tablename__ = "claims"
 
@@ -137,24 +114,19 @@ class Claim(Base):
         CheckConstraint(
             _in("verification_method", CLAIM_VERIFICATION_METHODS), name="ck_claim_method"
         ),
-        # The same unmeasured-vs-measured coherence as evidence: a claim cannot be
-        # UNCHECKED while recording that a verification method ran.
+        # 未检查的结论不能同时声称已执行某种核验，测量状态与方法记录必须一致。
         CheckConstraint(
             "(verification_state = 'UNCHECKED') = (verification_method = 'NOT_RUN')",
             name="ck_claim_unchecked",
         ),
-        # No index on `lineage_id`: it is NULL in every row written today, so an index would be
-        # pure write cost. It arrives with the first non-NULL writer.
+        # lineage_id 当前全部为空，暂不建索引以免徒增写入成本；有真实非空写入后再建。
     )
 
 
 class ClaimEvidenceLink(Base):
-    """The claim↔evidence relation. Authoritative; `[n]` is presentation.
+    """结论与证据的权威关联，正文 [n] 只是展示。
 
-    The two composite foreign keys share this row's single `run_id`, so one value must
-    satisfy both parents. A claim therefore cannot link to another run's evidence — the
-    contamination is unrepresentable rather than merely detected.
-    """
+    两个复合外键共用同一个 run_id，因此两端必须属于同次运行，从结构上禁止跨运行串证据。"""
 
     __tablename__ = "claim_evidence_links"
 
@@ -163,8 +135,7 @@ class ClaimEvidenceLink(Base):
     claim_id: Mapped[uuid.UUID] = mapped_column(UuidType, nullable=False)
     evidence_id: Mapped[uuid.UUID] = mapped_column(UuidType, nullable=False)
     stance: Mapped[str] = mapped_column(String(12), nullable=False)
-    # CITATION_MARKER says plainly that a link came from a typographic marker rather than a
-    # considered judgement. A plain report has only this kind and cannot say so.
+    # CITATION_MARKER 明确表示关联来自文字引用标记，不是模型或人工已经判断内容一致。
     origin: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -187,7 +158,6 @@ class ClaimEvidenceLink(Base):
         CheckConstraint(_in("stance", LINK_STANCES), name="ck_link_stance"),
         CheckConstraint(_in("origin", LINK_ORIGINS), name="ck_link_origin"),
         Index("ix_link_claim", "claim_id"),
-        # The reverse direction — "which claims cite this evidence?" — is what the evidence
-        # drawer asks, and the question a flat report cannot answer at all.
+        # 反向索引支持查询哪些结论引用了这条证据，供证据侧栏使用。
         Index("ix_link_evidence", "evidence_id"),
     )

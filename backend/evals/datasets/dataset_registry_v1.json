@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "registry_id": "researchflow-evaluation-datasets",
+  "datasets": [
+    {
+      "id": "report-benchmark",
+      "title": "Report Benchmark · 10 research topics",
+      "origin": "upstream",
+      "category": "outcome",
+      "split": "benchmark",
+      "collection": "queries",
+      "source": "evals/queries.json",
+      "supporting_files": [],
+      "declared_count": 10,
+      "case_ids": [],
+      "execution": "optional_paid",
+      "score_family": "task completion / citation support / latency",
+      "description": "Original ResearchFlow report question set. Dataset inventory, not the DeepSeek/Kimi result itself."
+    },
+    {
+      "id": "corpus-retrieval",
+      "title": "Corpus Retrieval · local benchmark",
+      "origin": "upstream",
+      "category": "retrieval",
+      "split": "benchmark",
+      "collection": "queries",
+      "source": "evals/datasets/retrieval/queries.json",
+      "supporting_files": [],
+      "declared_count": 12,
+      "case_ids": [],
+      "execution": "offline",
+      "score_family": "precision@k / recall@k / ranking",
+      "description": "Original corpus-retrieval queries and graded document relevance."
+    },
+    {
+      "id": "selection-retrieval",
+      "title": "Selection Retrieval · filtered corpus",
+      "origin": "upstream",
+      "category": "retrieval",
+      "split": "benchmark",
+      "collection": "queries",
+      "source": "evals/datasets/selection-retrieval/queries.json",
+      "supporting_files": [],
+      "declared_count": 16,
+      "case_ids": [],
+      "execution": "offline",
+      "score_family": "recall@k / precision@k / nDCG",
+      "description": "Original selection-aware retrieval benchmark. Some metrics use smaller effective denominators."
+    },
+    {
+      "id": "grounding-v1",
+      "title": "Grounding · claim/evidence labels",
+      "origin": "upstream",
+      "category": "grounding",
+      "split": "benchmark",
+      "collection": "items",
+      "source": "evals/datasets/grounding/v1/items.json",
+      "supporting_files": [
+        "evals/datasets/grounding/v1/labels.json"
+      ],
+      "declared_count": 425,
+      "case_ids": [],
+      "execution": "offline",
+      "score_family": "false accept / false reject / contradicted recall",
+      "description": "425 authored claim/evidence items; effective metric denominators differ by label and validity."
+    },
+    {
+      "id": "judge-calibration",
+      "title": "Judge calibration · Dev and Holdout",
+      "origin": "custom",
+      "category": "judge",
+      "split": "dev_holdout",
+      "collection": "cases",
+      "source": "evals/agent_eval_ext/fixtures/judge_calibration_registry.json",
+      "supporting_files": [
+        "evals/agent_eval_ext/fixtures/judge_calibration.jsonl"
+      ],
+      "declared_count": 24,
+      "case_ids": [],
+      "execution": "optional_paid",
+      "score_family": "human-labeled YES/NO calibration accuracy",
+      "description": "24 original v0.1 hand-labeled Dev/Holdout controls (16/8), exact original JSONL retained and sha256-verified; live independent Judge required for rerun."
+    },
+    {
+      "id": "planner-replay-v1",
+      "title": "Planner Replay · controlled faults",
+      "origin": "custom",
+      "category": "reliability",
+      "split": "regression",
+      "collection": "replay_manifest",
+      "source": "evals/agent_eval_ext/fixtures/replay_suite_v1.json",
+      "supporting_files": [
+        "evals/agent_eval_ext/fixtures/unified_dataset_v1.json"
+      ],
+      "declared_count": 4,
+      "case_ids": [],
+      "execution": "controlled_free",
+      "score_family": "expected behavior / retry count / trace integrity",
+      "description": "Runs a real compiled LangGraph with controlled fake LLM; PASS is not a completed research report."
+    },
+    {
+      "id": "executor-regression-v1",
+      "title": "Executor · controlled real-logic regression",
+      "origin": "custom",
+      "category": "executor",
+      "split": "regression",
+      "collection": "cases",
+      "source": "evals/agent_eval_ext/fixtures/executor_suite_v131.json",
+      "supporting_files": [
+        "evals/agent_eval_ext/executor_regression_v131.py"
+      ],
+      "declared_count": 7,
+      "case_ids": [
+        "search-read-submit",
+        "malformed-url",
+        "blocked-url",
+        "tool-timeout",
+        "duplicate-read",
+        "duplicate-submit",
+        "cancel"
+      ],
+      "execution": "controlled_free",
+      "score_family": "tool error handling / evidence path / cancellation",
+      "description": "Seven fixed scenarios using real ResearchFlow Executor internals, fake LLM/tool/HTTP responses, no paid model calls. 7-case manifest and fixed pytest CLI."
+    },
+    {
+      "id": "tool-contract-v1",
+      "title": "Tool contract · positive/negative fixtures",
+      "origin": "custom",
+      "category": "tool_contract",
+      "split": "fixture",
+      "collection": "cases",
+      "source": "evals/agent_eval_ext/fixtures/tool_gold_v1.json",
+      "supporting_files": [
+        "evals/agent_eval_ext/fixtures/tool_observed_pass_v1.json",
+        "evals/agent_eval_ext/fixtures/tool_observed_fail_v1.json"
+      ],
+      "declared_count": 4,
+      "case_ids": [],
+      "execution": "controlled_fixture",
+      "score_family": "tool selection / argument / order / forbidden-tool detection",
+      "description": "Synthetic tool contract fixtures; NOT measured real-LLM tool-selection accuracy."
+    }
+  ]
+}

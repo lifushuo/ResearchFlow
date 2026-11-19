@@ -51,18 +51,18 @@ export function CitedPassage({
     mark.current?.scrollIntoView({ block: "center" });
   }, [data]);
 
-  if (isLoading) return <p className="text-xs text-text-muted">Opening the cited passage…</p>;
+  if (isLoading) return <p className="text-xs text-text-muted">正在打开引用片段…</p>;
   if (error || !data)
     return (
       <p className="text-xs text-danger">
-        This document is no longer in the corpus. The run kept the quoted evidence, but the full
-        file cannot be reopened.
+        暂时无法读取语料库中的此文档。研究记录仍保留引用证据，但当前无法重新打开完整文件。
       </p>
     );
 
   const start = Math.max(0, Math.min(locator.start ?? 0, data.text.length));
   const end = Math.max(start, Math.min(locator.end ?? start, data.text.length));
-  const where = labelAt(data.segments, start) ?? (locator.page ? `page ${locator.page}` : null);
+  const segment = labelAt(data.segments, start);
+  const where = segment?.replace(/^page (\d+)$/i, "第 $1 页") ?? (locator.page ? `第 ${locator.page} 页` : null);
   // The extracted text is what the quote was checked against; the PDF is what a reader
   // trusts. Offered only for a PDF, opened at the cited page when the locator has one.
   const pdf = kindForFilename(data.filename) === "pdf";
@@ -72,7 +72,7 @@ export function CitedPassage({
         <span className="font-semibold text-text-primary">{data.filename}</span>
         {where ? ` — ${where}` : ""}
         {data.extraction_mode === "linearized" &&
-          " · quoted from a text rendering of this file's tables, slides or cells"}
+          " · 引用自此文件表格、幻灯片或单元格转换后的文本"}
       </p>
       {pdf && (
         <button
@@ -80,7 +80,7 @@ export function CitedPassage({
           onClick={() => setOriginal(true)}
           className="text-xs text-accent hover:underline"
         >
-          {locator.page ? `Open the PDF at page ${locator.page} →` : "Open the PDF →"}
+          {locator.page ? `打开 PDF 第 ${locator.page} 页 →` : "打开 PDF →"}
         </button>
       )}
       {pdf && original && (
@@ -90,7 +90,7 @@ export function CitedPassage({
           url={citedDocumentUrl(owner, locator.documentId)}
           filename={data.filename}
           downloadable
-          subtitle={locator.page ? `Cited from page ${locator.page}` : "Cited from your corpus"}
+          subtitle={locator.page ? `引用自第 ${locator.page} 页` : "引用自语料库"}
           page={locator.page}
         />
       )}

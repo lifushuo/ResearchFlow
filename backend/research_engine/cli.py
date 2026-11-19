@@ -1,18 +1,9 @@
-"""
-`research-engine` — a reference local host (docs/12 M6 step 4, its Definition of Done).
+"""research-engine：本地宿主的参考实现，见 docs/12 M6。
 
-Runs the full pipeline on a bare machine: no Docker, no Postgres, no Redis, no login, no
-server. State lives in one SQLite file, so the review gate works the way it should —
-the run pauses, the process exits, and a later `--approve` resumes *from the checkpoint*
-rather than re-running research you already paid for.
-
-    research-engine "why do LLMs hallucinate?" --fake
-    research-engine --approve <session-id>            # finalize the draft
-    research-engine --reject <session-id> -f "cite more primary sources"
-
-This is also the shape the desktop sidecar (docs/12 M9) will wrap: same engine, same
-ports, same two local adapters — a Tauri shell instead of a terminal.
-"""
+无需 Docker、Postgres、Redis、登录或服务器，状态保存在单个 SQLite 文件。
+研究暂停后进程可以退出；之后用 --approve 从检查点继续，不重复已付费的研究。
+拒绝时可用 --reject <session-id> -f 提供反馈；演示运行可使用 --fake。
+桌面端通过相同引擎、端口和本地适配器包装此流程。"""
 
 from __future__ import annotations
 
@@ -33,7 +24,7 @@ from research_engine.local import (
 )
 from research_engine.runner import RunOutcome, resume, run
 
-# ── Output ─────────────────────────────────────────────────────────────────────────
+# ── 终端输出 ──
 
 _AGENT_MARK = {
     "planner": "◆",
@@ -59,8 +50,7 @@ def _print_outcome(outcome: RunOutcome, session_id: str) -> None:
     print()
     print(report)
 
-    # The synthesizer already ends its report with a numbered source list, so only add a
-    # panel when it didn't — otherwise every run prints "Sources" twice.
+    # 综合器通常已输出来源列表，仅在缺失时补面板，避免重复显示 Sources。
     if outcome.sources and not _SOURCES_HEADING_RE.search(report):
         print()
         print("## Sources")
@@ -81,10 +71,8 @@ def _print_outcome(outcome: RunOutcome, session_id: str) -> None:
         print(f"  research-engine --approve {session_id}")
         print(f'  research-engine --reject {session_id} -f "what to fix"')
     elif outcome.status == "awaiting_plan":
-        # Unreachable through this CLI — `run_config_from_env` never enables the design
-        # gate, for exactly this reason (see its docstring). Handled anyway so that a
-        # config which somehow does enable it says so, rather than printing a bare
-        # status line and leaving a checkpointed session with no visible way forward.
+        # 此 CLI 的配置不会启用设计审批关卡，因为没有对应交互入口。
+        # 仍显式处理该状态，避免意外配置启用后只打印状态却不告诉用户如何继续。
         print()
         print(
             "Paused at the research design gate, which this CLI cannot review — "
@@ -94,15 +82,13 @@ def _print_outcome(outcome: RunOutcome, session_id: str) -> None:
         print(f"\nFailed: {outcome.error}", file=sys.stderr)
 
 
-# ── Run ────────────────────────────────────────────────────────────────────────────
+# ── 运行与恢复 ──
 
 
 async def _drive(args: argparse.Namespace) -> tuple[RunOutcome, str]:
-    """Open the local checkpointer and cache, then run or resume.
+    """打开本地检查点和缓存，再启动或恢复研究。
 
-    Returns the outcome *and* the session id, because a fresh run mints a random one and
-    the caller has to print it — that id is the only way back to a paused draft.
-    """
+    同时返回结果和会话 ID；新运行的 ID 随机生成，必须展示给用户以便恢复草稿。"""
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -110,9 +96,7 @@ async def _drive(args: argparse.Namespace) -> tuple[RunOutcome, str]:
 
     load_env_file()
 
-    # The config carries the provider keys, so there is no separate `provider_keys` here —
-    # that port exists for the server, where a *user's* BYOK key overrides the
-    # deployment's. On a laptop there is only one set of keys.
+    # 本地只有一套密钥，已由配置携带。单独 provider_keys 端口留给服务端用户密钥覆盖部署密钥的场景。
     ports = {
         "event_sink": InProcessEventSink(on_event=None if args.quiet else _print_event),
         "cache": SqliteCache(data_dir / "cache.sqlite"),
@@ -142,8 +126,7 @@ async def _drive(args: argparse.Namespace) -> tuple[RunOutcome, str]:
             depth=args.depth,
             **ports,
         )
-        # Approving in the same process still resumes from the checkpoint — the graph
-        # re-enters at the gate, it does not replan.
+        # 同一进程内批准也从检查点恢复，重新进入关卡，不会再次规划。
         if args.yes and outcome.status == "awaiting_approval":
             outcome = await resume(
                 checkpointer=saver, session_id=session_id, approved=True, **ports
@@ -190,12 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         outcome, session_id = asyncio.run(_drive(args))
-    except KeyboardInterrupt:  # pragma: no cover - interactive
+    except KeyboardInterrupt:  # pragma: no cover — 需要交互输入
         print("\ninterrupted", file=sys.stderr)
         return 130
     except ValueError as e:
-        # Model factory and config errors already carry actionable messages; a traceback
-        # would bury them.
+        # 模型工厂和配置错误已有可操作提示，不再用堆栈淹没这些信息。
         print(f"error: {e}", file=sys.stderr)
         return 2
 

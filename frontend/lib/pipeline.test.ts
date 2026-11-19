@@ -71,7 +71,7 @@ describe("routeModelLabel", () => {
   });
 
   it("keeps everything after the first colon, matching the backend's split-on-first-colon rule", () => {
-    // ollama:qwen2.5:7b is provider "ollama", model "qwen2.5:7b" (AGENTS.md).
+    // ollama:qwen2.5:7b 的提供方为 ollama，模型为 qwen2.5:7b，只按第一个冒号分割（AGENTS.md）。
     expect(routeModelLabel("ollama:qwen2.5:7b")).toBe("qwen2.5:7b");
   });
 

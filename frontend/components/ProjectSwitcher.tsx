@@ -8,16 +8,10 @@ import { ApiError } from "@/lib/api";
 
 import { useActiveProject } from "./ActiveProject";
 
-/**
- * Modern custom ProjectSwitcher dropdown for the sidebar.
- *
- * Supports expanded and collapsed modes, popping up smoothly without
- * relying on native unstyled <select> elements.
- */
+/** 侧边栏项目选择器。支持展开与折叠两种模式，使用自定义弹层，避免原生 select 的样式限制。 */
 interface ProjectSwitcherProps {
   collapsed?: boolean;
-  /** Which way the popover opens. "down" fits a switcher near the top of the sidebar,
-   *  where "up" (the original default) would clip off the top of the viewport. */
+  /** 弹层展开方向。位于侧边栏顶部时向下展开；原先默认向上会超出视口顶部。 */
   menuDirection?: "up" | "down";
 }
 
@@ -34,7 +28,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
 
   const activeProject = projects.find((p) => p.id === activeId) ?? projects[0];
 
-  // Close on click outside or Escape
+  // 点击外部或按 Escape 时关闭。
   useEffect(() => {
     if (!open) return;
 
@@ -62,7 +56,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
     };
   }, [open, creating]);
 
-  // Focus input when creating begins
+  // 开始创建项目时聚焦输入框。
   useEffect(() => {
     if (creating) {
       inputRef.current?.focus();
@@ -79,9 +73,9 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
       setName("");
       setCreating(false);
       setOpen(false);
-      toast.success(`Project "${project.name}" created`);
+      toast.success(`已创建项目“${project.name}”`);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Couldn't create that project.");
+      toast.error(err instanceof ApiError ? err.message : "无法创建该项目。");
     }
   };
 
@@ -104,7 +98,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="listbox"
         aria-expanded={open}
-        title={collapsed ? `Project: ${activeProject?.name ?? "None"}` : undefined}
+        title={collapsed ? `Project: ${activeProject?.name ?? "无"}` : undefined}
         className={`group flex w-full items-center border bg-bg-surface text-text-primary transition-all duration-150 ${
           collapsed
             ? "h-9 w-9 justify-center mx-auto p-0 border-border hover:border-text-secondary"
@@ -122,7 +116,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
                 {activeProject ? activeProject.name.charAt(0).toUpperCase() : "P"}
               </span>
               <span className="truncate font-semibold text-text-primary text-[0.8125rem]">
-                {activeProject ? activeProject.name : "Select Project"}
+                {activeProject ? activeProject.name : "选择项目"}
               </span>
             </div>
             <svg
@@ -146,7 +140,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
       {open && (
         <div
           role="listbox"
-          aria-label="Projects"
+          aria-label="项目"
           className={`menu-surface animate-fade-in absolute z-50 shadow-xl ${
             collapsed
               ? menuDirection === "down"
@@ -159,7 +153,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
         >
           <div className="flex items-center justify-between px-3 py-2 border-b border-border bg-bg-elevated/40">
             <span className="font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted">
-              Projects ({projects.length})
+              项目（{projects.length})
             </span>
             {!creating && (
               <button
@@ -167,16 +161,16 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
                 onClick={() => setCreating(true)}
                 className="font-mono text-[0.6875rem] font-semibold text-accent hover:underline flex items-center gap-1 shrink-0"
               >
-                <span>+ New</span>
+                <span>+ 新建</span>
               </button>
             )}
           </div>
 
-          {/* Project List */}
+          {/* 项目列表 */}
           <div className="max-h-56 overflow-y-auto py-1 divide-y divide-border/10">
             {projects.length === 0 ? (
               <div className="px-3 py-4 text-xs text-text-muted text-center">
-                No projects created yet
+                尚未创建项目
               </div>
             ) : (
               projects.map((p) => {
@@ -237,26 +231,22 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
             )}
           </div>
 
-          {/* New Project Form */}
+          {/* 新建项目表单 */}
           {creating ? (
             <form onSubmit={submitCreate} className="p-3 border-t border-border bg-bg-elevated">
-              {/* `htmlFor`/`id`, not proximity. Without the association a screen reader
-                  announces the placeholder as the field's name — and a placeholder is an
-                  example, not a label: it disappears on the first keystroke, and here it
-                  reads as "e.g. mRNA Epigenetics", which describes one possible project
-                  rather than what the field is for. */}
+              {/* 通过 htmlFor/id 关联标签，不能依赖视觉距离；占位符只是输入示例，输入后即消失，不能代替供读屏器使用的字段名称。 */}
               <label
                 htmlFor="new-project-name"
                 className="block font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted mb-1"
               >
-                Project name
+                项目名称
               </label>
               <input
                 id="new-project-name"
                 ref={inputRef}
                 value={name}
                 onChange={(e) => setName(e.target.value.slice(0, 120))}
-                placeholder="e.g. mRNA Epigenetics..."
+                placeholder="例如：mRNA 表观遗传学研究"
                 className="input-base h-8 w-full text-xs mb-2 py-1 px-2"
               />
               <div className="flex items-center justify-end gap-2">
@@ -268,14 +258,14 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
                   }}
                   className="px-2 py-1 text-xs text-text-muted hover:text-text-secondary"
                 >
-                  Cancel
+                  取消
                 </button>
                 <button
                   type="submit"
                   disabled={create.isPending || !name.trim()}
                   className="btn btn-primary h-7 px-3 text-xs"
                 >
-                  {create.isPending ? "Creating…" : "Create Project"}
+                  {create.isPending ? "创建中…" : "创建项目"}
                 </button>
               </div>
             </form>
@@ -299,7 +289,7 @@ export function ProjectSwitcher({ collapsed = false, menuDirection = "up" }: Pro
                   <line x1="12" y1="5" x2="12" y2="19" />
                   <line x1="5" y1="12" x2="19" y2="12" />
                 </svg>
-                <span>Create new project</span>
+                <span>创建新项目</span>
               </button>
             </div>
           )}

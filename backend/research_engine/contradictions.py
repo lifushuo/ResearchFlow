@@ -1,29 +1,9 @@
-"""
-Contradiction detection (docs/12 M11): the observable trust feature.
+"""证据矛盾检测，见 docs/12 M11。
 
-Two sources asserting incompatible things is checkable without a truth model — so it
-is the one trust feature that can be *demonstrated* rather than asserted. The detector
-runs once per research run over the finished evidence, between the critic and the
-synthesizer; whatever it finds is surfaced verbatim in a first-class report block and
-at the review gate. **It never resolves a conflict** — adjudication is the human's job.
-
-Division of labor:
-
-- This module is pure: grouping, prompt-input shaping, output validation, and the
-  deterministic block renderer. All of it is unit-tested without a model.
-- The LLM call itself lives in `graph.contradiction_detector_node`, which reuses the
-  graph's `_structured` fail-closed helper. An unavailable detector surfaces *nothing*
-  (and says so in the agent log) — inventing conflicts would be worse than missing them.
-
-Fail-closed details that matter:
-
-- A pair naming a source URL that is not in the evidence is dropped. A prompt-injected
-  snippet cannot thereby launder a fake source into the report's conflict block.
-- Input snippets are wrapped in `<untrusted_web_content>` exactly like the executor sees
-  them (docs/06 §4) — the detector is one more reader of untrusted text.
-- The block the synthesizer appends is rendered HERE, deterministically, from the
-  validated pairs. The LLM never authors it, so it can neither omit nor "resolve" it.
-"""
+在评审后、综合前运行一次，把不相容观点展示在报告和人工关卡，不自动裁决真假。
+此模块负责分组、提示词输入组装、输出校验和确定性渲染；模型调用由图节点负责。
+检测器不可用时明确记录，不编造冲突。未知来源 URL、同源冲突和重复项会被过滤；
+输入证据标作不可信内容，最终冲突段由代码生成，避免模型省略或擅自消解矛盾。"""
 
 from __future__ import annotations
 
@@ -31,23 +11,19 @@ import re
 
 from research_engine.schemas import ContradictionPair
 
-# Prompt-size caps. Cost is a design constraint (docs/01): one bounded detector call per
-# run, never per-pair calls that scale quadratically with source count.
+# 限制提示词大小，每轮只做一次有界检测，避免按来源两两调用导致成本平方增长。
 MAX_SOURCES = 12
 MAX_SNIPPETS_PER_SOURCE = 4
 MAX_SNIPPET_CHARS = 500
 
-# Matches the report's reference-list heading, same family as evals.metrics uses, so the
-# conflict block can be inserted before it regardless of which synonym the model wrote.
+# 识别参考文献标题，以便不论模型采用何种标题同义词，都能把冲突块放在来源列表之前。
 _SOURCES_HEADING_RE = re.compile(r"^#{1,6}\s*(sources|references|citations|bibliography)\b", re.I)
 
 
 def group_snippets_by_source(evidence: list[dict]) -> dict[str, list[str]]:
-    """Evidence → ordered {source_url: [distinct snippets]}, capped for the detector.
+    """将证据按来源 URL 分组，保留各来源不同片段并限制数量。
 
-    Order is first-appearance order, the same convention the synthesizer uses for
-    citation numbering, so detector input and report sources stay aligned.
-    """
+    按首次出现排序，与综合器引用编号约定一致。"""
     by_source: dict[str, list[str]] = {}
     for e in evidence:
         url = (e.get("source_url") or "").strip()
@@ -60,12 +36,12 @@ def group_snippets_by_source(evidence: list[dict]) -> dict[str, list[str]]:
         trimmed = snippet[:MAX_SNIPPET_CHARS]
         if trimmed not in bucket:
             bucket.append(trimmed)
-    # Keep only the first MAX_SOURCES sources — the detector's budget is fixed.
+    # 仅取前 MAX_SOURCES 个来源，控制检测预算。
     return dict(list(by_source.items())[:MAX_SOURCES])
 
 
 def build_detector_input(by_source: dict[str, list[str]]) -> str:
-    """The human-message body the detector sees: sources with their verbatim snippets."""
+    """组装检测器的人类消息正文，包含来源及其逐字证据片段。"""
     blocks: list[str] = ["Sources and their verbatim snippets:"]
     for url, snippets in by_source.items():
         lines = [f"Source: {url}", "<untrusted_web_content>"]
@@ -78,28 +54,21 @@ def build_detector_input(by_source: dict[str, list[str]]) -> str:
 def normalize_pairs(
     pairs: list[ContradictionPair], known_urls: set[str]
 ) -> list[ContradictionPair]:
-    """Best-effort field-shift repair for weaker models (docs/12 M11).
+    """有限修复已观察到的结构化字段错位，见 docs/12 M11。
 
-    deepseek-r1:14b correctly identifies contradictions but mis-fills the structured
-    fields: it puts URLs into snippet_* and "Source: <url>" into source_*. This narrow
-    normalization fixes the two observed patterns:
-
-    1. Strip a leading "Source: " prefix from source_a / source_b.
-    2. If source_* is still not a known URL but the corresponding snippet_* IS, swap them.
-
-    The result is still fed to validate_pairs, so no hallucinated URL can sneak through.
-    """
+    去掉 source_* 的 Source: 前缀；若 source_* 不是已知 URL 而 snippet_* 是，则交换两者。
+    修复后仍必须 validate_pairs，不能放行幻觉 URL。"""
     out: list[ContradictionPair] = []
     for p in pairs:
         d = p.model_dump()
         for side in ("a", "b"):
             src_key, snip_key = f"source_{side}", f"snippet_{side}"
-            # Strip "Source: " prefix (case-insensitive).
+            # 去掉 Source: 前缀，不区分大小写。
             src = d[src_key].strip()
             if src.lower().startswith("source:"):
                 src = src[len("source:") :].strip()
             d[src_key] = src
-            # If source is not a known URL but snippet is, swap them.
+            # 来源字段不是已知 URL、而片段字段是时，交换两个字段。
             if d[src_key] not in known_urls and d[snip_key].strip() in known_urls:
                 d[src_key], d[snip_key] = d[snip_key].strip(), d[src_key]
         out.append(ContradictionPair(**d))
@@ -107,13 +76,10 @@ def normalize_pairs(
 
 
 def validate_pairs(pairs: list[ContradictionPair], by_source: dict[str, list[str]]) -> list[dict]:
-    """Detector output → report-ready dicts, with everything untrustworthy dropped.
+    """把检测结果转换为可展示字典，丢弃不可信项。
 
-    - Both URLs must be sources the detector was actually shown (no hallucinated or
-      injected sources).
-    - A source cannot contradict itself here: same-URL pairs are dropped.
-    - Duplicate pairs (same two URLs, same claims either way around) collapse to one.
-    """
+    双方 URL 必须都曾提供给检测器；排除同一来源自身的冲突；
+    同一对来源及观点无论左右顺序如何，都只保留一次。"""
     known = set(by_source)
     seen_keys: set[tuple] = set()
     out: list[dict] = []
@@ -129,12 +95,9 @@ def validate_pairs(pairs: list[ContradictionPair], by_source: dict[str, list[str
 
 
 def render_block(contradictions: list[dict], index_of: dict[str, int]) -> str:
-    """The deterministic Markdown block appended to the report.
+    """确定性生成追加到报告的 Markdown 冲突块。
 
-    `index_of` maps source URL → the synthesizer's [n] citation number, so each side of
-    a conflict points at the exact entry in the report's source list. The wording is
-    load-bearing: it states that the report does NOT resolve the conflict.
-    """
+    index_of 把来源 URL 映射到 [n]，保证双方观点都能追溯；措辞明确说明报告没有裁决冲突。"""
     lines = [
         "## Conflicting evidence",
         "",
@@ -155,13 +118,7 @@ def render_block(contradictions: list[dict], index_of: dict[str, int]) -> str:
 
 
 def insert_block(draft: str, block: str) -> str:
-    """Place the conflict block before the report's reference list (after everything else).
-
-    A conflict buried below the Sources heading would be invisible in practice; a block
-    prepended would shove the executive summary down. Before Sources, after Limitations,
-    is where a first-class finding lives. Reports without a recognizable sources heading
-    get the block appended.
-    """
+    """把冲突块放在参考文献之前、其他内容之后；找不到来源标题时追加到报告末尾。"""
     lines = draft.splitlines()
     for i, raw in enumerate(lines):
         if _SOURCES_HEADING_RE.match(raw.strip()):

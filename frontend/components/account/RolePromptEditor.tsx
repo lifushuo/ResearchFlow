@@ -8,20 +8,7 @@ import { ApiError } from "@/lib/api";
 import { apiValidationMessage, promptEditorState } from "@/lib/promptOverrides";
 import type { PromptDefault } from "@/lib/types";
 
-/**
- * One agent's instruction editor (scope freeze §12), opened from its card on Settings →
- * Agents.
- *
- * It starts from what runs today — the user's override, else the shipped prompt with the
- * system-added untrusted-content instruction removed — and saves real text. Emptying the box
- * is deliberately not a way to reset: an empty prompt is refused, not read as a reset, so the
- * editor names the control to use instead of offering a Save that would fail.
- *
- * Reset to default is here as well as on the card, beside the text it would replace, and
- * means two things. For a customized agent it clears the override (`onReset`) — saving a
- * copy of the shipped text would still be an override, and the run would record the agent
- * as customized. For a shipped agent it only discards unsaved edits; nothing is sent.
- */
+/** 从“设置→智能体”中的角色卡片打开指令编辑器（范围约定 §12）。初始内容为用户覆盖值，否则为移除系统不可信内容框架后的默认提示词。清空不代表重置，空指令会被拒绝，必须引导使用重置控件。自定义角色重置时调用 onReset 清除覆盖；保存一份默认提示仍会被记录为自定义。默认角色重置时只丢弃未保存编辑，不发送请求。 */
 export function RolePromptEditor({
   label,
   shipped,
@@ -52,7 +39,7 @@ export function RolePromptEditor({
     maxChars,
   });
 
-  // The editor opens in response to a button press, so the cursor follows the person there.
+  // 编辑器由按钮打开，焦点应跟随用户操作进入输入框。
   useEffect(() => {
     box.current?.focus();
   }, []);
@@ -65,13 +52,13 @@ export function RolePromptEditor({
     setError(null);
     try {
       await onSave(state.text);
-      toast.success(`${label} instructions saved. They apply to research you start from now on.`);
+      toast.success(`已保存${label}的指令，将用于此后启动的研究。`);
       onClose();
     } catch (err) {
       setError(
         err instanceof ApiError
           ? apiValidationMessage(err.message)
-          : "Could not reach the server. Nothing was changed.",
+          : "无法连接服务端，未作任何更改。",
       );
     }
   }
@@ -96,14 +83,12 @@ export function RolePromptEditor({
     <div className="space-y-2">
       {shipped.untrusted_content_framed && (
         <p role="note" className="text-xs leading-relaxed text-text-muted">
-          Whatever you write here, the system also adds its rule for untrusted web content
-          before and after it: text retrieved from the web is data, never instructions. That
-          rule is not part of what you edit and cannot be removed.
+          无论填写什么，系统都会在前后补充不可信网页内容规则：检索文本是数据，不能作为指令执行。这部分不属于可编辑内容，也不能移除。
         </p>
       )}
       <textarea
         ref={box}
-        aria-label={`Instructions for ${label}`}
+        aria-label={`${label}的指令`}
         aria-describedby={describedBy}
         aria-invalid={state.tooLong || error !== null}
         className="textarea-base w-full font-mono text-xs leading-relaxed"
@@ -123,14 +108,14 @@ export function RolePromptEditor({
               state.tooLong ? "text-danger" : "text-text-muted"
             }`}
           >
-            {state.length.toLocaleString()} / {maxChars.toLocaleString()} characters
-            {state.tooLong && " — over the limit"}
+            {state.length.toLocaleString("zh-CN")} / {maxChars.toLocaleString("zh-CN")} 字符
+            {state.tooLong && "——超出长度限制"}
           </span>
           <ResetToDefault isDefault={atShipped || busy} onReset={resetToShipped} />
         </div>
         <div className="flex items-center gap-2">
           <button type="button" className="btn btn-ghost" disabled={busy} onClick={onClose}>
-            Cancel
+            取消
           </button>
           <button
             type="button"
@@ -138,16 +123,16 @@ export function RolePromptEditor({
             disabled={!state.canSave || busy}
             onClick={save}
           >
-            Save instructions
+            保存指令
           </button>
         </div>
       </div>
       {state.dirty && state.blank && (
         <p id={hintId} className="text-xs leading-relaxed text-text-secondary">
-          An empty prompt is not a reset — an agent needs instructions.{" "}
+          清空提示词不代表重置，智能体必须有指令。{" "}
           {state.customised
-            ? "Use Reset to default to go back to the shipped prompt."
-            : "Cancel to keep the shipped prompt."}
+            ? "使用“恢复默认”以还原内置提示词。"
+            : "点击“取消”保留内置提示词。"}
         </p>
       )}
       {error && (

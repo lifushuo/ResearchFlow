@@ -1,40 +1,21 @@
-"""
-Response policy for serving one stored corpus document.
+"""两种主机共用的文档下载响应策略。
 
-**Why this is its own module, and not part of the corpus route.** Both hosts serve the
-same document-download contract — `app/api/v1/corpus.py` on the server and
-`desktop/sidecar.py` on the desktop — and a second copy of a security header policy is
-the worst kind of duplication this repo has. It used to live in the route module and the
-sidecar imported it from there, which was one home but the wrong one: importing the route
-drags in `app.adapters` → `app.config`, and the desktop host has no `DATABASE_URL` or
-`JWT_SECRET_KEY` to build `Settings` with. The packaged sidecar therefore died at import
-before serving a single request (#50).
-
-So this module is deliberately **stdlib-only**. Nothing here may import `app.config`,
-`app.db`, or anything that reaches them, or the desktop build breaks again in exactly the
-way `tests/test_sidecar_startup.py` now exists to prevent.
-
-Same shape as `app/services/sse.py`: a shared header policy with the reasoning attached.
-"""
+仅依赖标准库，不能放在会导入 app.config、app.db 的路由模块，否则桌面缺少服务端配置时无法启动。安全头策略集中维护，避免两端出现不同防护。"""
 
 from __future__ import annotations
 
-#: Content-Type per stored kind. Derived from `kind` rather than echoed from the upload —
-#: a client-supplied type is attacker-controlled, and reflecting it invites content
-#: sniffing on a file another user uploaded.
+# 根据存储类型确定 Content-Type，不能原样相信用户上传的类型，以免反射恶意类型或触发嗅探。
 _MEDIA_TYPES = {
     "pdf": "application/pdf",
     "md": "text/markdown; charset=utf-8",
     "txt": "text/plain; charset=utf-8",
-    # Honest about what the bytes are, so a downloaded file opens correctly. Safe only
-    # because it is never served inline — see `download_headers`.
+    # 如实声明字节类型以便正确打开；安全前提是此类文档只作为附件下载，不能同源直接执行。
     "html": "text/html; charset=utf-8",
     "code": "text/plain; charset=utf-8",
     "csv": "text/csv; charset=utf-8",
     "ipynb": "application/x-ipynb+json",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    # One kind covers .xlsx/.xls/.ods; the exact type would need the extension, and a
-    # download names its file anyway, so the generic binary type is the honest one.
+    # 同一类型覆盖 xlsx、xls、ods，无法仅靠 kind 精确区分，因此使用通用二进制类型，文件名仍保留扩展名。
     "spreadsheet": "application/octet-stream",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "odt": "application/vnd.oasis.opendocument.text",
@@ -48,28 +29,11 @@ def media_type_for(kind: str) -> str:
 
 
 def download_headers(kind: str, filename: str) -> dict[str, str]:
-    """Response headers for one stored document (internal/07 Phase 6).
+    """构造存储文档的安全响应头（internal/07 Phase 6）。
 
-    This route used to be unconditionally `attachment`, on the stated principle that an
-    uploaded document must never render inline in this origin. That principle is
-    unchanged for every type except one.
-
-    **PDF is inline; nothing else is.** In-place preview needs the browser to render the
-    file, and PDF is the only format where "render" does not mean "execute a document in
-    our origin": `application/pdf` with `nosniff` is handed to the browser's own viewer,
-    which has its own sandbox. Markdown, text and HTML are previewed without this route
-    at all — the client `fetch`es the bytes and renders them itself, and `fetch` ignores
-    `Content-Disposition` entirely, so keeping `attachment` on them costs the preview
-    nothing and keeps an uploaded `.html` from ever being navigated to and executed here.
-
-    The CSP differs with it. PDF must be framable by our own preview (`frame-ancestors
-    'self'`, and an explicit `X-Frame-Options` because the security middleware's
-    `setdefault` would otherwise apply `DENY`). Everything else keeps `'none'` and adds
-    `sandbox`, which gives even a directly-navigated response an opaque origin with no
-    scripts — braces to `attachment`'s belt.
-    """
-    # The filename came from an upload: a raw newline or quote here would let a crafted
-    # name inject extra response headers.
+    只有 PDF 允许 inline，由浏览器独立查看器渲染，配合 nosniff。其他文件保持 attachment；文本和 Markdown 预览由客户端读取后安全渲染，不需要放宽下载策略。
+    PDF 允许本站预览框架嵌入，显式设置 frame-ancestors self 和 X-Frame-Options；其他类型禁止嵌入并加 sandbox，避免上传 HTML 在本站执行。"""
+    # 上传文件名不可包含可注入响应头的换行或引号，必须先清理。
     safe_name = filename.replace("\\", "_").replace('"', "_").replace("\n", "_").replace("\r", "_")
     if kind == "pdf":
         return {

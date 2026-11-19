@@ -50,8 +50,35 @@ a vector column, so a stock image fails `alembic upgrade head` outright.
 `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` reaches an Ollama on the host —
 portably, including on Linux.
 
-Volumes are named distinctly from the dev compose file's, so the full stack can never
-collide with a dev database of a different Postgres major version.
+Volumes are named distinctly from the dev compose file's, so a dev database of a different
+Postgres major version is not mounted into the full stack. This does **not** isolate container
+identity: using both files with the same Compose project replaces services named `postgres`
+and `redis`. Do not run a bare `docker compose up` from an existing full-stack installation.
+
+### Windows PowerShell：包含评测中心的完整服务
+
+已有 `.env` 时，在仓库根目录运行：
+
+```powershell
+.\start-evaluation.ps1 -Build
+```
+
+该脚本明确使用完整服务与评测扩展两个配置，固定项目 `researchflow`，检查原命名卷及 PostgreSQL 16，
+构建当前代码后等待服务就绪。仅恢复已有镜像去掉 `-Build`；`-CheckOnly` 只检查配置，不启动服务。
+脚本不重写 `.env`，不删除容器数据卷、不清理历史评测，也不主动创建模型评测任务。
+默认包含在线评测 Worker；`-OfflineOnly` 不启动该可选 profile，也不会停止已在运行的在线 Worker。
+
+等价的明确配置命令为：
+
+```powershell
+docker compose -p researchflow -f docker-compose.full.yml -f docker-compose.evaluation.override.yml --profile eval-online up -d --build
+```
+
+裸 `docker compose up -d --build` 读取的是仅有开发数据库/Redis 的 `docker-compose.yml`，
+可能替换已有完整服务容器，并在宿主机 5432/6379 发生端口冲突。完整服务的数据卷是
+`mara_full_postgres_data`、`mara_full_redis_data`、`mara_full_corpus_data`，评测卷是
+`researchflow_eval_job_data`；不要用新创建的 `researchflow_postgres_data` 空卷代替原库。
+误启动时先停止写入、备份并核对原卷版本，再用上述配置恢复；不要使用 `down -v` 或卷清理。
 
 **A locally built image reports the commit it was built from, or `unknown`.** Settings →
 About and `GET /api/v1/version` read a build stamp. `./start.sh` reads the version, commit

@@ -1,12 +1,6 @@
-"""The v1 surface, assembled.
+"""组合 v1 API 路由。
 
-`/version` is declared here rather than in a feature router because it belongs to no
-feature: it says which build is answering. It sits under `/api/v1` rather than beside
-`/health` so that **both hosts serve it at the same path** — the desktop has no top-level
-routes at all (everything is behind the per-launch token), and a client that had to know
-which host it was talking to in order to ask "what are you?" would be exactly the
-`isDesktop` branch this work exists to remove.
-"""
+/version 放在共用路由中，因为它描述整个构建，不属于某个功能。统一使用 /api/v1 路径，让服务端与桌面客户端用同一方式查询版本，无需根据主机类型分支。"""
 
 from fastapi import APIRouter
 
@@ -26,22 +20,16 @@ api_router = APIRouter()
 
 @api_router.get("/capabilities", response_model=Capabilities, tags=["Health"])
 async def capabilities() -> Capabilities:
-    """What this host can do, so the client stops inferring it from the build flag."""
+    """报告本主机实际支持的能力，客户端不再根据构建标记猜测。"""
     return SERVER
 
 
 @api_router.get("/version", tags=["Health"])
 async def version():
-    """Which build this is, and which commit produced it.
+    """报告当前构建版本与来源提交。
 
-    Unauthenticated on the server: it discloses nothing a client cannot infer from the
-    OpenAPI document, and the point is that a maintainer reading a bug report can ask a
-    running deployment what it is. The desktop serves the same payload behind its
-    per-launch token, because that host's boundary is "one token, no exceptions".
-
-    `unknown` where a build was never stamped — `research_engine/build_info.py` explains
-    why that is not filled in from the working tree.
-    """
+    服务端无需登录，因为不披露比 OpenAPI 更多的敏感信息，便于维护者定位部署。桌面仍通过每次启动令牌保护。
+    没有构建标记时保持 unknown，不能从当前工作区猜版本，原因见 research_engine/build_info.py。"""
     return build_info().as_dict()
 
 

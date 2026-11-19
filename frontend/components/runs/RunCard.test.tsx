@@ -56,10 +56,10 @@ describe("RunCard", () => {
     renderCard(run);
 
     expect(screen.getByText("How does distributed consensus work in Raft?")).toBeInTheDocument();
-    expect(screen.getByText("Approved")).toBeInTheDocument();
-    expect(screen.getByText("balanced")).toBeInTheDocument();
-    expect(screen.getByText("✓ verified artifact")).toBeInTheDocument();
-    expect(screen.getByText("100% citations resolve")).toBeInTheDocument();
+    expect(screen.getByText("已批准")).toBeInTheDocument();
+    expect(screen.getByText("均衡")).toBeInTheDocument();
+    expect(screen.getByText("✓ 已验证成果")).toBeInTheDocument();
+    expect(screen.getByText("100% 的引用可解析")).toBeInTheDocument();
   });
 
   it("shows Archive button for active run and calls archive mutation on click", async () => {
@@ -67,7 +67,7 @@ describe("RunCard", () => {
     const run = createSummary({ archived_at: null });
     renderCard(run);
 
-    const archiveBtn = screen.getByRole("button", { name: "Archive" });
+    const archiveBtn = screen.getByRole("button", { name: "归档" });
     expect(archiveBtn).toBeInTheDocument();
 
     await user.click(archiveBtn);
@@ -79,7 +79,7 @@ describe("RunCard", () => {
     const run = createSummary({ archived_at: "2026-08-25T14:00:00Z" });
     renderCard(run);
 
-    const restoreBtn = screen.getByRole("button", { name: "Restore" });
+    const restoreBtn = screen.getByRole("button", { name: "恢复" });
     expect(restoreBtn).toBeInTheDocument();
 
     await user.click(restoreBtn);
@@ -91,14 +91,14 @@ describe("RunCard", () => {
     const run = createSummary();
     renderCard(run);
 
-    const deleteBtn = screen.getByRole("button", { name: "Delete" });
+    const deleteBtn = screen.getByRole("button", { name: "删除" });
     await user.click(deleteBtn);
 
-    expect(screen.getByText("Delete permanently?")).toBeInTheDocument();
-    const noBtn = screen.getByRole("button", { name: "No" });
+    expect(screen.getByText("永久删除？")).toBeInTheDocument();
+    const noBtn = screen.getByRole("button", { name: "否" });
     await user.click(noBtn);
 
-    expect(screen.queryByText("Delete permanently?")).not.toBeInTheDocument();
+    expect(screen.queryByText("永久删除？")).not.toBeInTheDocument();
     expect(mockMutateDelete).not.toHaveBeenCalled();
   });
 
@@ -107,10 +107,10 @@ describe("RunCard", () => {
     const run = createSummary();
     renderCard(run);
 
-    const deleteBtn = screen.getByRole("button", { name: "Delete" });
+    const deleteBtn = screen.getByRole("button", { name: "删除" });
     await user.click(deleteBtn);
 
-    const yesBtn = screen.getByRole("button", { name: "Yes" });
+    const yesBtn = screen.getByRole("button", { name: "是" });
     await user.click(yesBtn);
 
     expect(mockMutateDelete).toHaveBeenCalledWith("run-123");

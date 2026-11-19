@@ -1,11 +1,6 @@
-"""
-A chat thread scoped to a project (docs/14 §3).
+"""项目范围的聊天线程（docs/14 §3）。
 
-Per-report chat answers questions about one report. A thread answers questions about
-everything the project has *approved*, which is the difference between a follow-up and a
-research memory. Threads are parallel and independent — the same project can hold one
-per line of enquiry.
-"""
+报告聊天只围绕一份报告，项目线程围绕项目全部获批研究。多个线程相互独立，可分别讨论不同研究问题。"""
 
 import uuid
 from datetime import datetime
@@ -16,8 +11,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
 from app.models.types import UuidType
 
-# Titles are derived from the first message rather than asked for: naming a thread before
-# writing in it is a chore, and a model call to summarise it would be spend for cosmetics.
+# 从首条消息生成标题，不强迫用户预先命名，也不为纯展示额外调用模型。
 TITLE_MAX_CHARS = 60
 
 
@@ -33,8 +27,7 @@ class ChatThread(Base):
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    # Ordering key for the thread list — a thread is "recent" when it was last *used*,
-    # not when it was created.
+    # 线程列表按最后使用时间排序，而不是创建时间。
     last_message_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -53,7 +46,7 @@ class ChatThread(Base):
 
 
 def derive_title(first_message: str) -> str:
-    """A thread title from its opening message, truncated on a word boundary."""
+    """用开场消息生成标题，按单词边界截断。"""
     cleaned = " ".join((first_message or "").split()) or "New chat"
     if len(cleaned) <= TITLE_MAX_CHARS:
         return cleaned

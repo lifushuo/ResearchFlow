@@ -1,25 +1,8 @@
-"""
-What makes a role→model routing map startable. One implementation, both hosts.
+"""两个宿主共用的模型路由校验。
 
-This rule had two homes and they disagreed. `app/services/model_routing.validate()` learned
-to accept endpoint-defined providers — Ollama serves whatever tags you pulled, and a custom
-gateway or OpenRouter fronts a catalogue that changes without us — while the desktop's
-`sidecar.validate_routing()` kept demanding catalog membership for every id. The visible
-result on the packaged app: an OmniRoute deployment was unselectable entirely, and the only
-local routes that validated were *family* names like `ollama:deepseek-r1`, which Ollama
-404s unless a `:latest` tag happens to exist.
-
-The two copies existed for one reason — `app/services/model_routing` imports `app.config`
-for `available_providers()` and `deployment_default()`, and the desktop host cannot build
-`Settings`. That is a constraint on *those* functions, not on this rule, which needs only
-the catalog and the role list. So it lives here, in the engine, where both hosts already
-import freely and neither needs configuration.
-
-`app.services.model_routing` re-exports `validate` and `InvalidRouting`, so existing call
-sites are unchanged; `sidecar.validate_routing` delegates. Change the rule here and both
-hosts move together — which is the point (AGENTS.md, "prefer extracting the shared logic
-into one function over keeping two copies in step by discipline").
-"""
+Ollama、custom、OpenRouter 的模型 ID 由端点定义，不能强制出现在本地目录。
+过去服务端已允许而桌面仍拒绝，导致精确本地 tag 和网关模型不可选。
+此纯规则只依赖目录和角色表，放在引擎层；服务端重新导出，桌面委托调用，避免再维护两份。"""
 
 from __future__ import annotations
 
@@ -28,31 +11,20 @@ from research_engine.runconfig import ROLES
 
 
 class InvalidRouting(ValueError):
-    """A routing map that must not be persisted.
-
-    Subclasses `ValueError` because the desktop host's callers catch that, and because a
-    bad routing genuinely is a bad value rather than a distinct failure mode.
-    """
+    """不能持久化的非法路由映射，继承 ValueError 以兼容宿主错误处理。"""
 
 
-#: Providers whose model ids are defined by the endpoint rather than by our catalog.
+#: 模型 ID 由端点定义、而非本地目录定义的供应商。
 #:
-#: Validating these against `catalog` would reject every legitimate local tag and every
-#: gateway model, so they are checked for shape only. The cost is real and accepted: spend
-#: on them is not catalog-priced, so `estimate_cost()` returns 0.0 and the per-session cap
-#: does not bind — the same gap `llm_factory.validate_pricing()` already allows for them.
-#: Cap spend at the provider, and never render an unpriced run's cost as a measured `$0.00`.
+#: 对这些供应商只检查路由形状，否则合法本地 tag 和网关模型都会被拒绝。
+#: 未知定价使本地费用上限无效，应在供应商侧设限，不能把未知费用展示为实测零。
 ENDPOINT_DEFINED_PROVIDERS = ("ollama", "custom", "openrouter")
 
 
 def validate(routing: dict) -> dict[str, str]:
-    """Normalize and check a user-supplied routing map.
+    """规范化并校验用户路由。
 
-    Rejects rather than silently repairs: a routing that survives this function is
-    guaranteed startable, so a run cannot fail halfway through on a model that was never
-    routable. In particular an unpriced *catalogued* model is refused here, because
-    accepting it would disable the per-session budget guard for that role.
-    """
+    不静默修复错误；目录内却缺价格的模型明确拒绝，避免该角色预算保护失效。"""
     if not isinstance(routing, dict):
         raise InvalidRouting("Model routing must be an object keyed by agent role.")
 
@@ -67,8 +39,7 @@ def validate(routing: dict) -> dict[str, str]:
     for role, route in routing.items():
         if not isinstance(route, str) or ":" not in route:
             raise InvalidRouting(f"{role}: expected a 'provider:model' string, got {route!r}.")
-        # Split on the FIRST colon only: `ollama:qwen2.5:7b` is provider `ollama`, model
-        # `qwen2.5:7b`. A greedy split silently reroutes every tagged local model.
+        # 只按第一个冒号拆分；ollama:qwen2.5:7b 的模型部分必须保留 qwen2.5:7b。
         provider, _, model_id = route.partition(":")
         if provider not in catalog.KNOWN_PROVIDERS:
             raise InvalidRouting(
@@ -78,9 +49,7 @@ def validate(routing: dict) -> dict[str, str]:
         if provider in ENDPOINT_DEFINED_PROVIDERS:
             if not model_id:
                 raise InvalidRouting(f"{role}: '{provider}:' names no model.")
-            # Kept verbatim rather than canonicalised, because the exact tag is the thing
-            # that resolves at call time. An "obvious" cleanup is how a route stops naming
-            # the model it was chosen for.
+            # 端点定义的精确 tag 原样保留，不能擅自规范化成另一个模型。
             cleaned[role] = route
             continue
         spec = catalog.get(model_id)
@@ -91,5 +60,5 @@ def validate(routing: dict) -> dict[str, str]:
                 f"{role}: '{model_id}' has no configured price, so spending on it could "
                 "not be capped. Add its price to the catalog before routing to it."
             )
-        cleaned[role] = spec.route  # canonical form, so stored values stay comparable
+        cleaned[role] = spec.route  # 目录模型使用标准形式，便于持久化值相互比较。
     return cleaned

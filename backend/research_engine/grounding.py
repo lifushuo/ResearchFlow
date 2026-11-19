@@ -1,27 +1,10 @@
-"""
-Claim-level grounding for selected-files runs (internal/rfcs/V3.1-corpus-scope.md §9).
+"""指定文件研究的逐 Claim 依据核验，见 RFC V3.1 §9。
 
-The requirement: every substantive factual claim in the answer is supported by the selected
-documents, and a claim that cannot be supported is never presented as a verified conclusion.
-This module decides, claim by claim, which is which — and records, without rounding off,
-what it could not decide.
-
-**Nothing here trusts a model's say-so about anything code can check.** The model splits
-sentences into claims and rules on meaning; code checks that the split covers the sentence,
-that every citation it names resolves to a selected document's retrieved evidence, and that
-every number the claim states is in those snippets (`quantities.py`). Prompts that rule are
-PROTECTED (`prompt_composition`), because a user who could rewrite them would grade their
-own report.
-
-**Four final states and no fifth.** A claim ends `supported`, `not_supported`,
-`contradicted` or `unmeasured`. Unmeasured always carries a cause and is never counted as
-supported or as rejected: "the checker could not run" must stay distinguishable from "the
-claim is false" (AGENTS.md: unmeasured is not zero). The caller fails a run that has any
-unmeasured claim left; it never ships one as verified.
-
-This file is the measuring half. The repair loop that keeps rejected claims out of the text
-is `grounding_repair.py`, and both are driven from `graph.synthesizer_node`.
-"""
+模型拆解句子并判断含义，代码核对拆解是否覆盖原句、引用是否来自冻结选择及数字是否有据。
+相关提示词受保护，用户不能改写自己的评分规则。
+最终只有 supported、not_supported、contradicted、unmeasured 四种状态。
+未测量必须带原因，不能当作支持或反对；仍有未测量项时不允许作为已核验报告交付。
+本模块负责测量，grounding_repair 负责改写，由综合节点驱动。"""
 
 from __future__ import annotations
 
@@ -39,7 +22,7 @@ from research_engine.llm_factory import estimate_cost, get_llm, text_of, token_c
 from research_engine.prompt_composition import system_prompt
 from research_engine.runconfig import get_run_config
 
-# ── States, causes, units ─────────────────────────────────────────────────────────
+# ── 状态、原因与文本单元 ──
 
 SUPPORTED, NOT_SUPPORTED, CONTRADICTED, UNMEASURED = (
     "supported",
@@ -48,8 +31,7 @@ SUPPORTED, NOT_SUPPORTED, CONTRADICTED, UNMEASURED = (
     "unmeasured",
 )
 
-#: Why a claim was rejected. `uncited`: no valid citation; `number_not_in_snippet`: a stated
-#: quantity is absent from its snippets; the rest come from a model verdict.
+#: 拒绝原因：uncited 表示无有效引用，number_not_in_snippet 表示数字无据，其余来自模型判定。
 REJECTION_CAUSES = (
     "uncited",
     "number_not_in_snippet",
@@ -59,8 +41,7 @@ REJECTION_CAUSES = (
     "inference_rejected",
 )
 
-#: Why a claim could not be judged. Decided from an exception's type and status, never from
-#: its message text, so a provider rewording an error cannot move a claim between causes.
+#: 无法测量的原因按异常类型和状态码分类，不依赖供应商可能随时改写的错误文字。
 UNMEASURED_CAUSES = (
     "provider_outage",
     "rate_limited",
@@ -71,8 +52,7 @@ UNMEASURED_CAUSES = (
     "unparsed_content",
 )
 
-#: Units of the report the validator reads. `label` units are not claims unless they carry
-#: a citation marker, a digit, or more than 12 words (§9.1).
+#: 待核验的报告单元；标签若有引用、数字或超过 12 个词，也视为 Claim，见 §9.1。
 PARAGRAPH, LIST_ITEM, TABLE_ROW, CAPTION, BLOCKQUOTE, HEADING, LIMITATION, CONCLUSION = (
     "paragraph",
     "list_item",
@@ -84,8 +64,7 @@ PARAGRAPH, LIST_ITEM, TABLE_ROW, CAPTION, BLOCKQUOTE, HEADING, LIMITATION, CONCL
     "conclusion",
 )
 
-#: Written by the repair loop where it removed a unit. Never validated: it states nothing
-#: about the world, so the parser skips it.
+#: 修复循环移除内容后写入的说明，本身不陈述外部事实，不再作为 Claim 校验。
 REMOVED_NOTICE = (
     "*A passage was removed here: its claims are not supported by your selected files.*"
 )
@@ -114,7 +93,7 @@ _SELECTION_PHRASE_RE = re.compile(
 
 @dataclass
 class Unit:
-    """One piece of the draft the validator reads, in document order."""
+    """按文档顺序排列的一个待核验草稿单元。"""
 
     index: int
     kind: str
@@ -125,7 +104,7 @@ class Unit:
 
 @dataclass
 class Claim:
-    """One atomic claim and everything decided about it."""
+    """一条原子 Claim 及其全部判定信息。"""
 
     unit: int
     sentence: str
@@ -133,8 +112,7 @@ class Claim:
     span: tuple[int, int]
     cites: list[int]
     calculation: dict | None = None
-    #: Figures the claim states that its snippets do not, left for the verifier to account
-    #: for with a calculation the code redoes (`_verify`); empty when every figure is present.
+    #: Claim 出现但片段没有的数字，允许核验器提出计算，由代码重新算一遍确认；无缺失时为空。
     missing: list[str] = field(default_factory=list)
     valid_cites: list[int] = field(default_factory=list)
     invalid_cites: list[int] = field(default_factory=list)
@@ -157,7 +135,7 @@ class Claim:
 
 @dataclass
 class Validation:
-    """What one validation pass found. `units` and `claims` are in document order."""
+    """一次核验结果，units 与 claims 均保持文档顺序。"""
 
     units: list[Unit]
     claims: list[Claim]
@@ -170,8 +148,7 @@ class Validation:
     retries: int = 0
     estimated_usd: float = 0.0
     failure: str | None = None
-    #: Which run limit stopped checking, and by how much — the claims only carry the cause
-    #: `budget_exhausted`, and a guard that fires must say which one (AGENTS.md).
+    #: 具体触发的运行限制及超出量；不能只在 Claim 中留下笼统的 budget_exhausted。
     budget_breach: str | None = None
 
     def counts(self) -> dict:
@@ -199,16 +176,14 @@ class Validation:
         }
 
 
-# ── Parsing the draft into units (§9.1) ───────────────────────────────────────────
+# ── 将草稿解析为文本单元，见 §9.1 ──
 
 
 def parse_units(draft: str) -> tuple[list[Unit], list[int]]:
-    """Every line of the draft, assigned to exactly one unit — or reported as unparsed.
+    """每行必须恰好归入一个单元，否则列为未解析。
 
-    Stops at the Sources heading: the reference list is generated, not asserted. A line no
-    rule recognises (raw HTML, a code fence) is returned in the second list rather than
-    skipped, so content cannot escape validation by being formatted oddly (AC-38).
-    """
+    到 Sources 标题停止；代码围栏、原始 HTML 等无法识别的行单独返回，
+    不能让内容因格式特殊而逃过核验，见 AC-38。"""
     units: list[Unit] = []
     unparsed: list[int] = []
     section, in_table, last_was_table = "", False, False
@@ -242,7 +217,7 @@ def parse_units(draft: str) -> tuple[list[Unit], list[int]]:
                 continue
             if not in_table:
                 in_table = last_was_table = True
-                continue  # the header row is a label
+                continue  # 表头行属于标签。
             units.append(Unit(len(units), TABLE_ROW, line.strip("|").strip(), number, section))
             continue
         if line.startswith(">"):
@@ -263,16 +238,14 @@ def parse_units(draft: str) -> tuple[list[Unit], list[int]]:
 
 
 def heading_is_claim(text: str) -> bool:
-    """A heading is a topic label — unless it carries a marker, a digit or a sentence."""
+    """标题通常是主题标签；包含引用、数字或完整句子时仍需核验。"""
     return bool(_MARKER_RE.search(text)) or bool(re.search(r"\d", text)) or len(text.split()) > 12
 
 
 def limitation_is_about_the_selection(sentence: str, question: str) -> bool:
-    """A "what your files don't cover" sentence must be about the selection, not the world.
+    """关于文件未覆盖内容的说明必须描述选择范围，而非断言外部事实。
 
-    Deterministic: it names the selection, carries no citation marker, and states no number
-    that is not already in the question. One that fails is validated as a body claim.
-    """
+    确定性检查其提到文件选择、无引用且没有问题之外的新数字；不符合时作为普通正文 Claim 核验。"""
     if _MARKER_RE.search(sentence) or not _SELECTION_PHRASE_RE.search(sentence):
         return False
     return not [q for q in quantities.extract(sentence) if q not in quantities.extract(question)]
@@ -288,23 +261,20 @@ def markers_in(sentence: str) -> list[int]:
     return sorted({int(p) for m in _MARKER_RE.finditer(sentence) for p in m.group(1).split(",")})
 
 
-# ── Decomposition (§9.2) ──────────────────────────────────────────────────────────
+# ── Claim 拆解，见 §9.2 ──
 
 _FACTUAL_TOKEN_RE = re.compile(r"\d[\d,.]*|\"[^\"]+\"|“[^”]+”|\b[A-Z][a-zA-Z]{2,}\b")
 
 
 def factual_token_positions(sentence: str) -> list[int]:
-    """Start offsets of everything a decomposition must cover: digits, quoted strings, and
-    capitalised words — except the sentence's first word and the citation markers."""
+    """返回拆解必须覆盖的事实标记起点：数字、引号文本和大写词，排除句首词与引用标记。"""
     stripped = _MARKER_RE.sub(lambda m: " " * len(m.group(0)), sentence)
     first = re.match(r"\s*\S+", stripped)
     first_end = first.end() if first else 0
     return [m.start() for m in _FACTUAL_TOKEN_RE.finditer(stripped) if m.start() >= first_end]
 
 
-#: Words a decomposition may leave between quotes: they join or frame assertions and make
-#: none. Negations, causes and sequences ("not", "because", "after") are deliberately absent
-#: — each changes what is asserted, so it must sit inside some claim's quote.
+#: 拆解可以略过的连接或框定词；不包含否定、因果、先后词，因为它们会改变断言含义。
 _FUNCTION_WORDS = frozenset(
     """a an the and or but nor so yet while whereas both either also then too as of in on at
     to for by with from into onto over this that these those which who whom whose it its
@@ -316,10 +286,9 @@ _WORD_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*")
 
 
 def content_word_positions(sentence: str) -> list[int]:
-    """Start offsets of every word a decomposition must cover besides the factual tokens:
-    anything that is not a function word. An aside with no number or capital — "(the
-    largest in the region)" — asserts something too, and left outside every quote it would
-    never be checked."""
+    """返回除事实标记外仍须覆盖的实义词位置。
+
+    没有数字或大写词的附带说明也可能是断言，不能因留在引文之外而漏检。"""
     stripped = _MARKER_RE.sub(lambda m: " " * len(m.group(0)), sentence)
     return [
         m.start() for m in _WORD_RE.finditer(stripped) if m.group(0).lower() not in _FUNCTION_WORDS
@@ -327,14 +296,10 @@ def content_word_positions(sentence: str) -> list[int]:
 
 
 def locate_quote(sentence: str, quote: str, after: int = 0) -> tuple[int, int] | None:
-    """Where a claim's quoted words sit in the sentence, as a character span, or None.
+    """定位 Claim 引文在原句中的字符区间，无法匹配时返回 None。
 
-    The model names a claim's place by quoting it, and this function measures it: a model
-    asked for character offsets miscounts them (G-6 run 1 lost 37% of its claims to spans
-    that started mid-word). The quote must be the sentence's own words in order; only runs
-    of whitespace may differ. The first occurrence at or after `after` wins, so a phrase the
-    sentence repeats is placed after the previous claim's quote.
-    """
+    由模型引用原词、代码计算偏移，避免模型数错字符。仅允许空白差异；
+    从 after 之后取首次出现，保证重复短语与前一个 Claim 不重叠。"""
     words = quote.split()
     if not words:
         return None
@@ -344,15 +309,10 @@ def locate_quote(sentence: str, quote: str, after: int = 0) -> tuple[int, int] |
 
 
 def check_decomposition(sentence: str, decomposed: list[dict]) -> list[Claim] | None:
-    """The claims a decomposition proposes, or None when it fails a structural check.
+    """校验模型拆解结构；失败时返回 None。
 
-    Each claim's span is located from its `quote` (`locate_quote`); a bare `span` is taken
-    as given, which the scripted fakes rely on. Spans inside the sentence and
-    non-overlapping; together they cover every factual token and every content word; every
-    `cites` entry is a marker the sentence carries. A failure makes the whole sentence unmeasured — never
-    supported — because an uncovered clause is exactly where an invented assertion would
-    hide.
-    """
+    通过 quote 定位 span，测试脚本可直接给 span；区间必须在句内、互不重叠、
+    覆盖事实标记和实义词，引用编号必须原句已有。失败则整句未测量，不能默认支持。"""
     if not isinstance(decomposed, list):
         return None
     allowed = set(markers_in(sentence))
@@ -410,15 +370,15 @@ def check_decomposition(sentence: str, decomposed: list[dict]) -> list[Claim] | 
     return out
 
 
-# ── Model calls, budget and causes ────────────────────────────────────────────────
+# ── 模型调用、预算与失败分类 ──
 
-#: Backoff between retries of one call. Module-level so tests can make it instant.
+#: 单次调用重试的退避间隔，放在模块级便于测试设为零。
 RETRY_BACKOFF_SECONDS = 0.5
 MAX_RETRIES = 2
 
 
 class BudgetExhausted(Exception):
-    """A run limit was crossed during validation. `reason` names which, and by how much."""
+    """核验期间超出运行限制；reason 说明具体限制及超出量。"""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -426,7 +386,7 @@ class BudgetExhausted(Exception):
 
 
 def unmeasured_cause(exc: BaseException) -> str:
-    """Which unmeasured cause an exception from a model call is — by type and status."""
+    """根据异常类型和状态码确定未测量原因。"""
     if isinstance(exc, BudgetExhausted):
         return "budget_exhausted"
     if isinstance(exc, asyncio.TimeoutError | TimeoutError) or "Timeout" in type(exc).__name__:
@@ -441,11 +401,9 @@ def unmeasured_cause(exc: BaseException) -> str:
 
 
 class Budget:
-    """The run's existing limits, applied to validation's calls as well (§9.9).
+    """将运行已有预算同时用于核验调用，见 §9.9。
 
-    Starts from what the run has already spent; every validation call adds to it. Checked
-    at each call boundary — a call in flight is never cut off mid-response.
-    """
+    从本轮已消耗量起算，每次核验调用继续累加；在调用边界检查，不截断正在返回的响应。"""
 
     def __init__(self, *, spent_usd: float, tokens_in: int, started_at: float | None) -> None:
         cfg = get_run_config()
@@ -471,11 +429,9 @@ class Budget:
 
 
 async def call_model(purpose: str, human: str, *, budget: Budget, result: Validation) -> str:
-    """One protected model call, retried for transient causes, charged to the budget.
+    """执行受保护模型调用，暂时故障可有限重试，并计入预算。
 
-    Raises `BudgetExhausted` before calling if a limit is already crossed, and re-raises the
-    last error after `MAX_RETRIES` — the caller turns either into an unmeasured cause.
-    """
+    调用前已超限则抛 BudgetExhausted；达到 MAX_RETRIES 后重抛最后错误，由调用方记录未测量原因。"""
     breach = budget.breach()
     if breach:
         result.budget_breach = breach
@@ -486,9 +442,11 @@ async def call_model(purpose: str, human: str, *, budget: Budget, result: Valida
     attempt = 0
     while True:
         try:
-            response = await model.ainvoke(messages)
+            from research_engine.eval_trace import traced_ainvoke
+
+            response = await traced_ainvoke(model, messages, role=role)
             break
-        except Exception as exc:  # noqa: BLE001 — classified, retried or re-raised below
+        except Exception as exc:  # noqa: BLE001 — 下方会分类、重试或重新抛出
             cause = unmeasured_cause(exc)
             if (
                 cause not in ("rate_limited", "timeout", "provider_outage")
@@ -521,7 +479,7 @@ _CALC_RE = re.compile(
 
 
 def parse_calculations(text: str, n: int) -> list[tuple[str, list[str], str] | None]:
-    """The calculation proposed for each claim, as (op, operands, result), or None."""
+    """提取每条 Claim 提出的计算：运算、操作数、结果；未提供时为 None。"""
     out: list[tuple[str, list[str], str] | None] = [None] * n
     for line in (text or "").splitlines():
         m = _CALC_RE.match(line)
@@ -531,7 +489,7 @@ def parse_calculations(text: str, n: int) -> list[tuple[str, list[str], str] | N
 
 
 def parse_verdicts(text: str, n: int) -> list[str | None]:
-    """One three-way verdict per claim; a missing or malformed line is `None` (unmeasured)."""
+    """解析每条 Claim 的三分类判定；缺失或格式错误为 None，表示未测量。"""
     out: list[str | None] = [None] * n
     for line in (text or "").splitlines():
         m = _VERDICT_RE.match(line)
@@ -550,7 +508,7 @@ def parse_pairs(text: str, n: int) -> list[bool | None]:
 
 
 def _json_array(text: str):
-    """The JSON array in a model reply, tolerating a fenced block around it."""
+    """提取模型回复中的 JSON 数组，兼容外层代码围栏。"""
     body = (text or "").strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", body, re.S)
     if fence:
@@ -561,18 +519,16 @@ def _json_array(text: str):
     return json.loads(body[start : body.rfind("]") + 1])
 
 
-# ── Validation ────────────────────────────────────────────────────────────────────
+# ── 依据核验 ──
 
 BATCH = 4
 
 
 @dataclass
 class Evidence:
-    """What a citation number resolves to: its snippets, and whether it may be cited.
+    """引用编号对应的片段及是否允许引用。
 
-    `admissible` is False for a source outside the frozen selection, or one with no
-    retrieved evidence behind it — a marker pointing at either cites nothing.
-    """
+    来源不在冻结选择内或没有实际检索证据时 admissible 为 False，该标记不构成有效引用。"""
 
     snippets: list[str]
     admissible: bool
@@ -600,13 +556,12 @@ async def validate(
     admissible: Callable[[str], bool],
     budget: Budget,
 ) -> Validation:
-    """Parse, decompose and verify every claim in `draft`. Never raises for a model failure:
-    each failure becomes an unmeasured cause on the claims it left undecided."""
+    """解析、拆解并核验草稿每条 Claim。模型故障转成对应 Claim 的未测量原因，不直接抛出。"""
     units, unparsed = parse_units(draft)
     result = Validation(units=units, claims=[], unparsed_lines=unparsed)
     evidence = evidence_by_index(sources, admissible)
 
-    # Which sentences need decomposing, and under which rule.
+    # 确定哪些句子需要拆解，以及各自适用的规则。
     todo: list[tuple[Unit, str]] = []
     for unit in units:
         if unit.kind == HEADING and not heading_is_claim(unit.text):
@@ -642,12 +597,10 @@ async def validate(
 
 
 def _estimate(sentences: int) -> float:
-    """A pre-flight estimate of validation's cost: calls × observed tokens × the price.
+    """调用前估算核验费用：调用数乘观察到的 Token 数和单价。
 
-    One decomposition call per sentence, and per four claims one verification and one
-    relevance call — taken at roughly one claim per sentence. 0.0 when the route is
-    unpriced, which the caller reports as unknown rather than as free.
-    """
+    每句一次拆解，每四条 Claim 一次核验和一次相关性检查，粗略按每句一条 Claim 估计。
+    路由无价格时返回 0.0，但调用方必须显示未知，不能显示免费。"""
     from research_engine import catalog
     from research_engine.llm_factory import model_name_for
 
@@ -671,7 +624,7 @@ async def _decompose(todo: list[tuple[Unit, str]], result: Validation, budget: B
             )
         except ValueError, json.JSONDecodeError:
             cause = "malformed_response"
-        except Exception as exc:  # noqa: BLE001 — every failure becomes a named cause
+        except Exception as exc:  # noqa: BLE001 — 每类故障转成明确原因
             cause = unmeasured_cause(exc)
         by_sentence: dict[int, list] = {}
         if parsed is not None:
@@ -704,7 +657,7 @@ def _undecided(unit: Unit, sentence: str, cause: str) -> Claim:
 
 
 def _check_citations(pending: list[Claim], evidence: dict[int, Evidence]) -> None:
-    """Structural citation validation, before any model is asked anything (§9.3)."""
+    """在模型调用前完成引用结构检查，见 §9.3。"""
     for claim in pending:
         for n in claim.cites:
             ev = evidence.get(n)
@@ -728,7 +681,7 @@ def _check_quantities(pending: list[Claim], evidence: dict[int, Evidence]) -> No
         if claim.state != UNMEASURED or claim.cause is not None:
             continue
         snippets = _snippets(claim, evidence)
-        # Citation markers are not quantities the claim states: `[1]` is not the number 1.
+        # 引用标记不是断言数字，[1] 不代表 Claim 陈述数值 1。
         missing = quantities.unsupported(_MARKER_RE.sub(" ", claim.text), snippets)
         calc = claim.calculation
         if (
@@ -741,18 +694,16 @@ def _check_quantities(pending: list[Claim], evidence: dict[int, Evidence]) -> No
                 snippets,
             )
         ):
-            # The stated result is accounted for by a recomputed calculation, and its
-            # operands were checked inside it; only the result itself may be absent.
+            # 计算操作数已在片段中核对，只有代码复算得到的结果允许不直接出现在片段中。
             result_values = {str(v) for v in [calc.get("result")]}
             missing = [m for m in missing if not any(m in r or r in m for r in result_values)]
-        # Not rejected yet: a figure computed from the snippets' figures is not in them as
-        # written. The verifier, which sees the snippets, may propose the calculation, and
-        # `_verify` accepts it only once the code has redone it.
+        # 暂不拒绝片段中未逐字出现的数字；核验器可提出基于片段数值的计算，
+        # 但只有 _verify 重新计算确认后才接受。
         claim.missing = missing
 
 
 def _as_written(claim: Claim) -> str:
-    """The report's own words for a claim, markers removed: what the claim was taken from."""
+    """取 Claim 来源的报告原文，并移除引用标记。"""
     words = claim.sentence[claim.span[0] : claim.span[1]]
     return " ".join(_MARKER_RE.sub(" ", words).split())
 
@@ -770,9 +721,7 @@ def _verify_human(i: int, claim: Claim, evidence: dict[int, Evidence]) -> str:
 
 
 def _account_for_figures(claim: Claim, calc, evidence: dict[int, Evidence]) -> bool:
-    """Whether a proposed calculation accounts for every figure the snippets lack: its
-    operands are in the snippets, the code's own arithmetic gives its result, and that
-    result is the claim's figure. The model proposes; nothing it says is taken as done."""
+    """检查计算能否解释片段缺失的每个数值：操作数必须有据，代码复算正确，结果与 Claim 一致。"""
     if calc is None:
         return False
     op, operands, outcome = calc
@@ -822,11 +771,9 @@ async def _verify(
 async def _relevance(
     claims_: list[Claim], evidence: dict[int, Evidence], result: Validation, budget: Budget
 ) -> None:
-    """Each citation of a supported claim, judged alone: does it support any part of it?
+    """单独核验已支持 Claim 的每个引用是否至少支持部分内容。
 
-    A citation that supports nothing is removed from the claim and counted, even when the
-    others carry it (§9.3). A relevant document that does not state the claim is caught here.
-    """
+    无关引用必须移除并计数，即使其他引用足够支持整条 Claim，见 §9.3。"""
     pairs = [(c, n) for c in claims_ if c.state == SUPPORTED for n in c.valid_cites]
     for start in range(0, len(pairs), BATCH):
         batch = pairs[start : start + BATCH]
@@ -851,8 +798,7 @@ async def _relevance(
                 c.non_supporting_cites.append(n)
     for c in claims_:
         if c.state == SUPPORTED and set(c.non_supporting_cites) >= set(c.valid_cites):
-            # Every citation it named supports nothing on its own: the verdict that combined
-            # them cannot stand on citations each of which is irrelevant.
+            # 全部引用单独看都无关，不能保留此前组合起来的支持判定。
             c.state, c.cause = NOT_SUPPORTED, "not_supported"
 
 
@@ -863,7 +809,7 @@ async def _verify_inference(
     result: Validation,
     budget: Budget,
 ) -> None:
-    """A conclusion claim is checked against the supported findings, not only snippets."""
+    """结论 Claim 同时对照已支持的研究发现核验，不仅对照片段。"""
     if not conclusions:
         return
     findings = "\n".join(f"- {c.text}" for c in supported) or "- (no supported findings)"

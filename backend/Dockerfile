@@ -39,7 +39,7 @@ COPY --chown=appuser:appuser . /app
 # and the api/worker processes run as appuser (never root), so an upload's first write
 # would fail with EACCES. Owning it here, before USER switches away from root, is what
 # makes the volume inherit appuser instead.
-RUN mkdir -p /app/data/corpus && chown -R appuser:appuser /app/data
+RUN mkdir -p /app/data/corpus /app/evaluation-jobs && chown -R appuser:appuser /app/data /app/evaluation-jobs
 USER appuser
 # Which build identity this image reports (`/api/v1/version`). The COPY above carries any
 # `research_engine/_build.py` in the context — a fresh stamp from `release.yml`, or a stale

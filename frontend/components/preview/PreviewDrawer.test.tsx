@@ -42,7 +42,7 @@ describe("PreviewDrawer keyboard contract", () => {
   it("labels itself as a modal dialog naming the document", () => {
     renderDrawer();
     expect(
-      screen.getByRole("dialog", { name: "Preview of notes.txt" }),
+      screen.getByRole("dialog", { name: "预览：notes.txt" }),
     ).toHaveAttribute("aria-modal", "true");
   });
 
@@ -57,7 +57,7 @@ describe("PreviewDrawer keyboard contract", () => {
     renderDrawer();
 
     // Tab from the last control must cycle to the first, not reach "outside after".
-    const close = screen.getByRole("button", { name: "Close" });
+    const close = screen.getByRole("button", { name: "关闭" });
     close.focus();
     await user.tab();
 
@@ -65,7 +65,7 @@ describe("PreviewDrawer keyboard contract", () => {
       screen.getByRole("button", { name: "outside after" }),
     );
     expect(
-      screen.getByRole("dialog", { name: "Preview of notes.txt" }).contains(document.activeElement),
+      screen.getByRole("dialog", { name: "预览：notes.txt" }).contains(document.activeElement),
     ).toBe(true);
   });
 });
@@ -83,7 +83,7 @@ describe("PreviewDrawer download", () => {
     renderDrawer();
     fetchMock.mockClear();
 
-    const link = screen.getByRole("link", { name: "Download" });
+    const link = screen.getByRole("link", { name: "下载" });
     expect(link).toHaveAttribute("href", "/api/v1/projects/p/corpus/documents/1/download"); // still a link: middle-click, copy link
     await userEvent.click(link);
 

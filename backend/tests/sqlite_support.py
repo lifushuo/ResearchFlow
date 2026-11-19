@@ -108,6 +108,8 @@ async def open_db(path):
 
     @event.listens_for(engine.sync_engine, "connect")
     def _fk(dbapi_conn, _):
+        # 与桌面真实连接策略一致，允许事件写入与 API 轮询并存；否则测试驱动会制造读写互锁。
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     tables = [t for t in Base.metadata.sorted_tables if t.name not in POSTGRES_ONLY_TABLES]

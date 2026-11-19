@@ -78,9 +78,10 @@ def test_the_fingerprint_changes_when_the_data_changes(tmp_path, monkeypatch):
     staged = tmp_path / "retrieval"
     staged.mkdir()
     (staged / "corpus").mkdir()
-    for name, text in _corpus().items():
-        (staged / "corpus" / name).write_text(text)
-    (staged / "queries.json").write_text((DATASET / "queries.json").read_text())
+    # The fingerprint measures bytes: text copying would normalize Windows CRLF.
+    for name in _corpus():
+        (staged / "corpus" / name).write_bytes((DATASET / "corpus" / name).read_bytes())
+    (staged / "queries.json").write_bytes((DATASET / "queries.json").read_bytes())
     monkeypatch.setattr(retrieval, "DATASET_DIR", staged)
     assert retrieval.dataset_fingerprint() == before
 

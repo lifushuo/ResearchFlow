@@ -6,11 +6,7 @@ import type { AgentRole, ModelCatalog } from "@/lib/types";
 
 import { ModelPicker } from "./ModelPicker";
 
-/**
- * Settings → Models answers one question — which model each role uses. Agent instructions
- * live on Settings → Agents; this pins that the picker still offers its model selectors and
- * carries nothing of the instruction editor.
- */
+/** 模型设置只负责各角色使用哪个模型，智能体指令在独立页面管理。测试保证选择器仍提供五个角色的模型选择，同时不包含指令编辑器。 */
 
 const ROLES: AgentRole[] = ["planner", "executor", "critic", "synthesizer", "chat"];
 const ROUTING = Object.fromEntries(ROLES.map((r) => [r, "google:gemini"])) as Record<
@@ -56,21 +52,21 @@ vi.mock("@/hooks/queries", () => ({
   useMe,
 }));
 
-describe("Settings → Models", () => {
+describe("设置 → 模型", () => {
   it("still offers a model selector for each of the five roles", async () => {
     render(<ModelPicker />);
-    await userEvent.click(screen.getByRole("button", { name: "Customize" }));
-    for (const label of ["Planner", "Executor", "Critic", "Synthesizer", "Follow-up chat"]) {
-      expect(screen.getByRole("combobox", { name: `Model for ${label}` })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "自定义" }));
+    for (const label of ["规划器", "执行器", "评审器", "综合器", "追问对话"]) {
+      expect(screen.getByRole("combobox", { name: `${label}的模型` })).toBeInTheDocument();
     }
   });
 
   it("renders no agent instruction editor, mark or statement", async () => {
     const { container } = render(<ModelPicker />);
-    await userEvent.click(screen.getByRole("button", { name: "Customize" }));
+    await userEvent.click(screen.getByRole("button", { name: "自定义" }));
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /instructions/i })).not.toBeInTheDocument();
-    expect(container.textContent).not.toMatch(/custom instructions|verification bundle/i);
+    expect(screen.queryByRole("button", { name: /指令/ })).not.toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/自定义指令|验证包/);
   });
 
   it("does not load agent instructions at all", () => {

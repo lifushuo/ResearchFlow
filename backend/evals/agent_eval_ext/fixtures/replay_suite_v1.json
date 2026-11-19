@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "cases": [
+    "replay_healthy.json",
+    "replay_planner_invalid.json",
+    "replay_planner_429.json",
+    "replay_planner_522.json"
+  ]
+}

@@ -1,15 +1,8 @@
-"""
-Agent tools — each with one responsibility (docs/architecture/04-agent-architecture.md §4).
+"""各司其职的代理工具，见 docs/architecture/04-agent-architecture.md §4。
 
-web_search   → retriever chain (Tavily → Brave → DuckDuckGo), Redis-cached
-read_webpage → SSRF-guarded fetch + main-text extraction
-calculate    → AST-restricted arithmetic
-
-In corpus mode (internal/12 M10) the fetch half of that contract changes: `read_webpage`
-resolves `corpus://` locations from the installed corpus and refuses every other URL,
-so neither tool reaches the network. The agents' model calls are not tools and are not
-restricted by corpus mode.
-"""
+web_search 走缓存检索链，read_webpage 做 SSRF 校验与正文提取，calculate 做受限 AST 运算。
+仅资料库模式下，读取只解析已安装资料库的 corpus:// 位置并拒绝其他 URL。
+这限制工具检索，不限制代理模型路由。"""
 
 from __future__ import annotations
 
@@ -31,9 +24,8 @@ MAX_PAGE_CHARS = 8000
 MAX_BODY_BYTES = 2 * 1024 * 1024
 _MAX_REDIRECTS = 3
 
-#: Search engines' *results pages*: (registrable domain, results paths). An empty paths tuple
-#: means "any path carrying a query" — DuckDuckGo and Qwant answer searches at their root.
-#: The domain matches itself and any subdomain; `google` and `yandex` match any country TLD.
+#: 搜索结果页的域名与路径清单；空路径列表表示任意携带查询的路径。
+#: 匹配域名及子域，google、yandex 允许各国顶级域。
 _SEARCH_RESULTS_PAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("google", ("/search", "/scholar")),
     ("yandex", ("/search",)),
@@ -56,13 +48,10 @@ SEARCH_RESULTS_PAGE_REFUSAL = (
 
 
 def is_search_results_page(url: str) -> bool:
-    """Whether `url` asks a web search engine for results rather than naming a source.
+    """判断地址是否指向搜索结果页而非可引用来源。
 
-    One home for the rule. An executor model that never calls `web_search` opens these with
-    `read_webpage` instead — one real run made 64 such fetches and got Google's JavaScript
-    wall, Yahoo's 500, Ecosia's 403 and Mojeek's captcha — so `read_webpage` refuses them
-    with directions rather than fetching a page that is almost never quotable.
-    """
+    模型绕过 web_search 时曾大量抓取验证码或脚本墙。read_webpage 应拒绝并提示使用搜索工具，
+    不能浪费抓取预算返回几乎无法引用的结果页。"""
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     path = parts.path.rstrip("/")
@@ -82,6 +71,8 @@ def is_search_results_page(url: str) -> bool:
     return False
 
 
+# 搜索入口：返回标题、URL 和摘要，必要时按供应商回退。
+# 下方英文文档字符串会作为工具指令发送给模型，保留原文以免改变模型行为。
 @tool
 async def web_search(query: str, max_results: int | None = None) -> list[dict]:
     """Search the web and return results as a list of {title, url, snippet}.
@@ -90,19 +81,19 @@ async def web_search(query: str, max_results: int | None = None) -> list[dict]:
     search: a search engine's results page opened with read_webpage is refused. Include
     date ranges in the query when the topic is time-sensitive.
     """
-    # The agent may specify a count; omitting it falls back to the configured
-    # `retrieval_k` (internal/07 Phase 3) rather than a value baked into the schema —
-    # the default here used to be the literal 5 this config's own default mirrors.
+    # 模型可指定结果数；省略时用 retrieval_k，而不是在工具数据结构里固定写死，见 internal/07 Phase 3。
     k = max_results if max_results is not None else get_run_config().retrieval_k
     try:
         return await search(query, max_results=k)
-    except Exception as e:  # noqa: BLE001 — surface a usable message to the agent
+    except Exception as e:  # noqa: BLE001 — 将可用错误提示返回给代理
         return [{"title": "Search unavailable", "url": "", "snippet": str(e)}]
 
 
 CORPUS_READ_REFUSAL = "blocked: corpus documents can be read only by corpus-only research"
 
 
+# 读取具体来源正文；拒绝搜索结果页和不安全网络地址，资料库模式只接受 corpus://。
+# 下方英文文档字符串供模型选择工具使用，不是普通开发注释。
 @tool
 async def read_webpage(url: str) -> dict:
     """Fetch one specific source page and return {url, title, text, error}.
@@ -113,23 +104,17 @@ async def read_webpage(url: str) -> dict:
     Not for PDFs/videos. In corpus-only mode, only corpus:// locations can be read.
     """
     if url.startswith("corpus://"):
-        # A corpus location is a file offset, not a fetch. Resolved before the
-        # fake-mode shortcut so scripted runs exercise the real store too.
+        # 资料库位置表示文件偏移，不是网络抓取；在 fake 分支前解析，让脚本也走真实存储。
         if not get_run_config().corpus_mode:
-            # Only a corpus-only run may read the corpus. A web run that reaches a corpus
-            # URL — model-invented, or quoted inside a fetched page — must not turn it
-            # into evidence. This is the desktop's exposure in particular: it used to
-            # install its app-wide store for every run, not only corpus runs.
+            # 只有资料库模式可读 corpus://；网页运行即使得到模型编造或页面注入的资料库 URL 也不能读取。
             return {"url": url, "title": "", "text": "", "error": CORPUS_READ_REFUSAL}
         try:
             return await get_corpus().read(url)
-        except Exception as e:  # noqa: BLE001 — surface a usable message to the agent
+        except Exception as e:  # noqa: BLE001 — 将可用错误提示返回给代理
             return {"url": url, "title": "", "text": "", "error": str(e)}
 
     if get_run_config().corpus_mode:
-        # Fail closed: an airgapped run must not fetch anything, however plausible the
-        # URL. Returning an error dict (not raising) keeps the executor able to finish
-        # its task with corpus evidence instead of looping on a dead tool.
+        # 仅资料库模式不能抓取任何网页；返回错误字典让执行器改用资料库证据，避免直接抛错阻断任务。
         return {
             "url": url,
             "title": "",
@@ -138,9 +123,8 @@ async def read_webpage(url: str) -> dict:
         }
 
     if is_search_results_page(url):
-        # Before the fake-mode shortcut too: the rule is about which tool searches, not about
-        # what a fetch would return, so scripted runs must see the same refusal real ones do.
-        # An error with empty text, so nothing in it can be quoted as evidence.
+        # 搜索结果页拒绝规则也先于 fake；规则与实际抓取内容无关。
+        # 错误返回空正文，避免错误提示被拿来当证据。
         return {"url": url, "title": "", "text": "", "error": SEARCH_RESULTS_PAGE_REFUSAL}
 
     cfg = get_run_config()
@@ -157,7 +141,7 @@ async def read_webpage(url: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=False) as client:
             for _ in range(_MAX_REDIRECTS + 1):
-                validate_url(current)  # re-validate every hop (docs/06 §3)
+                validate_url(current)  # 每次重定向都重新校验，见 docs/06 §3。
                 resp = await client.get(
                     current, headers={"User-Agent": "ResearchBot/1.0 (+research-assistant)"}
                 )
@@ -206,6 +190,7 @@ _SAFE_OPERATORS: dict[type, Any] = {
 }
 
 
+# 仅计算允许的算术语法，不执行任意 Python 代码；英文说明保留给模型读取。
 @tool
 def calculate(expression: str) -> float:
     """Safely evaluate an arithmetic expression (+, -, *, /, **, parentheses)."""

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "case_id": "planner-invalid-schema",
+  "query": "Research long-term memory approaches in LLM agents.",
+  "depth": "fast",
+  "fault": {"kind": "planner_invalid_schema"},
+  "expected": {
+    "status": "failed",
+    "planner_calls": 2,
+    "error_contains": "could not produce a valid task list"
+  }
+}

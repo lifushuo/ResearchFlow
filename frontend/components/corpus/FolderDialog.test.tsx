@@ -50,21 +50,21 @@ beforeEach(() => {
 describe("FolderDialog", () => {
   it("says what a delete removes before sending it, and starts on Cancel", () => {
     open("delete");
-    const dialog = screen.getByRole("alertdialog", { name: "Delete “Thesis”?" });
+    const dialog = screen.getByRole("alertdialog", { name: "确定删除“Thesis”吗？" });
     // k1 is filed only beneath Thesis; k2 is also in Notes, so it stays.
-    expect(dialog).toHaveTextContent("This folder and its 1 subfolder will be removed.");
-    expect(dialog).toHaveTextContent("1 file filed only here will be deleted, with every version.");
-    expect(dialog).toHaveTextContent("Files also in another folder stay there.");
-    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    expect(dialog).toHaveTextContent("将删除此文件夹及其 1 个子文件夹。");
+    expect(dialog).toHaveTextContent("仅存放于此处的 1 份文档及其所有版本也将删除。");
+    expect(dialog).toHaveTextContent("同时归属其他文件夹的文档会保留。");
+    expect(screen.getByRole("button", { name: "取消" })).toHaveFocus();
     expect(remove).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete folder" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除文件夹" }));
     expect(remove).toHaveBeenCalledWith({ projectId: "p1", folderId: "f-thesis" }, expect.anything());
   });
 
   it("says when a delete removes no files", () => {
     open("delete", "f-notes");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("No files will be deleted.");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("不会删除任何文档。");
   });
 
   it("closes on Escape without sending anything", () => {
@@ -76,15 +76,15 @@ describe("FolderDialog", () => {
 
   it("renames to the trimmed name, and sends nothing for an unchanged one", () => {
     const onClose = open("rename");
-    const field = screen.getByLabelText("New name");
+    const field = screen.getByLabelText("新名称");
     expect(field).toHaveFocus();
     fireEvent.change(field, { target: { value: "  Thesis  " } });
-    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.click(screen.getByRole("button", { name: "重命名" }));
     expect(update).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
 
     fireEvent.change(field, { target: { value: " Dissertation " } });
-    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.click(screen.getByRole("button", { name: "重命名" }));
     expect(update).toHaveBeenCalledWith(
       { projectId: "p1", folderId: "f-thesis", name: "Dissertation" },
       expect.anything(),
@@ -94,9 +94,9 @@ describe("FolderDialog", () => {
   it("moves anywhere but into itself or beneath itself", () => {
     open("move");
     const options = screen.getAllByRole("option").map((o) => o.textContent);
-    expect(options).toEqual(["Top level", "Notes"]);
-    fireEvent.change(screen.getByLabelText("Move into"), { target: { value: "f-notes" } });
-    fireEvent.click(screen.getByRole("button", { name: "Move" }));
+    expect(options).toEqual(["顶层目录", "Notes"]);
+    fireEvent.change(screen.getByLabelText("移动到"), { target: { value: "f-notes" } });
+    fireEvent.click(screen.getByRole("button", { name: "移动" }));
     expect(update).toHaveBeenCalledWith(
       { projectId: "p1", folderId: "f-thesis", parentId: "f-notes" },
       expect.anything(),

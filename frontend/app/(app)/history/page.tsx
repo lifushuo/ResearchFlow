@@ -71,60 +71,60 @@ export default function HistoryPage() {
             id="history-heading"
             className="font-serif text-2xl font-bold tracking-tight text-text-primary"
           >
-            {showArchived ? "Archived history" : "History"}
+            {showArchived ? "已归档的研究" : "历史记录"}
           </h1>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-text-muted">
             {showArchived
-              ? "Archived research runs. You can restore them to active history or delete them permanently."
-              : "Every research run, with the decision it is waiting on and whether it produced a verifiable artifact."}
+              ? "已归档的研究任务。可以恢复到历史记录，也可以永久删除。"
+              : "查看每项研究的进度、待审批事项，以及是否已生成可验证的成果。"}
           </p>
         </div>
 
         <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
           <label className="flex flex-col gap-1">
             <span className="font-mono text-[length:var(--text-micro)] uppercase tracking-wider text-text-muted">
-              Search questions
+              搜索研究问题
             </span>
             <input
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Filter by wording…"
+              placeholder="输入问题关键词…"
               className="input-base h-8 w-56 py-1 text-xs"
             />
           </label>
 
           <label className="flex flex-col gap-1">
             <span className="font-mono text-[length:var(--text-micro)] uppercase tracking-wider text-text-muted">
-              Scope
+              项目范围
             </span>
             <select
               value={scope}
               onChange={(e) => setScope(e.target.value as Scope)}
               className="input-base h-8 w-44 py-1 text-xs"
             >
-              <option value="project">{active ? active.name : "This project"}</option>
-              <option value="all">All projects</option>
+              <option value="project">{active ? active.name : "当前项目"}</option>
+              <option value="all">全部项目</option>
             </select>
           </label>
 
           <label className="flex flex-col gap-1">
             <span className="font-mono text-[length:var(--text-micro)] uppercase tracking-wider text-text-muted">
-              Artifact
+              研究成果
             </span>
             <select
               value={verified}
               onChange={(e) => setVerified(e.target.value as Verified)}
               className="input-base h-8 w-44 py-1 text-xs"
             >
-              <option value="any">Any</option>
-              <option value="artifact">Has a verified artifact</option>
-              <option value="none">No artifact yet</option>
+              <option value="any">不限</option>
+              <option value="artifact">已有可验证成果</option>
+              <option value="none">暂无成果</option>
             </select>
           </label>
 
           {present.length > 1 && (
-            <div className="flex flex-wrap gap-1" role="group" aria-label="Filter by status">
+            <div className="flex flex-wrap gap-1" role="group" aria-label="按状态筛选">
               <button
                 type="button"
                 aria-pressed={status === "ALL"}
@@ -135,7 +135,7 @@ export default function HistoryPage() {
                     : "border-border bg-bg-surface text-text-muted hover:text-text-primary"
                 }`}
               >
-                All
+                全部
               </button>
               {present.map((s) => (
                 <button
@@ -165,7 +165,7 @@ export default function HistoryPage() {
                 : "border-border bg-bg-surface text-text-muted hover:text-text-primary"
             }`}
           >
-            {showArchived ? "← Active History" : "Archived"}
+            {showArchived ? "← 返回历史记录" : "已归档"}
           </button>
         </div>
 
@@ -174,33 +174,33 @@ export default function HistoryPage() {
             {[0, 1, 2, 3].map((i) => (
               <div key={i} className="card h-28 animate-pulse" aria-hidden />
             ))}
-            <span className="sr-only">Loading your research history…</span>
+            <span className="sr-only">正在加载研究历史…</span>
           </div>
         ) : isError ? (
           <EmptyState
-            title="Couldn't load your history"
-            description="The request failed. Nothing has been lost — this page could not read it."
+            title="无法加载历史记录"
+            description="请求失败，当前页面无法读取记录，请重试。"
             action={
               <button type="button" onClick={() => refetch()} className="btn btn-secondary">
-                Try again
+                重试
               </button>
             }
           />
         ) : (runs ?? []).length === 0 ? (
           <EmptyState
-            title={showArchived ? "Nothing archived" : "No research yet"}
+            title={showArchived ? "暂无归档记录" : "尚无研究记录"}
             description={
               showArchived
-                ? "Archiving moves a research run out of History without deleting it."
+                ? "归档会将研究任务移出历史列表，但不会删除它。"
                 : scope === "project"
-                  ? "Nothing has been researched in this project. Start a question and it will be recorded here."
-                  : "Nothing has been researched in any of your projects yet."
+                  ? "当前项目尚无研究任务。发起研究后，记录会显示在这里。"
+                  : "所有项目中暂时都没有研究记录。"
             }
           />
         ) : visible.length === 0 ? (
           <EmptyState
-            title="Nothing matches these filters"
-            description={`${runs!.length} run${runs!.length === 1 ? "" : "s"} are hidden by the current filters.`}
+            title="没有符合筛选条件的记录"
+            description={`当前筛选条件隐藏了 ${runs!.length} 项研究任务。`}
             action={
               <button
                 type="button"
@@ -211,7 +211,7 @@ export default function HistoryPage() {
                 }}
                 className="btn btn-secondary"
               >
-                Clear filters
+                清除筛选
               </button>
             }
           />
@@ -219,8 +219,8 @@ export default function HistoryPage() {
           <>
             <p className="font-mono text-xs text-text-muted" aria-live="polite">
               {filtering
-                ? `${visible.length} of ${runs!.length} runs`
-                : `${visible.length} run${visible.length === 1 ? "" : "s"}`}
+                ? `显示 ${visible.length} 项，共 ${runs!.length} 项研究任务`
+                : `共 ${visible.length} 项研究任务`}
             </p>
             <ul className="grid gap-3 sm:grid-cols-2">
               {visible.map((r) => (

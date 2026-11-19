@@ -1,11 +1,6 @@
-"""
-Token service: short-lived access JWTs + opaque rotating refresh tokens
-(docs/architecture/06-security.md §1, docs/05 §1 refresh_tokens).
+"""短期访问 JWT 与不透明刷新令牌服务（docs/06 §1，docs/05 §1）。
 
-Access tokens are stateless HS256 JWTs (15 min). Refresh tokens are 256-bit opaque
-strings stored server-side as sha256 with a jti; every use rotates them and reuse of
-a rotated token revokes the family. Cookies are httpOnly, SameSite=Lax, Secure in prod.
-"""
+访问令牌为 15 分钟 HS256 JWT；刷新令牌是 256 位随机串，服务端只存 SHA-256 与 jti，每次使用轮换，旧令牌复用会吊销整族。Cookie 为 httpOnly、SameSite=Lax，生产启用 Secure。"""
 
 from __future__ import annotations
 
@@ -34,7 +29,7 @@ def create_access_token(user_id: UUID) -> str:
 
 
 def decode_access_token(token: str) -> UUID:
-    """Return the user id, or raise jwt exceptions / ValueError on invalid tokens."""
+    """返回用户 ID；令牌无效时抛 JWT 异常或 ValueError。"""
     payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
     if payload.get("type") != "access":
         raise ValueError("not an access token")
@@ -54,7 +49,7 @@ def refresh_expiry() -> datetime:
 
 
 def cookie_kwargs(max_age: int, *, path: str) -> dict:
-    """Shared Set-Cookie attributes for httpOnly auth cookies."""
+    """认证 Cookie 共用的 Set-Cookie 属性。"""
     return {
         "httponly": True,
         "secure": settings.is_production,

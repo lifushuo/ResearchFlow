@@ -1,10 +1,6 @@
-"""
-Auth endpoints (docs/05 §3, docs/06 §1–§2).
+"""登录、注册与会话认证接口（docs/05 §3，docs/06 §1—§2）。
 
-Cookie-based sessions: login sets httpOnly access + refresh cookies; refresh rotates
-them; logout revokes the refresh token. Register is neutral (no account enumeration)
-and rate-limited; login has per-IP and per-account limits.
-"""
+登录设置 httpOnly 访问和刷新 Cookie；刷新时轮换令牌，退出时吊销刷新令牌。注册使用中性提示防止枚举账号；登录同时限制 IP 与账号失败次数。"""
 
 from __future__ import annotations
 
@@ -78,14 +74,13 @@ async def register(
             User(
                 email=payload.email,
                 hashed_pw=hashed,
-                # Public deployments set this so one account can't drain a shared
-                # server key; 0 (the default) means unlimited.
+                # 公开部署可限制月度用量，避免单个账号耗尽共用密钥额度；默认 0 表示不限。
                 monthly_token_limit=settings.default_monthly_token_limit,
             )
         )
         await db.commit()
         logger.info("user_registered", email=payload.email)
-    # Neutral response either way (no enumeration, docs/06 §1).
+    # 无论账号是否存在都返回相同提示，防止枚举（docs/06 §1）。
     return {"message": "If this email is available, the account has been created. Please log in."}
 
 
@@ -99,9 +94,8 @@ async def login(
 ):
     ip = get_client_ip(request)
     ip_rl = await rate_limit.check(redis, rate_limit.key_login_ip(ip), rate_limit.LOGIN_IP)
-    # The account limit counts failures only (docs/06 §4), so it is read here and raised
-    # below. Counting every attempt locked out a person who simply signed in correctly a
-    # sixth time in fifteen minutes; five failures still lock even the right password.
+    # 账号限流只累计失败次数，因此先读取限额，再在下面记录失败。
+    # 不能把成功登录也计为失败，否则频繁正常登录的用户也会被锁定（docs/06 §4）。
     email_key = rate_limit.key_login_email(payload.email)
     email_rl = await rate_limit.peek(redis, email_key, rate_limit.LOGIN_EMAIL)
     if not ip_rl.allowed or not email_rl.allowed:
@@ -112,8 +106,7 @@ async def login(
 
     user = (await db.execute(select(User).where(User.email == payload.email))).scalar_one_or_none()
     if not user or not verify_password(payload.password, user.hashed_pw):
-        # An unknown address counts exactly as a wrong password does, or the lock itself
-        # would reveal which addresses have accounts.
+        # 不存在的邮箱与密码错误同样计数，避免通过锁定行为判断账号是否存在。
         await rate_limit.check(redis, email_key, rate_limit.LOGIN_EMAIL)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
     if not user.is_active:
@@ -136,7 +129,7 @@ async def refresh(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="No refresh token.")
     rotated = await auth_service.rotate_refresh_token(db, raw)
     if rotated is None:
-        await db.commit()  # persist any family revocation
+        await db.commit()  # 提交同一刷新令牌家族的吊销记录。
         response.delete_cookie(tokens.ACCESS_COOKIE, path="/")
         response.delete_cookie(tokens.REFRESH_COOKIE, path="/api/v1/auth")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token.")
@@ -173,21 +166,18 @@ async def update_me(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Update editable profile fields. Only provided fields change."""
+    """更新允许编辑的用户资料；只修改请求明确提供的字段。"""
     fields = payload.model_dump(exclude_unset=True)
     for field in ("display_name", "avatar_url", "monthly_token_limit"):
         if field in fields:
             value = fields[field]
-            # Treat "" as clearing an optional text field.
+            # 空字符串表示清空可选文本字段。
             if field in ("display_name", "avatar_url") and value == "":
                 value = None
             setattr(current_user, field, value)
     if payload.preferences is not None:
-        # Merged, never replaced (internal/07 Phase 3): a request from one settings
-        # section only carries that section's fields, and a naive overwrite would
-        # blank every preference set from any other section. `prompt_overrides` needs a
-        # second level of that — one function, shared with the desktop, rather than the
-        # rule restated per host.
+        # 按字段合并偏好，不能整份替换，否则一个设置分区会清空另一个分区的配置。
+        # prompt_overrides 还需再合并一层；与桌面共用函数，避免重复规则（internal/07 Phase 3）。
         current_user.preferences = merge_preferences(
             current_user.preferences, payload.preferences.model_dump(exclude_unset=True)
         )
@@ -206,16 +196,10 @@ async def change_password(
     current_user: User = Depends(get_current_user),
     redis=Depends(get_redis),
 ):
-    """Change the account password.
+    """修改账号密码。
 
-    Requires the current password (a stolen session cookie alone must not be
-    enough to lock the owner out), applies the same strength policy as
-    registration, and revokes every refresh token for the account so other
-    devices are signed out. The caller keeps working: we immediately issue a
-    fresh token pair on this response.
-    """
-    # Reuse the login limiter: this endpoint verifies a password, so it is a
-    # brute-force target in exactly the same way.
+    必须验证旧密码，防止仅持有被盗 Cookie 就能改密码；新密码遵守注册时的强度规则。吊销全部刷新令牌使其他设备退出，同时向当前设备签发新令牌对。"""
+    # 此接口也验证密码，属于暴力尝试目标，因此复用登录限流。
     ip = get_client_ip(request)
     limited = await rate_limit.check(redis, rate_limit.key_login_ip(ip), rate_limit.LOGIN_IP)
     if not limited.allowed:
@@ -237,7 +221,7 @@ async def change_password(
     except WeakPassword as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
-    # Sign out every other device, then re-issue for this one.
+    # 先退出所有设备，再为当前设备签发新令牌。
     await auth_service.revoke_all_for_user(db, current_user.id)
     await _issue_session(response, db, current_user)
     await db.commit()
@@ -251,11 +235,9 @@ async def set_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Store a user-supplied provider key (BYOK).
+    """保存用户自带供应商密钥。
 
-    The key is encrypted at rest and never returned by any endpoint — the
-    response carries only the provider and a display hint (docs/06 §1).
-    """
+    密钥加密存储，接口不返回原值，只返回供应商和显示提示（docs/06 §1）。"""
     if payload.provider == "custom" and payload.api_base_url and settings.is_production:
         try:
             validate_url(str(payload.api_base_url))
@@ -269,12 +251,10 @@ async def set_api_key(
     current_user.api_key_set_at = datetime.now(UTC)
     await db.commit()
     await db.refresh(current_user)
-    # Log the event, never the key or its hint.
+    # 只记录操作事件，不记录密钥及其显示提示。
     logger.info("api_key_set", user_id=str(current_user.id), provider=payload.provider)
 
-    # Saving *is* testing (internal/07 Phase 2a) — probed after the commit, so the
-    # verdict describes the key that is now actually stored, and a probe failure never
-    # blocks the save itself (the key is good to have on file even if the check flakes).
+    # 提交保存后再探测连接，使检查对应实际已存储密钥；探测故障不影响保存本身（internal/07 Phase 2a）。
     verdict = await provider_health.probe(
         payload.provider,
         payload.api_key,
@@ -295,7 +275,7 @@ async def delete_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Remove the stored BYOK key; the deployment's server key applies again."""
+    """删除用户自带密钥，后续回退部署密钥。"""
     current_user.api_key_encrypted = None
     current_user.api_key_provider = None
     current_user.api_key_base_url = None
@@ -314,13 +294,9 @@ async def rename_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Give the active BYOK connection a display name ("OmniRoute", "Work vLLM").
+    """给当前自定义连接设置显示名称。
 
-    Independent of `PUT /me/api-key`: a nickname describes which gateway this is,
-    which does not change just because the key or base URL is rotated, so renaming
-    must not force the key to be re-entered and must not re-probe the provider — it
-    only touches the label column.
-    """
+    名称描述网关身份，与密钥轮换无关；重命名只更新标签，不要求重填密钥或再次探测供应商。"""
     if not current_user.api_key_provider:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="No connection to rename.")
     current_user.api_key_label = payload.label
@@ -335,5 +311,5 @@ async def get_usage(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Token/cost usage for this month, the last 7 days, and the last session."""
+    """查询本月、近 7 天及最近一次会话的 Token 与费用用量。"""
     return await usage.summary(db, current_user.id, current_user.monthly_token_limit)

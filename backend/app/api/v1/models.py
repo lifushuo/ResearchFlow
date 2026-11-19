@@ -1,12 +1,6 @@
-"""
-Model catalog and per-user routing endpoints (docs/12 M8).
+"""模型目录与用户路由配置接口（docs/12 M8）。
 
-`GET /models` is what the picker renders: every routable model with its price, context
-window, and capabilities, plus the presets, plus which providers this user can actually
-reach. Models the user has no key for are returned *marked unavailable* rather than
-omitted — hiding them would make adding a key feel like the app changed, and the price
-comparison is most of the point.
-"""
+模型选择器读取价格、上下文长度、能力、预设及用户可访问的供应商。没有密钥的模型仍返回，但标明不可用，便于用户知道添加密钥后能使用什么。"""
 
 from __future__ import annotations
 
@@ -28,10 +22,8 @@ from research_engine.runconfig import ROLES
 router = APIRouter(prefix="/models", tags=["Models"])
 
 
-# Re-exported, not restated. The shapes live in `app/schemas/models.py` so the desktop
-# host can declare the same `response_model` without importing this module's
-# configuration chain (#50); callers and tests have always found them here.
-from app.schemas.models import (  # noqa: E402  (re-export)
+# 请求响应结构共用 app/schemas/models.py，让桌面声明相同 response_model 时不引入服务端配置链；此处只重新导出兼容旧导入。
+from app.schemas.models import (  # noqa: E402 — 重新导出共用结构
     CatalogResponse,
     CustomEndpointStatusResponse,
     LocalLLMStatusResponse,
@@ -62,23 +54,12 @@ __all__ = [
 
 
 async def _ollama_presets_from_installed() -> dict[str, dict[str, str]] | None:
-    """Ollama presets built from the models this machine actually has, or None.
+    """按本机实际安装的 Ollama 模型生成预设，无可用模型返回 None。
 
-    The static presets in `catalog.PRESETS` name specific tags (`llama3.3`), so choosing
-    "Local" on a machine without that exact tag pulled produced a routing that 404s on the
-    first planner call — every time, for every role. The failure surfaced as a provider
-    error mid-run, long after the click that caused it, which is the worst possible place
-    to learn the model does not exist.
-
-    Selection mirrors what the settings card already tells the user: skip embedding models
-    (they cannot chat), prefer one big enough for the structured-evidence step for
-    `balanced`/`best`, and let `fast` be the smallest chat model available. Returns None
-    when nothing usable is installed, so the caller keeps the static defaults rather than
-    serving an empty preset.
-    """
+    跳过向量模型；均衡和最佳优先足以处理结构化证据的模型，快速模式可用最小聊天模型。不能让静态预设指向未安装标签，直到研究执行才出现 404。"""
     try:
         status_ = await local_llm.probe()
-    except Exception:  # noqa: BLE001 — a catalog request must not fail on a dead probe
+    except Exception:  # noqa: BLE001 — 探测服务故障不能使模型目录查询失败
         return None
     chat_models = [
         m for m in status_.models if not m.is_embedding and getattr(m, "supports_tools", True)
@@ -93,11 +74,8 @@ async def _ollama_presets_from_installed() -> dict[str, dict[str, str]] | None:
     research_ready = [m for m in chat_models if not m.likely_underpowered]
     strongest = max(research_ready or chat_models, key=size)
 
-    # The exact installed tag, not the catalog's family route. `LocalModel.route` maps a
-    # tag onto its catalog family (`deepseek-r1:14b` → `ollama:deepseek-r1`), and Ollama
-    # resolves a bare family only when a `:latest` tag happens to exist for it — which for
-    # `deepseek-r1` it does not. Routing at the family reproduced the exact 404 this
-    # function exists to prevent, so route at what is actually pulled.
+    # 必须路由到精确安装标签，不能替换成目录家族名称。
+    # 家族名只有存在 latest 时才可用，否则会 404，或运行与用户选择不同的模型。
     def route_of(m) -> str:
         return f"ollama:{m.name}"
 
@@ -110,17 +88,10 @@ async def _ollama_presets_from_installed() -> dict[str, dict[str, str]] | None:
 
 @router.get("/readiness", response_model=ReadinessResponse)
 async def get_readiness(current_user: User = Depends(get_current_user)):
-    """Can this user run research right now? (docs/17 §8a)
+    """判断当前用户现在能否启动研究（docs/17 §8a）。
 
-    Deliberately computed on every request rather than stored as a
-    "has-completed-onboarding" flag. A stored flag desynchronises from reality — it stays
-    true after a key is revoked and false after Ollama starts — whereas this answer is
-    always the current truth and stops being shown the moment a model exists.
-
-    `available_providers()` cannot answer this: it lists ollama unconditionally, because
-    local inference needs no key, so it is never empty and would report every user as
-    ready. Reachability is the thing that matters here, not permission.
-    """
+    每次请求重新计算，不保存容易过期的入门完成标记。密钥被撤销或本地服务启动后，结果应立即变化。
+    available_providers 总会包含不需要密钥的 Ollama，不能单凭列表非空判断就绪，还必须确认服务可达且存在聊天模型。"""
     has_cloud_key = bool(
         current_user.api_key_provider
         or settings.google_api_key
@@ -136,13 +107,11 @@ async def get_readiness(current_user: User = Depends(get_current_user)):
         status_ = await local_llm.probe()
         local_reachable = status_.reachable
         chat_models = sum(1 for m in status_.models if not m.is_embedding)
-    except Exception:  # noqa: BLE001 — a dead probe means "no local models", not an error
+    except Exception:  # noqa: BLE001 — 探测失败视为没有可用本地模型，不作为接口错误
         pass
 
     return ReadinessResponse(
-        # An embedding-only Ollama cannot fill an agent role, so a reachable server with
-        # no chat model is not readiness — that distinction is the whole reason this
-        # counts chat models rather than trusting `reachable`.
+        # 只有向量模型的 Ollama 无法承担研究角色；必须统计聊天模型，不能只检查 reachable。
         ready=has_cloud_key or chat_models > 0,
         has_cloud_key=has_cloud_key,
         local_reachable=local_reachable,
@@ -171,16 +140,14 @@ async def get_catalog(current_user: User = Depends(get_current_user)):
             notes=spec.notes,
             available=spec.provider in usable,
         )
-        # Cheapest first: the picker reads as a cost ladder, and the free local models
-        # sort to the top where a cost-conscious user will find them.
+        # 按费用从低到高排列，本地免费模型优先展示，便于控制成本。
         for spec in sorted(
             catalog.CATALOG.values(),
             key=lambda s: (s.provider, s.output_per_mtok if s.priced else float("inf")),
         )
     ]
 
-    # Serve the local presets that this machine can actually run, falling back to the
-    # static table when nothing is installed (or the probe is down).
+    # 优先返回本机实际可运行的预设；未安装模型或探测失败时回退静态表。
     presets = dict(catalog.PRESETS)
     installed = await _ollama_presets_from_installed()
     if installed:
@@ -200,11 +167,9 @@ async def get_catalog(current_user: User = Depends(get_current_user)):
 
 @router.get("/local/status", response_model=LocalLLMStatusResponse)
 async def local_llm_status(_current_user: User = Depends(get_current_user)):
-    """Probe the configured local model server (docs/12 M15).
+    """探测已配置的本地模型服务（docs/12 M15）。
 
-    Separate from `GET /models` because it does live I/O: the catalog must stay instant
-    and always renderable, while this can legitimately time out when nothing is running.
-    """
+    与模型目录分开，因为实时网络探测可能超时，而目录查询应保持快速且始终可展示。"""
     status_ = await local_llm.probe()
     return LocalLLMStatusResponse(
         configured_base_url=status_.configured_base_url,
@@ -230,13 +195,9 @@ async def local_llm_status(_current_user: User = Depends(get_current_user)):
 
 @router.get("/custom/status", response_model=CustomEndpointStatusResponse)
 async def custom_endpoint_status(_current_user: User = Depends(get_current_user)):
-    """Ask the configured custom endpoint what it serves (see `services/custom_endpoint`).
+    """询问自定义端点实际提供的模型，规则见 services/custom_endpoint。
 
-    Split from `GET /models` for the same reason `/local/status` is: this does live I/O
-    against an address that can legitimately be down, and the catalog must stay instant and
-    always renderable. Both probes answer the same question for the two providers whose
-    model lists this codebase cannot know — the endpoint owns them, not the catalog.
-    """
+    与目录接口分开，避免远程服务故障拖慢模型列表。自定义和本地模型列表由端点决定，不能在项目目录里猜测。"""
     status_ = await custom_endpoint.probe()
     return CustomEndpointStatusResponse(
         configured_base_url=status_.configured_base_url,
@@ -249,15 +210,9 @@ async def custom_endpoint_status(_current_user: User = Depends(get_current_user)
 
 @router.get("/prompt-defaults", response_model=PromptDefaultsResponse)
 async def get_prompt_defaults(_current_user: User = Depends(get_current_user)):
-    """The shipped text each role's prompt editor starts from (scope freeze §12).
+    """返回各角色提示词编辑器的项目默认内容（范围冻结 §12）。
 
-    Its own route rather than a field on `GET /models`, which the run form fetches too and
-    which has no use for several kilobytes of prompt text. Authenticated like its
-    neighbours, though it reads nothing about the caller: the answer is fixed by the build,
-    identical for every user and on both hosts, and a user's own overrides — served by
-    `GET /auth/me` — never appear here. What may be shown is decided by
-    `prompt_composition.editable_defaults`, so no protected purpose can reach this body.
-    """
+    单独设接口，避免运行表单读取模型目录时携带无用的长提示词。所有用户和主机得到相同的构建默认值，不包含用户覆盖。仅通过 editable_defaults 选择允许公开的用途，受保护提示词不能进入响应。"""
     return PromptDefaultsResponse(
         max_chars=MAX_PROMPT_OVERRIDE_CHARS,
         roles=[
@@ -271,12 +226,9 @@ async def get_prompt_defaults(_current_user: User = Depends(get_current_user)):
 async def test_provider(
     payload: ProviderTestRequest, _current_user: User = Depends(get_current_user)
 ):
-    """Probe a submitted key BEFORE it is stored (internal/07 Phase 2a) — the picker's
-    "test connection" action, separate from saving.
+    """在保存之前探测提交的密钥，对应“测试连接”（internal/07 Phase 2a）。
 
-    Live I/O, same reason `/local/status` is split from `GET /models`: it can
-    legitimately be slow or time out, and the catalog must stay instant either way.
-    """
+    它可能较慢或超时，因此独立于必须快速返回的模型目录。"""
     verdict = await provider_health.probe(
         payload.provider,
         payload.api_key,
@@ -292,13 +244,9 @@ async def test_provider(
 
 @router.get("/providers/health", response_model=ConnectionVerdict)
 async def provider_health_check(current_user: User = Depends(get_current_user)):
-    """Re-probe this user's own stored BYOK key on demand (internal/07 Phase 2a).
+    """按用户要求重新检查其已保存的自带密钥。
 
-    404s when there is no key to check — a settings page with no key stored already
-    says so in prose; this endpoint has nothing of the user's own to verify, and a
-    "degraded: no key" verdict here would be a second, redundant way to say the same
-    thing the empty-state text already covers.
-    """
+    没有保存密钥时返回 404；此时没有用户密钥可验证，不必再返回一份重复的降级状态。"""
     if not current_user.api_key_provider or not current_user.api_key_encrypted:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="No key stored to check.")
 
@@ -320,13 +268,9 @@ async def provider_health_check(current_user: User = Depends(get_current_user)):
 
 @router.post("/local/pull")
 async def pull_local_model(request: Request, _current_user: User = Depends(get_current_user)):
-    """Stream download progress for a recommended model (internal/07 Phase 2b).
+    """流式返回推荐模型下载进度（internal/07 Phase 2b）。
 
-    Unlike `/local/start` (spawning a server process), pulling a model is just an
-    HTTP call to an already-running Ollama — no local process access required, so
-    this works on the web build too wherever `/local/status` already does, not only
-    on desktop. Newline-delimited JSON, one `PullProgress` per line.
-    """
+    通过 HTTP 调用已运行的 Ollama，不需要启动本地进程，因此服务端和桌面都可使用。每行 JSON 对应一条 PullProgress。"""
     body = await request.json()
     model = (body.get("model") or "").strip()
     if not model:
@@ -351,21 +295,10 @@ async def pull_local_model(request: Request, _current_user: User = Depends(get_c
 
 @router.get("/routing", response_model=RoutingResponse)
 async def get_routing(current_user: User = Depends(get_current_user)):
-    """This user's saved routing, and what a run would actually dial.
+    """读取用户保存的路由及本次会真正使用的路由。
 
-    The read half of a trio that shipped write-only: PUT and DELETE existed, GET did not,
-    and `frontend/hooks/queries.ts` was already fetching it — so every dashboard load
-    logged a 405 and `useModelRouting()` never resolved. Nothing failed loudly; the
-    project hub's model panel just stayed empty.
-
-    `routing` is null when the user has expressed no preference. That is deliberately
-    distinct from `effective_routing`, which is never null because a run always dials
-    *something*: collapsing them would make "I have not chosen" read identically to "I
-    chose exactly the deployment defaults", and only one of those should survive an
-    operator changing MODEL_*.
-
-    No database write and no live provider call, so it stays as cheap as `GET /models`.
-    """
+    routing 为空表示用户未选偏好，effective_routing 始终有实际默认值；两者不能合并，否则无法区分跟随部署配置和用户明确选择。
+    只读数据库，不调用真实供应商，保持与模型目录一样轻量。"""
     return RoutingResponse(
         routing=current_user.model_routing,
         effective_routing=model_routing.resolve(
@@ -380,11 +313,7 @@ async def set_routing(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Save this user's per-role routing.
-
-    Validated against the catalog before it is stored, so a saved preference is always
-    startable — a run should never fail on a model that could have been rejected here.
-    """
+    """保存用户按角色选择的模型路由；先按目录校验，避免保存后直到研究执行才发现模型不能使用。"""
     try:
         cleaned = model_routing.validate(payload.routing)
     except model_routing.InvalidRouting as e:
@@ -407,7 +336,7 @@ async def clear_routing(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Drop the preference and fall back to the deployment's MODEL_* routing."""
+    """清除用户偏好，回退部署的 MODEL_* 路由。"""
     current_user.model_routing = None
     await db.commit()
     await db.refresh(current_user)

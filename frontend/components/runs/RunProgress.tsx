@@ -7,20 +7,7 @@ import { AGENT_TOKEN } from "@/lib/pipeline";
 import type { AgentEvent, RunGraph } from "@/lib/types";
 import { deriveStages, type Stage, type StageState } from "@/lib/runProgress";
 
-/**
- * What a run is doing right now, with live agent activity and reasoning disclosure.
- *
- * The run page renders each pipeline stage along with an expandable dropdown
- * displaying what each agent is doing and thinking in real-time.
- *
- * **No percentage, no bar, no elapsed-time extrapolation.** The backend publishes discrete
- * events and a status; it does not publish completion, so a bar would be the frontend
- * inventing a measurement — the one thing this product must never do. The derivation lives
- * in `lib/v2Progress.ts` and is tested there; this file only draws it.
- *
- * Colour is reinforcement, never the carrier: every stage states its own state in words
- * (and in an `sr-only` phrase for a screen reader), and the marker is redundant with it.
- */
+/** 展示研究当前状态、智能体活动及可展开的说明。不显示百分比、进度条或基于用时的推测，因为后端只报告离散事件和状态，不提供完成度。状态推导在 lib/runProgress.ts 中独立测试，此组件只负责绘制。颜色只作辅助，每阶段同时提供文字与读屏说明。 */
 
 const STAGE_COLOR: Record<string, string> = {
   planner: `var(--${AGENT_TOKEN.planner})`,
@@ -32,11 +19,11 @@ const STAGE_COLOR: Record<string, string> = {
 };
 
 const STATE_WORD: Record<StageState, string> = {
-  pending: "Not started",
-  active: "In progress",
-  done: "Done",
-  waiting: "Waiting for you",
-  stopped: "Did not run",
+  pending: "尚未开始",
+  active: "进行中",
+  done: "已完成",
+  waiting: "等待你处理",
+  stopped: "未执行",
 };
 
 function Marker({ state, color }: { state: StageState; color: string }) {
@@ -65,8 +52,8 @@ function Marker({ state, color }: { state: StageState; color: string }) {
       />
     );
   }
-  // "Did not run" and "not started yet" are different findings, so they are different
-  // marks. Drawn as a dash rather than a second empty box.
+  // 未执行与尚未开始是不同事实，须使用不同标记；
+  // 前者画为短横线，避免都显示为空方框。
   if (state === "stopped") {
     return (
       <span aria-hidden className="font-mono text-sm leading-none text-text-muted">
@@ -95,7 +82,7 @@ function StageDetailDrawer({
     [events, stage.id],
   );
 
-  // Extract thoughts from agent events
+  // 从智能体事件提取活动说明。
   const thoughts = useMemo(() => {
     const list: { thought: string; message?: string | null; ts?: string | null }[] = [];
     for (const e of agentEvents) {
@@ -108,7 +95,7 @@ function StageDetailDrawer({
     return list;
   }, [agentEvents]);
 
-  // Extract latest tool invocations or actions
+  // 提取最近的工具调用及操作。
   const toolCalls = useMemo(() => {
     const calls: { tool: string; args?: unknown; observation?: string | null; message?: string | null }[] = [];
     for (const e of agentEvents) {
@@ -131,7 +118,7 @@ function StageDetailDrawer({
   if (agentEvents.length === 0 && stage.state === "pending") {
     return (
       <div className="mt-2.5 border border-dashed border-border/60 bg-bg-surface/50 p-3 text-xs text-text-muted">
-        This agent has not started yet. Its activity and reasoning will appear here as it executes.
+        此智能体尚未开始，运行后将在这里显示活动及说明。
       </div>
     );
   }
@@ -141,7 +128,7 @@ function StageDetailDrawer({
       <div className="mt-2.5 border border-border bg-bg-surface/60 p-3 text-xs text-text-secondary">
         <div className="flex items-center gap-2">
           <span className="spinner" style={{ width: 10, height: 10 }} />
-          <span>{stage.agentName} is currently initializing and reasoning...</span>
+          <span>{stage.agentName} 正在初始化并处理任务…</span>
         </div>
       </div>
     );
@@ -149,12 +136,12 @@ function StageDetailDrawer({
 
   return (
     <div className="mt-2.5 space-y-2.5 border border-border bg-bg-surface/80 p-3 text-xs">
-      {/* Latest Agent Thinking & Reasoning */}
+      {/* 最近的智能体活动说明。 */}
       {latestThought && (
         <div className="border-l-2 border-accent bg-bg-elevated/70 p-2.5">
           <div className="mb-1 flex items-center gap-1.5 font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-accent">
             <IconThought className="h-3.5 w-3.5" />
-            <span>Agent Thinking & Reasoning</span>
+            <span>智能体思考与推理</span>
           </div>
           <p className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-text-primary">
             {latestThought.thought}
@@ -162,12 +149,12 @@ function StageDetailDrawer({
         </div>
       )}
 
-      {/* Latest Tool Actions (e.g. search queries, page fetches) */}
+      {/* 最近的搜索、页面抓取等工具操作。 */}
       {toolCalls.length > 0 && (
         <div className="space-y-1.5">
           <div className="flex items-center gap-1.5 font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted">
             <IconSearch className="h-3 w-3" />
-            <span>Tools & Search Queries ({toolCalls.length})</span>
+            <span>工具与搜索请求（{toolCalls.length})</span>
           </div>
           <div className="space-y-1">
             {toolCalls.slice(-3).map((call, idx) => (
@@ -187,12 +174,12 @@ function StageDetailDrawer({
         </div>
       )}
 
-      {/* Activity Timeline */}
+      {/* 活动时间线。 */}
       {recentEvents.length > 0 && (
         <div className="space-y-1.5">
           <div className="flex items-center gap-1.5 font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted">
             <IconList className="h-3 w-3" />
-            <span>Recent Agent Activity</span>
+            <span>最近的智能体活动</span>
           </div>
           <ul className="space-y-1">
             {recentEvents.map((e, idx) => (
@@ -200,7 +187,7 @@ function StageDetailDrawer({
                 key={idx}
                 className="flex items-center justify-between gap-2 border-b border-border/20 py-0.5 text-xs text-text-secondary last:border-b-0"
               >
-                <span>{e.message || "Agent state updated"}</span>
+                <span>{e.message || "智能体状态已更新"}</span>
                 {e.ts && (
                   <span className="font-mono text-[0.6875rem] text-text-muted">
                     {new Date(e.ts).toLocaleTimeString()}
@@ -264,24 +251,24 @@ function StageRow({
           </div>
         </div>
 
-        {/* Dropdown toggle button for agent thinking and activity */}
+        {/* 智能体说明与活动的展开开关。 */}
         {isAgent && (
           <button
             type="button"
             onClick={onToggle}
             aria-expanded={isExpanded}
-            aria-label={`${isExpanded ? "Collapse" : "Expand"} activity and thinking for ${stage.agentName}`}
+            aria-label={`${isExpanded ? "收起" : "展开"}${stage.agentName}的活动与说明`}
             className="btn btn-ghost shrink-0 px-2 py-0.5 font-mono text-[length:var(--text-micro)] text-text-muted hover:text-text-primary"
           >
             <span className="flex items-center gap-1">
-              <span>{isExpanded ? "Hide thoughts" : "Thoughts & activity"}</span>
+              <span>{isExpanded ? "收起说明" : "说明与活动"}</span>
               <span aria-hidden className="text-[0.625rem]">{isExpanded ? "▲" : "▼"}</span>
             </span>
           </button>
         )}
       </div>
 
-      {/* Expanded detail drawer */}
+      {/* 展开的详情抽屉。 */}
       {isAgent && isExpanded && (
         <StageDetailDrawer stage={stage} events={events} />
       )}
@@ -296,7 +283,7 @@ export function RunProgress({
 }: {
   graph: RunGraph;
   events: AgentEvent[];
-  /** The stream is not delivering. Said out loud rather than left to look like a stall. */
+  /** 实时流中断时必须明确提示，不能让页面看起来像停滞。 */
   degraded: boolean;
 }) {
   const stages = useMemo(
@@ -310,7 +297,7 @@ export function RunProgress({
     [graph.run.status, graph.run.skip_plan_gate, graph.reviews, events],
   );
 
-  // Expanded state map for each stage ID
+  // 按阶段 ID 保存展开状态。
   const [expandedStages, setExpandedStages] = useState<Record<string, boolean>>({});
   const [expandAll, setExpandAll] = useState(false);
 
@@ -331,8 +318,8 @@ export function RunProgress({
     setExpandedStages(updated);
   };
 
-  // The last thing the pipeline actually said. Shown verbatim: a paraphrase here would be
-  // the frontend narrating a run it cannot see.
+  // 原样显示流水线最后报告的信息，
+  // 避免前端改述自身无法观察的研究进程。
   const lastMessage = [...events].reverse().find((e) => e.message)?.message ?? null;
 
   return (
@@ -342,7 +329,7 @@ export function RunProgress({
           id="run-progress"
           className="font-mono text-[length:var(--text-micro)] font-semibold uppercase tracking-wider text-text-muted"
         >
-          Progress
+          研究进展
         </h2>
         <button
           type="button"
@@ -351,7 +338,7 @@ export function RunProgress({
         >
           <span className="flex items-center gap-1.5">
             <IconThought className="h-3 w-3 text-accent" />
-            <span>{expandAll ? "Collapse all agent thoughts" : "Expand all agent thoughts"}</span>
+            <span>{expandAll ? "收起全部智能体说明" : "展开全部智能体说明"}</span>
             <span aria-hidden className="text-[0.625rem]">{expandAll ? "▲" : "▼"}</span>
           </span>
         </button>
@@ -387,8 +374,7 @@ export function RunProgress({
             borderColor: "var(--warning-line)",
           }}
         >
-          The live connection dropped. It reconnects automatically and replays anything
-          missed, so nothing is lost — this page is not stuck.
+          实时连接已中断，将自动重连并回放遗漏事件；数据不会丢失，页面也没有卡住。
         </p>
       )}
     </section>

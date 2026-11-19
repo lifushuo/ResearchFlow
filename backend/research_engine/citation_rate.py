@@ -1,24 +1,8 @@
-"""
-How much of a report's citation apparatus actually resolves (internal/07 Phase 7).
+"""统计报告引用标记能否解析到真实来源，见 internal/07 Phase 7。
 
-The product's central claim is that every `[n]` is falsifiable. This turns that into one
-number per report so it is scannable across a list, not only checkable inside one.
-
-**The return type is `float | None` and the `None` is the point.** `None` means *not
-measured*: the report made no citable claims at all. `0.0` means every marker it did make
-points at nothing. Those are opposite findings, and rendering the first as the second is
-the failure AGENTS.md opens the repo with — an unmeasured value printed as a zero.
-
-Lives here rather than in `evals/` because `app/` must not import the eval harness (see
-`graph.py`'s inlined uncited-count and the note explaining why). `evals.metrics.
-citation_stats` now delegates here, so the number a benchmark publishes and the number
-the UI displays cannot drift apart.
-
-The citation pattern and the sources-heading boundary are **not defined here** — they come
-from `research_engine.claims`, which is also what the graph's fidelity pass and the eval
-judge use. Two copies of "where does the body end" is how the published number and the
-displayed number come to disagree about the same report.
-"""
+None 表示没有可测引用；0.0 表示出现过引用但全部无对应来源，二者不能混淆。
+此实现由界面与 evals.metrics 共用，避免显示值与评测值不一致。
+引用模式和参考文献边界统一来自 research_engine.claims。"""
 
 from __future__ import annotations
 
@@ -28,20 +12,14 @@ __all__ = ["body_before_sources", "cited_indices", "resolution_rate"]
 
 
 def cited_indices(text: str) -> list[int]:
-    """Every cited index in the body, in order, duplicates kept.
+    """按出现顺序提取正文引用编号，保留重复项。
 
-    A thin alias for `claims.extract_citations`, kept because callers and docs refer to
-    this name and because "which indices does this report cite" reads better here than in
-    a module about claims.
-    """
+    这是 claims.extract_citations 的薄封装，保留供既有调用方使用的名称。"""
     return extract_citations(text)
 
 
 def resolution_rate(report: str, sources: list[dict] | None) -> float | None:
-    """Fraction of in-text markers that point at a real source, or `None` if unmeasured.
-
-    `None` when the body carries no markers at all. Not 0.0: see the module docstring.
-    """
+    """返回正文引用指向真实来源的比例；没有任何引用时返回 None，不能填 0。"""
     cites = cited_indices(body_before_sources(report))
     if not cites:
         return None

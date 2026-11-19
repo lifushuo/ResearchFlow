@@ -3,14 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FirstRunNotice } from "./FirstRunNotice";
 
-/**
- * The notice offers only a keyless path the build really has.
- *
- * It used to say "tick Demo run under Options". There is no such control: the only
- * "Demo run" in the interface is the badge on a run that already used scripted models. A
- * self-hosted stack's keyless path is `./start.sh --fake`; the desktop app has none, so
- * there the notice offers no alternative at all.
- */
+/** 提示只能提供当前构建确实支持的免密钥路径。自托管服务可使用 ./start.sh --fake，桌面端没有此替代入口；不能引导用户勾选实际不存在的演示选项。 */
 
 const readiness = vi.hoisted(() => ({ value: { ready: false, local_reachable: false } as object }));
 const host = vi.hoisted(() => ({ desktop: false }));
@@ -31,12 +24,12 @@ describe("the keyless path the notice offers", () => {
   it("names the real demo command on a self-hosted stack", () => {
     render(<FirstRunNotice />);
     expect(screen.getByText("./start.sh --fake")).toBeInTheDocument();
-    expect(screen.getByRole("note")).toHaveTextContent(/stamped as a demo/);
+    expect(screen.getByRole("note")).toHaveTextContent(/标记为演示/);
   });
 
   it("never points at a Demo run control under Options, which does not exist", () => {
     render(<FirstRunNotice />);
-    expect(screen.getByRole("note")).not.toHaveTextContent(/Demo run/);
+    expect(screen.getByRole("note")).not.toHaveTextContent(/演示研究/);
     expect(screen.getByRole("note")).not.toHaveTextContent(/under Options/);
   });
 
@@ -44,8 +37,8 @@ describe("the keyless path the notice offers", () => {
     host.desktop = true;
     render(<FirstRunNotice />);
     expect(screen.getByRole("note")).not.toHaveTextContent(/start\.sh/);
-    expect(screen.getByRole("note")).not.toHaveTextContent(/Demo run/);
-    expect(screen.getByRole("link", { name: "Connect a model" })).toHaveAttribute(
+    expect(screen.getByRole("note")).not.toHaveTextContent(/演示研究/);
+    expect(screen.getByRole("link", { name: "连接模型" })).toHaveAttribute(
       "href",
       "/settings",
     );

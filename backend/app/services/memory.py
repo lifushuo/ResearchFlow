@@ -1,23 +1,7 @@
-"""
-Project memory: writing approved reports in, and reading scoped knowledge back out.
+"""项目记忆：写入获批报告，再按项目读取知识。
 
-Two operations and one rule.
-
-**Ingestion is approval-gated.** `ingest_report` refuses anything not marked COMPLETED,
-which is only reachable after a human approved the draft. The check is here as well as in
-the caller because it is the property the whole feature rests on — drafts and rejected work
-must be *provably* absent from retrieval, not absent by convention.
-
-**A report is a report, whichever pipeline produced it.** Memory is keyed on
-`source_report_id`, which is polymorphic across both run tables. It used to carry a foreign
-key to `sessions`, so reports from the current runtime could not be indexed at all: they
-counted as approved, nothing could ever index them, and Chat answered from an empty store
-while `memory/status` reported a backlog that only grew.
-
-**Isolation is a SQL boundary.** Every read filters `WHERE project_id = :project_id`
-before a single character reaches a model. A prompt-level "only use Project X"
-instruction is not a security control and is not treated as one (docs/06 §4).
-"""
+摄取必须检查 COMPLETED，不能让草稿或拒绝报告进入检索。来源 ID 同时支持会话和研究运行，不能只外键关联旧会话表。
+隔离必须在 SQL 查询中过滤 project_id，再把文字交给模型；提示词限制不能替代安全边界（docs/06 §4）。"""
 
 from __future__ import annotations
 
@@ -38,50 +22,27 @@ from research_engine.ports import Embeddings
 
 logger = structlog.get_logger()
 
-# How many chunks a chat turn retrieves. docs/14 §5 says "start 8"; it rides in every
-# prompt, so it is also a cost knob — eight ~300-token chunks is ~2.4k tokens of context.
+# 每轮聊天取多少记忆片段，也是上下文费用开关；8 段约 300 Token 的片段约占 2400 Token（docs/14 §5）。
 DEFAULT_TOP_K = 8
 
-# Cosine distance above which a chunk is not a match by any reading. Normalised embeddings
-# put unrelated text near 1.0 and opposed text above it, so this drops results that are
-# worse than orthogonal rather than encoding a guess about what "relevant" means.
+# 余弦距离上限仅剔除明显不相关的片段；归一化向量中不相关接近 1，不能凭感觉设过严阈值。
 #
-# It was briefly tightened to 0.45 on the reasoning that a smaller number "filters out
-# noisy background matches". Nothing had been measured against a real embedding model, and
-# the number did not filter noise — it filtered the answer: a question asked of the project
-# that owns the report retrieved nothing at all. A retrieval ceiling is a measurement claim
-# like any other, and an unmeasured one silently reports "no memory" for memory that is
-# there. Tighten this only with a benchmark that says what it costs; `test_retrieval_ceiling
-# _admits_a_genuine_match` is the floor that keeps a guess from landing again.
+# 此前未经真实向量基准验证就收紧到 0.45，反而把确有答案的片段过滤掉。
+# 调整检索阈值必须有基准说明收益和损失，不能让猜测变成“无项目记忆”的假测量。
 MAX_COSINE_DISTANCE = 1.0
 
 
 def is_available(db: AsyncSession) -> bool:
-    """Whether this host has project memory at all.
+    """统一判断主机是否支持项目记忆。
 
-    Memory is pgvector-backed, so it exists on the server and not on the desktop app —
-    a decision stated in the parity tables, in the release notes and in the UI, not an
-    outage. One home for the check: a caller that writes its own dialect test is a caller
-    that will disagree with this one the day the storage changes.
-    """
+    目前依赖 pgvector，桌面没有此能力是产品差异，不是服务故障；调用方不能各自复制数据库方言判断。"""
     return db.bind is not None and db.bind.dialect.name == "postgresql"
 
 
 async def purge_report(db: AsyncSession, report_id: uuid.UUID) -> int:
-    """Remove every chunk indexed from one report. A no-op where memory does not exist.
+    """显式删除某报告的全部记忆片段；无记忆能力时不操作。
 
-    Explicit rather than a relationship cascade, and guarded rather than attempted, because
-    `memory_chunks` is pgvector-backed and absent on the desktop. `Session.memory_chunks`
-    used to carry `cascade="all, delete-orphan"`, so `db.delete(session)` SELECTed a table
-    that host does not have and the delete route answered 500 — a control the desktop build
-    renders, listed in `DESKTOP_UI_CALLS`, failing on every use.
-
-    `run_lifecycle.delete_run` already did it this way. The two delete paths differed in
-    exactly the place that mattered.
-
-    The guarantee is unchanged: deleting research takes its indexed text with it, or
-    project chat keeps quoting a report nobody can open.
-    """
+    桌面没有 memory_chunks 表，不能通过无条件 ORM 级联去查询它。必须先检查能力再清理，同时保证删除研究后不会残留可被聊天引用的正文。"""
     if not is_available(db):
         return 0
     result = await db.execute(delete(MemoryChunk).where(MemoryChunk.source_report_id == report_id))
@@ -90,7 +51,7 @@ async def purge_report(db: AsyncSession, report_id: uuid.UUID) -> int:
 
 @dataclass(frozen=True)
 class IngestResult:
-    """What one ingestion attempt did. `skipped` is a success, not a failure."""
+    """一次摄取的结果，skipped 表示成功跳过，不是失败。"""
 
     chunks_written: int = 0
     skipped: bool = False
@@ -99,25 +60,20 @@ class IngestResult:
 
 @dataclass(frozen=True)
 class SourceReport:
-    """Just enough of the report a chunk came from to cite it.
+    """足够定位引用报告的简要信息，不直接暴露 ORM 行。
 
-    A named three-field record rather than the ORM row, because the row can come from
-    either run table and a caller that reaches for `.prompt` on one and `.question` on the
-    other is a caller that works until the day the other kind shows up.
-    """
+    报告可来自会话或研究运行，统一结构避免调用方错误依赖其中一种表的字段。"""
 
     id: uuid.UUID
     title: str
     created_at: datetime
-    #: `"run"` or `"session"`. Carried because a citation has to link somewhere, and the
-    #: two kinds live on different routes — a marker that opens nothing is the failure the
-    #: whole citation apparatus exists to prevent.
+    # 来源类型为 run 或 session；引用需要据此跳到正确路由，不能生成打不开的标记。
     kind: str
 
 
 @dataclass(frozen=True)
 class Retrieved:
-    """One retrieved chunk with the report it came from, ready to cite as [R{n}]."""
+    """检索片段及其来源报告，可直接用于 R 编号引用。"""
 
     chunk: MemoryChunk
     distance: float
@@ -133,22 +89,10 @@ async def ingest_report(
     embedder: Embeddings,
     force: bool = False,
 ) -> IngestResult:
-    """Embed one approved report into its project's memory.
+    """将一份已批准报告切块并写入项目记忆。
 
-    Approval is the caller's to establish — `ingest_session` and `ingest_run` each check
-    the status their own table records — and this function does the mechanics for both, so
-    there is one chunking rule, one batching rule and one replacement rule rather than a
-    copy per pipeline.
-
-    Idempotent. Re-ingesting a report already indexed under the current embedding model is
-    skipped rather than repeated: approving twice (a double-click, a redelivered task) must
-    not double the store or the bill. `force=True` re-indexes, which is what a provider
-    switch needs.
-
-    Raises `EmbeddingsUnavailable` if there is no provider; the caller decides whether that
-    is fatal. It is not fatal at the end of a run — the research already succeeded and is
-    already saved, so an un-indexed report is a gap to report, not a run to fail.
-    """
+    批准由会话和运行各入口先检查，本函数共用切块、批量向量化及替换规则。当前模型下已索引就跳过，避免重复批准产生重复数据和费用；force=True 用于模型切换后的重建。
+    无向量服务时抛 EmbeddingsUnavailable，由调用方决定是否致命；已完成研究只披露索引缺口，不能因此改为失败。"""
     report = (report_markdown or "").strip()
     if not report:
         return IngestResult(skipped=True, reason="no final report text")
@@ -171,16 +115,14 @@ async def ingest_report(
     if not chunks:
         return IngestResult(skipped=True, reason="report produced no chunks")
 
-    # One batched call for the whole report rather than one per chunk.
+    # 整份报告批量调用一次，不按片段逐个请求。
     vectors = await embedder.embed(chunks)
     if len(vectors) != len(chunks):
         raise EmbeddingsUnavailable(
             f"Embedder returned {len(vectors)} vectors for {len(chunks)} chunks."
         )
 
-    # Replace wholesale: a re-index with a different chunk count would otherwise leave
-    # the tail of the previous run behind, and those stale rows are unreachable garbage
-    # that still gets retrieved.
+    # 重建时整体替换旧片段，避免新旧切块数量不同而残留仍可被检索的旧尾部。
     await db.execute(delete(MemoryChunk).where(MemoryChunk.source_report_id == report_id))
     db.add_all(
         [
@@ -213,9 +155,9 @@ async def ingest_session(
     *,
     force: bool = False,
 ) -> IngestResult:
-    """Approval gate for a session, then the shared mechanics."""
+    """先检查会话报告批准状态，再执行共用摄取。"""
     if session.status != SessionStatus.COMPLETED:
-        # The load-bearing guard. Everything else is mechanics.
+        # 核心批准门禁，后续步骤仅负责执行机制。
         return IngestResult(skipped=True, reason=f"status is {session.status}, not COMPLETED")
     return await ingest_report(
         db,
@@ -235,12 +177,9 @@ async def ingest_run(
     *,
     force: bool = False,
 ) -> IngestResult:
-    """Approval gate for a run, then the shared mechanics.
+    """先检查研究运行批准状态，再执行共用摄取。
 
-    The report text is passed in rather than read off `run`: a run keeps its report on the
-    latest `Revision`, and the caller already holds the revision it just approved. Reading
-    it again here would risk indexing a *different* version from the one the human saw.
-    """
+    正文由调用方传入已批准修订，不能从 run 再查最新版本，否则可能索引到用户没审核过的另一版。"""
     if run.status != "COMPLETED":
         return IngestResult(skipped=True, reason=f"status is {run.status}, not COMPLETED")
     return await ingest_report(
@@ -254,13 +193,9 @@ async def ingest_run(
 
 
 async def _resolve_reports(db: AsyncSession, ids: list[uuid.UUID]) -> dict[uuid.UUID, SourceReport]:
-    """Titles and dates for a set of report ids, looked up in both run tables.
+    """分别从会话和运行表查询报告标题与日期。
 
-    Two small `IN` queries rather than a join, because `source_report_id` is polymorphic
-    and there is no single table to join to. An id present in neither table is simply
-    absent from the result — its chunk is then dropped by the caller rather than cited to a
-    report nobody can open.
-    """
+    来源 ID 是多态，用两次小型 IN 查询；两表均无此报告则不返回，调用方丢弃其片段，不能引用不存在的报告。"""
     if not ids:
         return {}
     found: dict[uuid.UUID, SourceReport] = {}
@@ -287,17 +222,11 @@ async def retrieve(
     embedding_model: str,
     limit: int = DEFAULT_TOP_K,
 ) -> list[Retrieved]:
-    """Nearest chunks *within one project*, with the report each came from attached.
+    """只在一个项目内检索最近片段，并附带来源报告。
 
-    The `project_id` predicate and the ownership check that precedes it are the isolation
-    boundary. `embedding_model` is filtered too: chunks written by a different model are
-    not comparable to this query vector, and silently ranking them together would produce
-    confident nonsense rather than an obvious error.
-    """
-    # The nearest-neighbour query is `app.ports.MemoryIndex`'s. Its distance operator is
-    # pgvector's — the most dialect-specific expression in this codebase — and it used to
-    # sit here, in a module the desktop imports. Both predicates travel with the call
-    # because both are isolation boundaries, not optimisations.
+    归属检查与 project_id 过滤构成隔离边界；同时按 embedding_model 过滤，禁止不可比模型的向量混排。"""
+    # 数据库专有的向量距离查询交给 MemoryIndex 端口。
+    # 项目与模型两个过滤条件都是正确性边界，不是可省略的优化。
     rows = await index.nearest(
         db,
         project_id=project_id,
@@ -307,9 +236,7 @@ async def retrieve(
     )
 
     reports = await _resolve_reports(db, [chunk.source_report_id for chunk, _ in rows])
-    # A chunk whose report has gone is dropped, not cited: a grounding block naming a
-    # report the reader cannot open is exactly the unresolvable citation this product
-    # exists to make impossible.
+    # 来源报告已删除的片段直接丢弃，不能让用户收到无法打开的引用。
     return [
         Retrieved(chunk=chunk, distance=float(dist), report=reports[chunk.source_report_id])
         for chunk, dist in rows
@@ -319,12 +246,9 @@ async def retrieve(
 
 @dataclass(frozen=True)
 class MemoryStatus:
-    """What `GET /projects/{id}/memory/status` reports (docs/14 §8).
+    """项目记忆状态（docs/14 §8）。
 
-    `pending_reports` is derived rather than stored: approved reports minus distinct
-    indexed ones. That keeps a failed ingestion visible without a status column to keep
-    in sync, and it self-heals — a later re-index simply makes the number fall.
-    """
+    pending_reports 由已批准报告减去已索引报告计算，不额外维护易失同步的状态；重建成功自然缩小缺口。"""
 
     chunk_count: int
     indexed_reports: int
@@ -337,7 +261,7 @@ class MemoryStatus:
 
 
 async def status(db: AsyncSession, *, project_id: uuid.UUID, current_model: str) -> MemoryStatus:
-    """Make memory legible rather than magic: what is indexed, and what is still pending."""
+    """展示真实已索引内容和待处理缺口，让记忆状态可理解。"""
     norm_pid = uuid.UUID(str(project_id))
     by_model = (
         await db.execute(
@@ -373,12 +297,8 @@ async def status(db: AsyncSession, *, project_id: uuid.UUID, current_model: str)
     pg_chunks = sum(chunks for _, chunks, _, _ in by_model)
     pg_indexed = sum(reports for model, _, reports, _ in by_model if model == current_model)
 
-    # These numbers describe **project memory**, and nothing else. They were briefly
-    # `max(memory, corpus)`, which made the card read "2 reports indexed" while the memory
-    # table held one — the corpus is a different store with a different purpose and its own
-    # card, and blending the two reported a coverage the retrieval this card describes did
-    # not have. That is the unmeasured-as-measured failure, in the surface whose whole job
-    # is to say what memory knows.
+    # 这里只统计项目记忆，不能与独立语料库取最大值或混算。
+    # 否则记忆只有一份却会显示索引两份，冒报实际检索能力。
     pending = max(approved - pg_indexed, 0)
 
     models_list = [

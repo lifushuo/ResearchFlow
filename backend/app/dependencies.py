@@ -1,11 +1,6 @@
-"""
-Auth dependencies (docs/architecture/06-security.md §1).
+"""身份认证依赖（docs/architecture/06-security.md §1）。
 
-The browser authenticates via the httpOnly `access_token` cookie (sent
-automatically through the same-origin proxy, so SSE works). A Bearer header is
-also accepted for non-browser API clients. Password hashing lives in
-services.passwords; token logic in services.tokens.
-"""
+浏览器使用 httpOnly access_token Cookie，经同源代理自动携带，兼容 SSE。非浏览器客户端也可使用 Bearer 头。密码哈希和令牌逻辑分别位于 passwords、tokens 服务。"""
 
 from __future__ import annotations
 
@@ -20,7 +15,10 @@ from app.db.base import get_db
 from app.db.redis import get_redis
 from app.models.user import User
 from app.services import rate_limit, tokens
-from app.services.passwords import hash_password, verify_password  # re-exported
+from app.services.passwords import (
+    hash_password,
+    verify_password,
+)  # 重新导出共用依赖，兼容现有导入位置。
 
 logger = structlog.get_logger()
 
@@ -71,12 +69,9 @@ async def get_current_user(
 async def enforce_research_rate_limit(
     current_user: User = Depends(get_current_user), redis=Depends(get_redis)
 ) -> None:
-    """Per-user research throttle. Disabled (0) by default — see `Settings`.
+    """用户研究请求限流，默认 0 关闭，规则见 Settings。
 
-    Returning early also skips the Redis INCR, so a disabled limit leaves no counter
-    behind to expire. Re-enabling it later starts from a clean window rather than from
-    usage accumulated while it was off.
-    """
+    关闭时不执行 Redis INCR，也不积累隐藏计数；重新启用时从新的时间窗口开始。"""
     limit = settings.research_rate_limit_per_hour
     if limit <= 0:
         return
@@ -94,7 +89,7 @@ async def enforce_research_rate_limit(
 async def enforce_chat_rate_limit(
     current_user: User = Depends(get_current_user), redis=Depends(get_redis)
 ) -> None:
-    """Per-user chat throttle. Disabled (0) by default — see `Settings`."""
+    """用户聊天请求限流，默认 0 关闭，规则见 Settings。"""
     limit = settings.chat_rate_limit_per_hour
     if limit <= 0:
         return

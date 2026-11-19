@@ -1,15 +1,6 @@
-"""
-Freezing a selected-files run's selection (internal/rfcs/V3.1-corpus-scope.md §8.2).
+"""创建运行时一次性冻结文件选择（RFC V3.1 §8.2）。
 
-A selection is control-plane data, resolved once — when the run is created — into the exact
-document *versions* the run may read, and stored on the row. Every later step reads the row:
-the plan gate, a resume, the persist check, the bundle. Nothing re-resolves it, so a document
-superseded, deleted or moved after creation can never widen or shift what the run may read.
-
-Shared by both hosts: the server's `runs.create_run` and the desktop sidecar's delegated
-route call the same handler, which calls this. It imports nothing host-specific (no
-`app.config`, no database), so the packaged sidecar can import it (`test_sidecar_startup`).
-"""
+把请求解析为确切文档版本并存入运行。计划关卡、恢复、保存和导出都读同一快照；文件后来替换、删除或移动，不能扩大或改变原范围。两种主机共用，不依赖服务器设置或数据库。"""
 
 from __future__ import annotations
 
@@ -18,7 +9,7 @@ from urllib.parse import unquote, urlsplit
 
 
 class SelectionError(ValueError):
-    """A selection that cannot be frozen. `code` is the stable, named reason."""
+    """无法冻结文件选择；code 为稳定的错误原因标识。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -32,12 +23,9 @@ async def freeze_selection(
     doc_keys: list[str] | None,
     whole_corpus: bool,
 ) -> dict:
-    """Resolve a selection request to its frozen record, or raise `SelectionError`.
+    """把选择请求解析成冻结记录，失败抛 SelectionError。
 
-    `whole_corpus` is a corpus-only run with no explicit selection: today's meaning (the
-    project's whole corpus), frozen like any selection so the run reads a fixed set.
-    `store` is the project's corpus, or `None` when the project has none yet.
-    """
+    whole_corpus 同样冻结当时整个项目的版本集合；store 为 None 表示项目还没有语料。"""
     folder_ids = list(folder_ids or [])
     doc_keys = list(doc_keys or [])
     if not whole_corpus and not folder_ids and not doc_keys:
@@ -45,12 +33,10 @@ async def freeze_selection(
 
     folder_keys: set[str] = set()
     if folder_ids:
-        # Folders expand to every document in them and beneath them, now — the selection
-        # records documents, so a file added to the folder later is not in this run.
+        # 文件夹只展开为创建当时其中及子目录的文档；后来加入的文件不属于此次运行。
         found = await store.folder_doc_keys(folder_ids) if store is not None else None
         if found is None:
-            # Never says which: an id that exists in another project and one that exists
-            # nowhere must look the same from here.
+            # 不区分 ID 存在于别的项目还是根本不存在，避免泄露。
             raise SelectionError(
                 "selection_not_found", "Some selected files or folders are not in this project."
             )
@@ -64,8 +50,7 @@ async def freeze_selection(
 
     if not whole_corpus:
         found = {item["doc_key"] for item in resolved}
-        # Every file named explicitly must resolve; a folder may hold documents with no
-        # current version, which simply are not in the selection.
+        # 明确指定的每个文件都必须能解析；文件夹中没有当前版本的文档则不纳入。
         if set(doc_keys) - found:
             raise SelectionError(
                 "selection_not_found",
@@ -95,11 +80,9 @@ async def freeze_selection(
 
 
 def allowed_ids(selection: dict | None) -> frozenset[str] | None:
-    """The document-version ids a frozen selection admits, or `None` for no selection.
+    """返回冻结选择允许的文档版本集合；只有确实没配置选择才返回 None。
 
-    An unreadable record yields an empty set, never `None`: `ScopedCorpus` refuses an empty
-    set loudly, whereas `None` would mean "no selection" and let the run read everything.
-    """
+    记录损坏返回空集合，让 ScopedCorpus 明确拒绝；若返回 None 会被解释为不限范围，反而允许读取全部文件。"""
     if selection is None:
         return None
     try:
@@ -109,12 +92,9 @@ def allowed_ids(selection: dict | None) -> frozenset[str] | None:
 
 
 def document_id_of(url: str) -> str | None:
-    """The document-version id a `corpus://` URL names, or `None` for any other URL.
+    """从 corpus:// 地址提取文档版本 ID，其他地址返回 None。
 
-    Only the identity, never the span: what a selection admits is a document version, and
-    `Source.corpus_document_id` stores the whole fragment beside it (audit C3), so callers
-    must not compare that column to a selection directly.
-    """
+    这里只取身份，不取片段位置；不能把含完整片段的 Source.corpus_document_id 直接与选择集合比较。"""
     parts = urlsplit(url or "")
     if parts.scheme != "corpus" or not parts.netloc:
         return None
@@ -122,14 +102,9 @@ def document_id_of(url: str) -> str | None:
 
 
 def violations(selection: dict | None, urls: list[str]) -> list[str]:
-    """Every URL in `urls` that a run with this selection could not legitimately cite.
+    """找出冻结选择不允许引用的 URL，作为 ScopedCorpus 后的第二道检查（RFC V3.1 §8.5）。
 
-    The defence in depth behind `ScopedCorpus` (internal/rfcs/V3.1-corpus-scope.md §8.5):
-    the port should make a violation impossible, so finding one means a path around it
-    exists. In a run with a selection, a source is admissible only if it is a corpus URL
-    naming a selected version — a web URL is a violation too, since a selected-files run
-    reads nothing else. A run with no selection has nothing to violate.
-    """
+    只有指向所选版本的语料 URL 合法，网页 URL 也算越界。发现越界说明存在绕过端口的路径；未配置选择则无此限制。"""
     allowed = allowed_ids(selection)
     if allowed is None:
         return []

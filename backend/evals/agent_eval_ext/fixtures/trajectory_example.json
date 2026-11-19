@@ -1,0 +1,35 @@
+{
+  "expected": [
+    {
+      "name": "search_web",
+      "args": {
+        "query": "test"
+      }
+    },
+    {
+      "name": "read_page",
+      "args": {
+        "url": "https://example.org"
+      }
+    }
+  ],
+  "observed": [
+    {
+      "name": "search_web",
+      "args": {
+        "query": "test"
+      }
+    },
+    {
+      "name": "read_page",
+      "args": {
+        "url": "https://example.org"
+      }
+    }
+  ],
+  "mode": "strict",
+  "check_args": true,
+  "forbidden_tools": [
+    "delete_document"
+  ]
+}

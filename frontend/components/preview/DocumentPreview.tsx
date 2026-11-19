@@ -79,13 +79,13 @@ function TextDocument({ url, filename, kind }: { url: string; filename: string; 
     let cancelled = false;
     fetch(url, { credentials: isDesktop ? "omit" : "include", headers: { ...authHeaders() } })
       .then(async (res) => {
-        if (!res.ok) throw new Error(`Could not load this document (${res.status}).`);
+        if (!res.ok) throw new Error(`无法加载文档（状态码：${res.status}）。`);
         return res.text();
       })
       .then((body) => {
         if (cancelled) return;
         if (looksBinary(body)) {
-          setError("This file's contents don't look like text, so it can't be previewed here.");
+          setError("文件内容不是可识别的文本，无法在此预览。");
           return;
         }
         setText(body);
@@ -116,7 +116,7 @@ function TextDocument({ url, filename, kind }: { url: string; filename: string; 
             <div key={i} className="h-3.5 animate-pulse bg-bg-elevated" style={{ width: `${w}%` }} />
           ))}
         </div>
-        <span className="sr-only">Loading {filename}…</span>
+        <span className="sr-only">正在加载 {filename}…</span>
       </Frame>
     );
   }
@@ -129,7 +129,7 @@ function TextDocument({ url, filename, kind }: { url: string; filename: string; 
         // sandbox). This is the boundary; see the module docstring.
         sandbox=""
         srcDoc={text}
-        title={`${filename} (preview)`}
+        title={`${filename}（预览）`}
         className="h-full w-full border-0 bg-bg-surface"
         // The frame is untrusted content: stop it leaking where it was opened from.
         referrerPolicy="no-referrer"
@@ -176,7 +176,7 @@ function PdfDocument({ url, filename, page }: { url: string; filename: string; p
         setObjectUrl(created);
       })
       .catch((e: Error) => {
-        if (!cancelled) setError(`Could not load this document (${e.message}).`);
+        if (!cancelled) setError(`无法加载文档（${e.message}）。`);
       });
     return () => {
       cancelled = true;
@@ -196,7 +196,7 @@ function PdfDocument({ url, filename, page }: { url: string; filename: string; p
   if (objectUrl === null) {
     return (
       <Frame>
-        <span className="text-sm text-text-muted">Loading {filename}…</span>
+        <span className="text-sm text-text-muted">正在加载 {filename}…</span>
       </Frame>
     );
   }
@@ -205,12 +205,12 @@ function PdfDocument({ url, filename, page }: { url: string; filename: string; p
       data={page ? `${objectUrl}#page=${page}` : objectUrl}
       type="application/pdf"
       className="h-full w-full"
-      aria-label={`${filename} (PDF preview)`}
+      aria-label={`${filename}（PDF 预览）`}
     >
       {/* Shown when the browser has no PDF viewer, rather than a blank rectangle. */}
       <Frame>
         <p className="text-sm text-text-secondary">
-          Your browser can&apos;t display PDFs inline. Download it to read it.
+          当前浏览器无法直接预览 PDF，请下载后阅读。
         </p>
       </Frame>
     </object>
@@ -238,8 +238,7 @@ export function DocumentPreview({
     return (
       <Frame>
         <p className="text-sm text-text-secondary">
-          This document was added before original files were kept. Its text is still
-          searchable and citable — there is just no file to show.
+          此文档上传时尚未保留原文件。已提取的文本仍可检索和引用，但没有可预览的原文件。
         </p>
       </Frame>
     );
@@ -249,7 +248,7 @@ export function DocumentPreview({
     return (
       <Frame>
         <p className="text-sm text-text-secondary">
-          No preview for this file type. Download it to open in its own application.
+          暂不支持预览此类文件，请下载后使用相应应用打开。
         </p>
       </Frame>
     );

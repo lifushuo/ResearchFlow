@@ -1,22 +1,7 @@
-"""
-Human review, artifacts, and the audit log.
+"""人工审核、最终产物与审计模型。
 
-Three decisions are load-bearing here.
-
-**`reviews` is the only approval authority**. A partial unique index allows at
-most one approving report review per revision. Claim-level feedback lives in
-`claim_annotations`, which has no `decision` column and therefore cannot be mistaken for a
-second approval system.
-
-**An artifact exists only because an approving review exists.** `research_artifacts` carries
-a denormalised `review_decision` constrained to `'APPROVED'` and a *composite* foreign key to
-`reviews(id, decision)`. An artifact referencing a rework request is unrepresentable — the
-strongest available form of the rule, and portable, unlike a trigger.
-
-**`audit_events` has no foreign key to its subject.** That is not a limitation; an FK would
-delete the audit record together with the thing it documents, which is exactly when the
-record matters most.
-"""
+reviews 是唯一批准来源；结论批注没有 decision，不能当成另一套审批。最终产物通过冗余的批准状态与复合外键，只能引用真正的报告批准。
+审计事件不外键绑定被操作对象，避免删对象时同时抹掉审计。"""
 
 from __future__ import annotations
 
@@ -48,31 +33,21 @@ ANNOTATION_KINDS = ("FLAG_UNSUPPORTED", "REQUEST_EVIDENCE", "COMMENT")
 
 
 class Review(Base):
-    """A human decision about a specific versioned object — the trust boundary.
+    """人工对某个版本对象作出的决定，是系统信任边界。
 
-    `ON DELETE RESTRICT` rather than CASCADE, deliberately: a Review outlives its
-    subject, because deleting a run must not silently erase the record that a human approved
-    something. The restrict chain is also what stops the ordinary delete path from destroying
-    approved research — `DELETE run → CASCADE revisions → RESTRICT reviews` fails
-    at the restrict, and the application's only job is to turn that into a helpful message.
-    """
+    RESTRICT 外键阻止普通级联删除悄悄擦掉审核记录；需要删除时由明确的应用流程处理，而不是让数据库自动连带清空。"""
 
     __tablename__ = "reviews"
 
     id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
-    # A review belongs to the RUN, not only to whichever versioned object it judged
-    # . Without this, a run's approval chain cannot be collected at
-    # all: PLAN reviews hang off `research_plans` and REPORT reviews off `revisions`, so a
-    # single-parent read would silently omit every plan approval.
+    # 审核还必须关联整个 RUN，而不只是被审核版本。
+    # 计划挂在 research_plans、报告挂在 revisions；只查一个父表会漏掉另一关卡的决定。
     run_id: Mapped[uuid.UUID] = mapped_column(
         UuidType, ForeignKey("research_runs.id", ondelete="RESTRICT"), nullable=False
     )
-    # The total order of decisions within a run. Not `created_at` (the clock guarantees no
-    # distinctness and two gates can share a timestamp) and not insertion order (ids are
-    # uuid5, so id order is arbitrary). Migrated from the rank of `audit_log.id`.
+    # sequence 给同次运行的决定建立完整顺序。时间可能相同，uuid5 也没有插入顺序含义，不能拿它们排序代替。
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
-    # NULL for a PLAN review: `submit_plan` runs at AWAITING_PLAN, before any draft exists,
-    # so a plan approval with no revision to point at is normal.
+    # 计划审核发生在草稿生成前，因此 revision_id 为空是正常情况。
     revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UuidType, ForeignKey("revisions.id", ondelete="RESTRICT"), nullable=True
     )
@@ -85,26 +60,22 @@ class Review(Base):
     gate: Mapped[str] = mapped_column(String(8), nullable=False)
     decision: Mapped[str] = mapped_column(String(20), nullable=False)
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The hash's meaning follows `gate`, rather than one overloaded `draft_hash`. At the report
-    # gate it hashes `Revision.report_markdown`; at the plan gate, the plan's canonical
-    # serialisation — which used to share that one column, where nothing ever verified it.
+    # 哈希含义随 gate 区分：报告关卡绑定 Revision.report_markdown，计划关卡绑定标准化计划。
+    # 不能把两种含义混在一个未校验的 draft_hash 中。
     reviewed_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     __table_args__ = (
-        # Composite-FK target for `research_artifacts`. Carries `gate` as well as
-        # `decision`: once a PLAN review can exist without a revision, constraining only
-        # the decision would let a plan approval authorize an artifact.
+        # 产物复合外键同时引用审核的 gate 和 decision，只限制批准状态不足以排除计划批准。
         UniqueConstraint("id", "decision", "gate", name="uq_review_decision"),
         UniqueConstraint("run_id", "sequence", name="uq_review_sequence"),
         CheckConstraint(_in("gate", REVIEW_GATES), name="ck_review_gate"),
         CheckConstraint(_in("decision", REVIEW_DECISIONS), name="ck_review_decision"),
         CheckConstraint("length(reviewed_hash) = 64", name="ck_review_hash"),
         CheckConstraint("(gate = 'PLAN') = (plan_version_id IS NOT NULL)", name="ck_review_plan"),
-        # The mirror of ck_review_plan, and the whole of S1: a REPORT review must have a
-        # revision, a PLAN review must not.
+        # 报告审核必须有关联修订，计划审核必须没有，与 ck_review_plan 对应。
         CheckConstraint("(gate = 'REPORT') = (revision_id IS NOT NULL)", name="ck_review_report"),
         CheckConstraint("sequence >= 1", name="ck_review_sequence"),
         Index("ix_review_revision", "revision_id", "created_at"),
@@ -112,10 +83,8 @@ class Review(Base):
     )
 
 
-# At most one approving report review per revision. Declared
-# after the class because the predicate needs column objects. Both dialect keywords given —
-# omitting one silently makes the index total on that host, which would forbid a second
-# *rework* review and break the loop.
+# 每个修订最多一个报告批准，但允许多次返工审核。
+# 索引在类定义后配置，并同时指定两种数据库条件，避免误变为全表唯一而破坏返工。
 Index(
     "uq_review_approval",
     Review.__table__.c.revision_id,
@@ -128,13 +97,9 @@ Index(
 
 
 class ClaimAnnotation(Base):
-    """A reviewer's note on one claim. Advisory; carries no approval authority.
+    """审核者对单条结论的建议，不具有批准权。
 
-        Deliberately not a third `Review.gate` value: a row with no `decision` column cannot be
-        mistaken for an approval. Cascades with its claim, which means annotations do **not**
-        carry forward across revisions — the accepted cost of not manufacturing claim lineage
-    , visible here in the schema rather than hidden in a service.
-    """
+    不新增 Review.gate 类型，也没有 decision 字段。批注随结论级联删除，不自动跨修订继承，避免编造结论谱系。"""
 
     __tablename__ = "claim_annotations"
 
@@ -155,16 +120,10 @@ class ClaimAnnotation(Base):
 
 
 class ResearchArtifact(Base):
-    """The immutable, self-contained, hash-verifiable approved record.
+    """不可变、独立且可通过哈希验证的获批记录。
 
-    `payload` is a frozen snapshot, not a set of joins. Reading an artifact never
-    touches live tables, so a later project rename or run deletion cannot change it — which
-    is the property that makes it worth handing to someone who does not trust this database.
-
-    `owner_id` is the survival anchor. `run_id`, `project_id`, `revision_id` and `review_id`
-    all become NULL when their subject is deleted; without an owner the artifact would be
-    orphaned outside every tenant boundary.
-    """
+    payload 是冻结快照，不重新连接实时表读取；项目重命名或删除不能改变其内容。
+    owner_id 是持续保留的归属锚点；其他对象删除后 ID 可置空，产物仍不能脱离用户隔离。"""
 
     __tablename__ = "research_artifacts"
 
@@ -183,12 +142,10 @@ class ResearchArtifact(Base):
     )
     review_id: Mapped[uuid.UUID | None] = mapped_column(UuidType, nullable=True)
     review_decision: Mapped[str] = mapped_column(String(20), nullable=False)
-    # Denormalised beside `review_decision` for the same reason and by the same technique:
-    # it makes "this artifact was authorized by a plan approval" unrepresentable rather
-    # than merely discouraged.
+    # 冗余保存报告关卡并约束它，让计划批准无法授权产物，而不只是靠调用方自觉检查。
     review_gate: Mapped[str] = mapped_column(String(8), nullable=False, default="REPORT")
 
-    # `research_engine.bundle`'s format, unchanged — one schema, one verifier.
+    # 沿用 research_engine.bundle 格式，共用同一结构和校验器。
     format_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     payload: Mapped[dict] = mapped_column(JsonType, nullable=False)
     artifact_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -198,7 +155,7 @@ class ResearchArtifact(Base):
     )
 
     __table_args__ = (
-        # The load-bearing constraint of the whole schema: approval as a database fact.
+        # 关键数据库约束：批准必须是实际存在的审核事实。
         ForeignKeyConstraint(
             ["review_id", "review_decision", "review_gate"],
             ["reviews.id", "reviews.decision", "reviews.gate"],
@@ -206,19 +163,17 @@ class ResearchArtifact(Base):
             name="fk_artifact_review",
         ),
         CheckConstraint("review_decision = 'APPROVED'", name="ck_artifact_approved"),
-        # A PLAN approval can never reach here: the FK forces (decision, gate) to match a
-        # real review's pair, and this pins the gate to REPORT.
+        # 复合外键要求关卡与决定匹配真实审核，且关卡固定为 REPORT，计划批准无法通过。
         CheckConstraint("review_gate = 'REPORT'", name="ck_artifact_gate"),
         UniqueConstraint("artifact_hash", name="uq_artifact_hash"),
         CheckConstraint("format_version >= 1", name="ck_artifact_format"),
         CheckConstraint("length(artifact_hash) = 64", name="ck_artifact_hashlen"),
-        # Artifacts survive project deletion, so they cannot be reached by project.
+        # 产物在项目删除后仍可保留，因此不能靠项目关联作为唯一访问入口。
         Index("ix_artifact_owner", "owner_id", "created_at"),
     )
 
 
-# At most one artifact per run. Partial, so multiple orphaned artifacts stay legal after a
-# run is deleted and their `run_id` goes NULL.
+# 运行存在时最多一个产物；采用部分索引，让运行删除、run_id 变空后允许保留多个独立产物。
 Index(
     "uq_artifact_run",
     ResearchArtifact.__table__.c.run_id,
@@ -229,13 +184,9 @@ Index(
 
 
 class AuditEvent(Base):
-    """Append-only accountability log. Not the record of a decision — that is `Review`.
+    """只追加的责任审计记录；审核决定本身保存在 Review。
 
-    `(subject_type, subject_id)` is polymorphic and has no foreign key, deliberately: an
-    audit event may reference a row that has since been deleted, and that is precisely when
-    it is most needed. Nothing cascades into this table, so nothing deletes an event as a
-    side effect of deleting something else.
-    """
+    subject_type、subject_id 是多态且不设外键，使被操作对象删除后仍能保留审计，不受其他对象级联影响。"""
 
     __tablename__ = "audit_events"
 

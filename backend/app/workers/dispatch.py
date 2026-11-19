@@ -1,16 +1,6 @@
-"""
-The server's `RunDispatcher`: hand the run to a Celery worker over the broker.
+"""服务端的 Celery 运行调度实现，位于 Worker 层，不放进两个主机共用的协议模块。
 
-Lives here rather than in `app/run_dispatch.py` because that module is the *port*, and both
-hosts import it — a protocol that ships one host's adapter inside it makes every importer
-depend on that host's machinery. The desktop's implementation is `_SidecarDispatcher` in
-`desktop/sidecar.py`, next to the event loop it schedules on, for the same reason.
-
-Every import is still deferred to the call. `app.workers.tasks` pulls in Celery and the
-whole pipeline module tree, and `app/api/v1/runs.py` — which imports this module — is
-called by *both* hosts. An import at module scope here would reintroduce the packaged-app
-`ModuleNotFoundError` this seam exists to remove; `test_sidecar_startup` fails if it does.
-"""
+所有任务导入延迟到调用时，避免桌面导入共享路由时拉入未打包的 Celery。"""
 
 from __future__ import annotations
 
@@ -18,13 +8,9 @@ from app.run_dispatch import RunDispatcher, SessionDispatcher
 
 
 class CeleryDispatcher:
-    """The server's mechanism: hand the run to a worker over the broker.
+    """通过消息代理把研究运行交给 Worker。
 
-    Every import is deferred to the call. `app.workers.tasks` pulls in Celery and the whole
-    pipeline module tree, and this module is imported by the run routes on *both* hosts — an
-    import at module scope here would reintroduce the packaged-app `ModuleNotFoundError`
-    this seam exists to remove.
-    """
+    任务模块带入 Celery 和整套执行依赖，必须延迟导入，保证桌面可导入共用路由。"""
 
     async def start(self, run_id: str, user_id: str) -> None:
         from app.workers.tasks import run_research_pipeline
@@ -43,17 +29,14 @@ class CeleryDispatcher:
 
 
 def get_run_dispatcher() -> RunDispatcher:
-    """FastAPI dependency: the mechanism this deployment uses.
+    """FastAPI 注入当前部署的运行调度机制。
 
-    The server resolves it through `Depends`. The desktop sidecar calls the same handler
-    functions directly and passes its own dispatcher explicitly — the pattern it already
-    uses for `db` and `user`, so nothing about the handler changes shape per host.
-    """
+    桌面直接传自己的 dispatcher，与 db、user 参数一样，处理函数本身不区分主机。"""
     return CeleryDispatcher()
 
 
 class CelerySessionDispatcher:
-    """The server's session mechanism. Imports deferred, exactly as `CeleryDispatcher`."""
+    """服务端会话调度，和 CeleryDispatcher 一样延迟导入任务。"""
 
     async def start(self, session_id: str, user_id: str) -> None:
         from app.workers.tasks import run_agent_pipeline
@@ -74,5 +57,5 @@ class CelerySessionDispatcher:
 
 
 def get_session_dispatcher() -> SessionDispatcher:
-    """FastAPI dependency: how this deployment drives sessions."""
+    """为 FastAPI 注入当前部署的会话驱动方式。"""
     return CelerySessionDispatcher()

@@ -1,4 +1,4 @@
-"""Audit trail of human approval decisions (docs/01 principle 2, docs/05 §1)."""
+"""人工批准决定的审计记录（docs/01 原则 2，docs/05 §1）。"""
 
 import uuid
 from datetime import datetime
@@ -25,7 +25,7 @@ class AuditLog(Base):
     )
     action: Mapped[str] = mapped_column(
         String(30), nullable=False
-    )  # approved|rework_requested|abandoned
+    )  # 审核动作：approved（批准）、rework_requested（要求返工）、abandoned（放弃）。
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     draft_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

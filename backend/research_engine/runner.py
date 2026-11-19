@@ -1,28 +1,8 @@
-"""
-Host-independent pipeline orchestration (docs/13 §4–§5, docs/12 M6 step 3).
+"""不依赖宿主的图运行与恢复，见 docs/13 §4–§5、docs/12 M6。
 
-`app/workers/pipeline_runner.py` used to do six things at once: take a Redis lock, open a
-SQLAlchemy session, build a Postgres checkpointer, install the run's context, drive the
-graph, and write the result back to ORM models. Only *one* of those — installing context
-and driving the graph — is pipeline behaviour. The rest is the server host.
-
-This module is that one thing. It takes a ready checkpointer and the ports it needs,
-runs or resumes the graph, and returns a `RunOutcome` describing what happened. It never
-touches a database, a queue, or an ORM model, so the same code path serves the Celery
-worker (Postgres saver, Redis cache, `agent_logs` sink) and the desktop sidecar (SQLite
-saver, SQLite cache, in-process sink).
-
-What deliberately stays in the host:
-
-- **Constructing and `setup()`-ing the checkpointer.** Schema creation is a host concern;
-  the engine receives a saver that is ready to use.
-- **The run lock.** Guarding against double execution is scheduling, not pipeline
-  behaviour — see `ports.py`.
-- **Persisting the outcome, and emitting lifecycle events.** The host commits its own
-  session row and only then emits HITL_READY / COMPLETED / FAILED (via
-  `events.make_event`), which preserves today's guarantee that a client acting on a
-  terminal event never reads a stale status.
-"""
+只接收准备好的检查点与端口，安装上下文、驱动图并返回 RunOutcome。
+数据库会话、队列、锁、saver 构造与建表均由宿主负责。
+结果持久化和生命周期事件也归宿主：先提交状态，再通知客户端，避免终态事件后仍读到旧状态。"""
 
 from __future__ import annotations
 
@@ -45,24 +25,20 @@ from research_engine.runconfig import (
     set_run_config,
 )
 
-#: Two of these are pauses, not ends. `awaiting_plan` is the research design gate
-#: (internal/07 Phase 4) and `awaiting_approval` is the draft review gate — they are
-#: distinct values rather than one "paused" because they resume with different payloads
-#: and a host that conflated them would answer a plan edit by approving a draft that
-#: does not exist yet.
+#: awaiting_plan 是计划审核暂停，awaiting_approval 是草稿审核暂停。
+#: 两者恢复参数不同，混用会在尚无草稿时错误批准报告。
 RunStatus = Literal["awaiting_plan", "awaiting_approval", "completed", "failed"]
 
-#: The `type` each gate's `interrupt(...)` payload carries. `graph.plan_gate_node` and
-#: `graph.hitl_gate_node` are the producers; keep the two in step.
+#: 两个人工关卡 interrupt 载荷的 type，必须与图节点生产端一致。
 _PLAN_INTERRUPT = "PLAN_READY"
 
-# Matches the column width the server truncates error messages to.
+# 与服务端错误消息列的截断长度一致。
 _MAX_ERROR_CHARS = 500
 
 
 @dataclass(frozen=True)
 class RunOutcome:
-    """What one graph invocation produced. Plain data — no ORM, no host types."""
+    """一次图调用的结果，只有普通数据，不含 ORM 或宿主类型。"""
 
     status: RunStatus
     draft_report: str | None = None
@@ -74,16 +50,14 @@ class RunOutcome:
     rework_count: int = 0
     elapsed_seconds: float | None = None
     error: str | None = None
-    # What the planner proposed, carried out of the interrupt so the host can persist it
-    # and serve it to the reviewer. Populated only on `awaiting_plan`; empty elsewhere,
-    # which is the honest reading — a run that has not reached the gate has no proposal,
-    # and one past it has a *decision* (`Session.plan_json`), not a proposal.
+    # 仅在 awaiting_plan 携带规划提议，供宿主持久化及展示。
+    # 其他状态保持空：未到关卡无提议，过关后则已有决定而非仍待审提议。
     plan_tasks: list[dict] = field(default_factory=list)
     plan_outline: list[dict] = field(default_factory=list)
 
     @property
     def report(self) -> str | None:
-        """The best available report text: finalized if approved, else the draft."""
+        """返回当前最佳报告文本：有定稿则取定稿，否则取草稿。"""
         return self.final_report or self.draft_report
 
 
@@ -95,12 +69,9 @@ def _installed(
     cache: Cache | None,
     corpus: Corpus | None,
 ):
-    """Install the run's context, then unwind it in reverse order.
+    """安装运行上下文，并按相反顺序恢复。
 
-    Each of these is a ContextVar, so concurrent runs in one worker process stay
-    isolated from each other — that is what makes per-session model routing (docs/12 M8)
-    and per-user BYOK keys safe under concurrency.
-    """
+    各项使用 ContextVar，隔离同一进程的并发路由、预算与用户密钥。"""
     undo: list[tuple] = []
     try:
         if run_config is not None:
@@ -120,7 +91,7 @@ def _installed(
 
 
 def initial_state(*, session_id: str, user_id: str, query: str, depth: str = "balanced") -> dict:
-    """The graph's starting state for a fresh run."""
+    """构造新研究的图初始状态。"""
     return {
         "session_id": session_id,
         "user_id": user_id,
@@ -139,16 +110,10 @@ def initial_state(*, session_id: str, user_id: str, query: str, depth: str = "ba
 
 
 def _outcome(result: dict, state: dict) -> RunOutcome:
-    """Map final graph state onto a RunOutcome.
+    """将图状态映射为 RunOutcome。
 
-    Ordering matters: an interrupt is checked before `error`, because a run that paused
-    at a gate is awaiting a human, not failed.
-
-    The graph has two interrupts, so which one fired has to be read off the payload
-    rather than assumed. Assuming was safe while only `hitl_gate_node` existed; with the
-    plan gate added, an unconditional `awaiting_approval` would tell the host a draft was
-    ready when the run had not yet run a single search.
-    """
+    先检查中断再检查 error，因为等待人工不是失败。
+    从中断载荷读取关卡类型，不能默认草稿已完成；计划关卡时可能尚未搜索。"""
     totals = {
         "sources": state.get("sources") or [],
         "cost_usd": round(state.get("cost_usd", 0.0), 6),
@@ -162,9 +127,7 @@ def _outcome(result: dict, state: dict) -> RunOutcome:
         if payload.get("type") == _PLAN_INTERRUPT:
             return RunOutcome(
                 status="awaiting_plan",
-                # Read from the interrupt payload, not from state: this is specifically
-                # the proposal the reviewer is being shown, and it is what a later
-                # comparison against their edits has to be made against.
+                # 从中断载荷读取用户实际看到的提议，不能取可能已被修改的状态值。
                 plan_tasks=list(payload.get("tasks") or []),
                 plan_outline=list(payload.get("proposed_outline") or []),
                 **totals,
@@ -198,8 +161,7 @@ async def _drive(
 ) -> RunOutcome:
     config = {"configurable": {"thread_id": session_id}}
     with _installed(run_config, provider_keys, event_sink, cache, corpus):
-        # Before the graph, so an Offline run that cannot stay offline makes no model call
-        # at all — on a start and on every resume, since both enter here.
+        # 每次启动和恢复都先验证 Offline，保证不符合本地承诺时没有任何模型调用。
         refused = offline.refusal(
             get_run_config(), custom_base_url=llm_factory.api_key_for("custom_base_url")
         )
@@ -207,8 +169,7 @@ async def _drive(
             return RunOutcome(status="failed", error=refused)
         graph = build_graph(checkpointer)
         result = await graph.ainvoke(payload, config)
-        # An async checkpointer requires the async state getter; the sync `get_state()`
-        # raises when called from the running loop.
+        # 异步检查点必须使用异步状态读取器；运行中的事件循环不能调用同步 get_state。
         state = (await graph.aget_state(config)).values
     return _outcome(result, state)
 
@@ -226,7 +187,7 @@ async def run(
     cache: Cache | None = None,
     corpus: Corpus | None = None,
 ) -> RunOutcome:
-    """Run a fresh research session up to its first stop (the review gate, or failure)."""
+    """启动新研究，运行到首次暂停或失败。"""
     return await _drive(
         checkpointer=checkpointer,
         session_id=session_id,
@@ -252,22 +213,11 @@ async def resume(
     cache: Cache | None = None,
     corpus: Corpus | None = None,
 ) -> RunOutcome:
-    """Resume a session paused at a gate. Enters at the checkpoint — never replans.
+    """从人工关卡的检查点恢复，不重新规划。
 
-    One entry point, two decision shapes, because the graph has two interrupts:
-
-    - `approved=` (with optional `feedback`) resumes `hitl_gate_node` — approve the
-      draft, or send it back for rework.
-    - `plan={"tasks": [...], "outline": [...]}` resumes `plan_gate_node` with the
-      reviewer's edited research design. Both keys are optional and an absent key means
-      "unedited", so `plan={}` is a valid "approve as proposed" — distinct from
-      `{"tasks": []}`, which is a reviewer who excluded everything.
-
-    Exactly one must be given. There is no default: `approved` defaulting to True would
-    turn a malformed plan resume into an approval of a draft that does not exist, and
-    defaulting to False would count a phantom rework. Fail loudly instead — the caller
-    knows which gate its session is sitting at, because the status says so.
-    """
+    approved 配可选 feedback 用于草稿审批；plan 用于编辑计划，tasks 与 outline 均可省略。
+    plan={} 表示按原提议批准，tasks=[] 表示排除全部任务，两者不同。
+    两种决定必须且只能给一种，不设置默认批准，以免把错误恢复请求变成对不存在草稿的批准。"""
     if (approved is None) == (plan is None):
         raise ValueError(
             "resume() needs exactly one of `approved=` (draft review gate) or "

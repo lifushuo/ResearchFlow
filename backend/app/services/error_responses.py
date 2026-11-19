@@ -1,18 +1,6 @@
-"""
-The one place a domain refusal becomes an HTTP status, for both hosts.
+"""统一将领域错误映射为 HTTP 状态，供两个主机共用。
 
-Separate from `app/errors.py` on purpose, and the split is the point: the taxonomy is what
-the product means and belongs in the domain, while `404` is how one delivery mechanism says
-it. Same shape as `app/services/document_headers.py` and `app/services/sse.py` — shared
-transport policy, in a module both hosts import, with the reasoning attached.
-
-Both hosts install `install_error_handlers`, and
-`tests/workflow/test_error_contract_has_one_home.py` asserts they install *the same
-function object*, not two that agree today.
-
-FastAPI and stdlib only. Nothing here may import `app.config`, `app.db` or anything
-reaching them, or the packaged sidecar dies at import (#50).
-"""
+错误含义在 app/errors.py，传输方式在这里。只依赖 FastAPI 和标准库，不引入 app.config、app.db，避免破坏桌面导入。"""
 
 from __future__ import annotations
 
@@ -32,10 +20,9 @@ from app.errors import (
     Unprocessable,
 )
 
-#: The whole status contract, in one table.
+# 全部状态码契约集中在此映射表。
 #:
-#: Keyed by class rather than by class *name*: a rename would otherwise be a silent status
-#: change, which is the kind of edit that looks safe in review.
+# 以错误类对象而非类名作键，防止重命名意外改变状态码。
 ERROR_STATUS: dict[type[AppError], int] = {
     NotFound: 404,
     Conflict: 409,
@@ -46,18 +33,12 @@ ERROR_STATUS: dict[type[AppError], int] = {
     CapabilityUnavailable: 501,
 }
 
-#: What an unmapped error becomes. 500 rather than a friendlier default, because an error
-#: nobody assigned a status is a bug in this table, and a refusal that presents as a
-#: successful-looking 4xx would hide it.
+# 未映射错误按 500 处理，这是映射遗漏的程序缺陷，不能用看似正常的 4xx 掩盖。
 UNMAPPED_STATUS = 500
 
 
 def status_for(exc: AppError) -> int:
-    """The status for this error, honouring subclasses.
-
-    Walks the MRO so a future `RunNotFound(NotFound)` inherits `404` without an entry —
-    a subclass that means something narrower should not have to restate the contract.
-    """
+    """沿继承顺序查找状态映射；更具体的 NotFound 子类自然继承 404，无需重复登记。"""
     for cls in type(exc).__mro__:
         if cls in ERROR_STATUS:
             return ERROR_STATUS[cls]
@@ -65,16 +46,10 @@ def status_for(exc: AppError) -> int:
 
 
 def error_body(exc: AppError) -> dict:
-    """`{"detail": ...}` — the shape every client in this product already reads.
-
-    `detail` is FastAPI's own key for `HTTPException`, so this is deliberately not a new
-    envelope: the frontend's `ApiError` reads `err.detail`, and changing the shape would be
-    a client rewrite in exchange for nothing.
-    """
+    """沿用客户端已识别的 detail 响应结构，不另加包装层，避免无意义改变接口。"""
     body = {"detail": exc.detail}
     if isinstance(exc, CapabilityUnavailable):
-        # Machine-readable, so a client can branch on *which* capability is absent instead
-        # of matching prose.
+        # 提供机器可读的能力标识，客户端不必解析说明文字来判断缺少哪个功能。
         body["capability"] = exc.capability
     return body
 
@@ -84,34 +59,20 @@ async def _handle(_request: Request, exc: AppError) -> JSONResponse:
 
 
 def install_error_handlers(app) -> None:
-    """Teach one FastAPI app to translate domain refusals. Called by both hosts.
+    """为一个 FastAPI 应用安装领域错误处理器，两种主机共用。
 
-    **Any app that mounts `app/api/v1/runs.py` must call this.** Those handlers raise
-    domain errors, so without the translation every refusal surfaces as an unhandled 500 —
-    a 404 for someone else's run would read as a crash. `test_error_contract_has_one_home`
-    asserts both real hosts install it; a third mounting site is on its own, which is the
-    one cost of moving the status out of the handlers.
-    """
+    挂载 runs.py 的应用必须调用，否则业务拒绝会变成未处理的 500；例如越权应为 404，而不是崩溃。"""
     app.add_exception_handler(AppError, _handle)
 
 
-#: Exposed so a test can assert both hosts registered *this* handler rather than each
-#: having some handler of its own.
+# 公开此处理器供验证，确保两个主机注册的是同一函数，而不是各自实现。
 install_error_handlers.handler = _handle
 
 
 def body_validation_error(exc: ValidationError, *, at: tuple[str, ...]) -> RequestValidationError:
-    """A pydantic failure on part of a request body, raised the way FastAPI raises its own.
+    """把局部请求体的 Pydantic 校验失败转换成 FastAPI 标准请求错误。
 
-    Scope freeze §7: a refused preference is a 422 with an **identical body on both hosts**.
-    The server validates `PATCH /auth/me` as FastAPI parameters, so its body is FastAPI's —
-    every error located from `body`, carrying the rejected `input`, rendered by the default
-    handler. A host that validates part of a body itself (the desktop reads
-    `body["preferences"]` in order to merge it) refuses with that same body by raising this:
-    located the same way and rendered by the same default handler, so there is one renderer
-    rather than two that happen to agree. `include_url=False` because FastAPI's own
-    validation omits it; `tests/workflow/test_prompt_override_422_parity.py` compares the two.
-    """
+    桌面手动校验 preferences 时也应返回与服务端相同的 422：位置从 body 开始，携带拒绝输入，由默认处理器渲染，并省略额外 URL。"""
     return RequestValidationError(
         [{**err, "loc": ("body", *at, *err["loc"])} for err in exc.errors(include_url=False)]
     )

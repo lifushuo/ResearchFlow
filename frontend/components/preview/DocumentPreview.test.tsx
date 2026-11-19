@@ -42,7 +42,7 @@ describe("DocumentPreview security boundary", () => {
     respondWith("<h1>Hello</h1><script>parent.postMessage('pwned','*')</script>");
     render(<DocumentPreview url="/api/d/1" filename="page.html" downloadable />);
 
-    const frame = (await screen.findByTitle("page.html (preview)")) as HTMLIFrameElement;
+    const frame = (await screen.findByTitle("page.html（预览）")) as HTMLIFrameElement;
     // Empty string, not merely "not allow-scripts": an opaque origin with every
     // capability withheld. `allow-scripts` + `allow-same-origin` together would let the
     // frame remove its own sandbox, so neither may ever appear here.
@@ -86,7 +86,7 @@ describe("DocumentPreview security boundary", () => {
     });
     render(<DocumentPreview url="/api/d/3" filename="paper.pdf" downloadable page={4} />);
 
-    const object = await screen.findByLabelText("paper.pdf (PDF preview)");
+    const object = await screen.findByLabelText("paper.pdf（PDF 预览）");
     expect(object.getAttribute("type")).toBe("application/pdf");
     expect(created).toHaveLength(1);
     expect(created[0].type).toBe("application/pdf");
@@ -121,7 +121,7 @@ describe("DocumentPreview security boundary", () => {
 describe("DocumentPreview honest empty states", () => {
   it("says a document has no stored original instead of showing a blank pane", () => {
     render(<DocumentPreview url="/api/d/4" filename="old.pdf" downloadable={false} />);
-    expect(screen.getByText(/still\s+searchable and citable/i)).toBeInTheDocument();
+    expect(screen.getByText(/已提取的文本仍可检索和引用/)).toBeInTheDocument();
   });
 
   it("surfaces a failed load rather than an empty document", async () => {

@@ -1,24 +1,6 @@
-"""
-Marking a route as a thin adapter over a named owner.
+"""标记路由委托给哪个标准处理函数，只依赖标准库，供两种主机共用。
 
-`AGENTS.md`'s invariant is that a product operation is implemented once and exposed by both
-hosts through thin adapters. Nothing could check that: the desktop's run routes *do*
-delegate to `app/api/v1/runs.py`, but they delegate by calling an imported function inside a
-wrapper, and "this wrapper calls that function" is not something a test can read off an
-application object.
-
-`@delegates_to` makes it readable. It records the owner on the wrapper, so
-`tests/workflow/test_one_canonical_owner.py` can assert that both hosts' routes for one
-operation point at the **same function object** — which two copies of a function cannot do,
-however identical they look.
-
-It is a claim, not an enforcement: a wrapper could carry the marker and then do something
-else entirely. What stops that is the parity suite, which drives the operation on both
-hosts and compares the result to a recorded contract. The two work together — this says
-*who owns it*, the goldens say *what it does*.
-
-Stdlib only; both hosts import it.
-"""
+@delegates_to 记录 owner，让检查可以确认两个主机指向同一个函数对象，而非看似相同的两份实现。标记只声明归属，实际行为仍需两端契约回归验证。"""
 
 from __future__ import annotations
 
@@ -30,17 +12,9 @@ F = TypeVar("F", bound=Callable)
 
 
 def delegates_to(owner: str) -> Callable[[F], F]:
-    """Record that this route is an adapter over `owner`, and nothing more.
+    """记录路由包装器委托的 owner，不增加行为。
 
-    `owner` is a `"module:function"` string, not the function itself, and that is
-    load-bearing rather than stylistic. The desktop's run routes import their handlers
-    *inside* the request, because importing `app.api.v1.runs` at module scope reaches
-    `app.config` — which requires `database_url` and `jwt_secret_key`, neither of which an
-    installed app has, and which killed the packaged sidecar at launch (#50).
-
-    A decorator taking the function object would have to resolve it at import time and
-    would reintroduce exactly that. A string costs nothing until something asks.
-    """
+    owner 使用 module:function 字符串，避免装饰时立即导入服务端依赖链；桌面只在请求需要时解析共享处理函数。"""
 
     def mark(route: F) -> F:
         route.__canonical__ = owner
@@ -50,11 +24,9 @@ def delegates_to(owner: str) -> Callable[[F], F]:
 
 
 def canonical_owner(route: Callable) -> Callable:
-    """The function this route delegates to, or the route itself when it owns the operation.
+    """按需解析路由委托的标准函数；没有委托标记则返回路由自身。
 
-    Resolves the reference here rather than at decoration time — callers are tests and
-    tooling, where importing the owning module is free.
-    """
+    解析放在测试和工具调用时，不在装饰阶段导入。"""
     reference = getattr(route, "__canonical__", None)
     if reference is None:
         return route

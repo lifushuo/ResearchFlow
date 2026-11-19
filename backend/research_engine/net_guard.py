@@ -1,11 +1,7 @@
-"""
-SSRF guard for agent-controlled URL fetches (docs/architecture/06-security.md §3).
+"""代理可控 URL 的 SSRF 防护，见 docs/architecture/06-security.md §3。
 
-The URL passed to read_webpage is influenced by an LLM steered by untrusted web
-content, so it is treated as hostile: scheme/port allowlist, resolve every
-address and reject private/loopback/link-local ranges, and pin the connection to
-a validated IP to defeat DNS rebinding.
-"""
+模型可能受不可信网页影响，因此读取地址也视为不可信。
+检查协议和端口，解析全部 IP 并拒绝私网、回环、链路本地地址，再固定已验证 IP 连接以防 DNS 重绑定。"""
 
 from __future__ import annotations
 
@@ -18,7 +14,7 @@ _ALLOWED_PORTS = {80, 443, 8080, 8443}
 
 
 class SSRFBlocked(Exception):
-    """Raised when a URL fails the SSRF policy."""
+    """URL 不符合 SSRF 策略时抛出。"""
 
 
 def _ip_is_forbidden(ip: str) -> bool:
@@ -36,12 +32,9 @@ def _ip_is_forbidden(ip: str) -> bool:
 
 
 def validate_url(url: str) -> list[str]:
-    """
-    Validate a URL against the SSRF policy.
+    """按 SSRF 策略校验 URL，通过则返回可连接的 IP 列表，否则抛 SSRFBlocked。
 
-    Returns the list of resolved IPs (safe to connect to). Raises SSRFBlocked
-    with a reason otherwise. Call once per hop (redirects must re-validate).
-    """
+    每次重定向都需重新校验，不能只检查最初地址。"""
     if not url:
         raise SSRFBlocked("empty url")
 
@@ -59,14 +52,14 @@ def validate_url(url: str) -> list[str]:
     if port not in _ALLOWED_PORTS:
         raise SSRFBlocked(f"port {port} not allowed")
 
-    # Reject literal IPs in forbidden ranges before any DNS.
+    # 先检查字面 IP，禁止范围无需 DNS 解析即可拒绝。
     try:
         ipaddress.ip_address(host)
         if _ip_is_forbidden(host):
             raise SSRFBlocked(f"host IP {host} is in a forbidden range")
         return [host]
     except ValueError:
-        pass  # not a literal IP — resolve it
+        pass  # 不是字面 IP，继续解析域名。
 
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)

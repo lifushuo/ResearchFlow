@@ -11,22 +11,13 @@ import { RunCard } from "@/components/runs/RunCard";
 import { StartResearchForm } from "@/components/runs/StartResearchForm";
 import { useRuns } from "@/hooks/runs";
 
-/**
- * Research: ask a question, and see what this project has already established.
- *
- * Start and recent work live on one page deliberately. A research tool's first screen should
- * show what has already been established, not an empty box — the list is the reason to
- * trust the box.
- *
- * Project scoping comes from the switcher's context, not a second control here and not a
- * route param: one choice, one source of truth (frontend/AGENTS.md).
- */
+/** 研究页兼顾提出问题和查看项目已有成果。将发起入口与近期研究放在一起，让用户先看到已建立的知识。项目范围统一来自选择器上下文，不增加第二个控件或路由参数，保持单一信息来源（frontend/AGENTS.md）。 */
 export default function ResearchPage() {
-  // `useSearchParams` forces a client bailout, which a static export refuses to prerender
-  // without a boundary. The fallback must NOT be the same component — one that also reads
-  // the query string fails the export in exactly the same way, which is what `build:desktop`
-  // caught here and `build` did not. This is the third-target trap frontend/AGENTS.md
-  // describes: a branch is only exercised by the target that builds it.
+  // useSearchParams 会触发客户端渲染，静态导出需要边界；
+  // 兜底不能还是读取查询参数的同一组件，
+  // 否则 build:desktop 仍会在导出时失败，尽管普通 build 通过。
+  // 这是 frontend/AGENTS.md 说明的多构建目标陷阱：
+  // 一个分支只有在对应目标的构建中才真正受到检查。
   return (
     <Suspense fallback={<ResearchSkeleton />}>
       <ResearchPageInner />
@@ -39,28 +30,28 @@ function ResearchSkeleton() {
     <div className="space-y-8">
       <div className="h-8 w-48 animate-pulse bg-bg-elevated" aria-hidden />
       <div className="card h-64 animate-pulse" aria-hidden />
-      <span className="sr-only">Loading research…</span>
+      <span className="sr-only">正在加载研究…</span>
     </div>
   );
 }
 
 function ResearchPageInner() {
   const router = useRouter();
-  // Seeded by "Ask this question again" on a failed run. Read once, into form state.
+  // 从失败研究的再次提问链接初始化，仅在创建表单状态时读取一次。
   const params = useSearchParams();
   const seeded = params?.get("q") ?? "";
-  // A selection made on the Corpus page arrives as ids in the URL (never web storage); the
-  // server resolves and freezes it when the run is created.
+  // 语料库页的文件选择通过 URL 中的 ID 传入，不存入浏览器存储；
+  // 服务端在创建研究时解析并冻结范围。
   const list = (key: string) => (params?.get(key) ?? "").split(",").filter(Boolean);
   const selection = { folder_ids: list("folders"), doc_keys: list("files") };
-  // `activeId` is undefined while the switcher loads; scoped fetches hold off on that.
+  // 项目选择器加载期间 activeId 为 undefined，此时暂缓项目范围内的请求。
   const { activeId: projectId, active, isLoading: projectsLoading } = useActiveProject();
   const { data: runs, isLoading, isError, refetch } = useRuns(projectId ?? null);
 
   const waiting =
     runs?.filter((r) => r.status === "AWAITING_REVIEW" || r.status === "AWAITING_PLAN") ?? [];
-  // Anything already surfaced above is not repeated below. A run appearing twice on one
-  // screen reads as two runs, which is the opposite of what a list is for.
+  // 已在上方展示的研究不在下方重复，
+  // 避免同一屏中的两条记录被误认为两次研究。
   const promoted = new Set(waiting.map((r) => r.id));
   const rest = runs?.filter((r) => !promoted.has(r.id)) ?? [];
   const recent = rest.slice(0, 8);
@@ -76,12 +67,10 @@ function ResearchPageInner() {
           id="new-research"
           className="mb-1 font-serif text-2xl font-bold tracking-tight text-text-primary"
         >
-          Research
+          研究
         </h1>
         <p className="mb-5 max-w-2xl text-sm leading-relaxed text-text-muted">
-          Ask a question. What comes back is a report whose every claim traces to a piece of
-          evidence, a source, and a review decision you made — and a frozen artifact anyone
-          can check without trusting this app.
+          提出问题，获得可逐项追溯证据、来源和审核决定的报告；最终生成冻结的成果文件，任何人都可独立核查，无需信任本应用。
         </p>
 
         <StartResearchForm
@@ -97,7 +86,7 @@ function ResearchPageInner() {
             id="waiting-on-you"
             className="mb-3 font-serif text-lg font-bold tracking-tight text-text-primary"
           >
-            Waiting on you
+            等待你处理
           </h2>
           <ul className="grid gap-3.5 sm:grid-cols-2">
             {waiting.map((r) => (
@@ -115,15 +104,15 @@ function ResearchPageInner() {
             id="recent-research"
             className="font-serif text-lg font-bold tracking-tight text-text-primary"
           >
-            Earlier in this project
+            本项目的历史研究
           </h2>
           <div className="flex items-baseline gap-3">
             {active && (
-              <span className="font-mono text-xs text-text-muted">in {active.name}</span>
+              <span className="font-mono text-xs text-text-muted">所属项目：{active.name}</span>
             )}
             {rest.length > recent.length && (
               <Link href="/history" className="font-mono text-xs text-accent hover:underline">
-                All research →
+                全部研究 →
               </Link>
             )}
           </div>
@@ -134,25 +123,25 @@ function ResearchPageInner() {
             {[0, 1].map((i) => (
               <div key={i} className="card h-28 animate-pulse" aria-hidden />
             ))}
-            <span className="sr-only">Loading this project&apos;s research…</span>
+            <span className="sr-only">正在加载本项目的研究…</span>
           </div>
         ) : isError ? (
           <EmptyState
-            title="Couldn't load this project's research"
-            description="The list request failed. Your runs are not lost — this page could not read them."
+            title="无法加载本项目的研究"
+            description="列表请求失败，研究记录仍然存在，只是此页未能读取。"
             action={
               <button type="button" onClick={() => refetch()} className="btn btn-secondary">
-                Try again
+                重试
               </button>
             }
           />
         ) : recent.length === 0 ? (
           <EmptyState
-            title={waiting.length > 0 ? "Nothing else here yet" : "No research yet"}
+            title={waiting.length > 0 ? "暂时没有其他研究" : "尚无研究"}
             description={
               waiting.length > 0
-                ? "Every run in this project is waiting for a decision from you, above."
-                : "Ask your first question above. Every run you start appears here with its review state and whether it produced a verified artifact."
+                ? "本项目的全部研究都在上方等待你的决定。"
+                : "在上方提出第一个问题。每次研究都会在这里显示审核状态及是否生成可验证成果。"
             }
           />
         ) : (

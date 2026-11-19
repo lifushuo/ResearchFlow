@@ -1,26 +1,7 @@
-"""
-Reopening a document a run or session cited, wherever that document lives now
-(internal/rfcs/V3.1-corpus-scope.md §7.3, "Historical citations across projects"; AC-27).
+"""重新打开本次运行或会话曾引用的特定文档版本（RFC V3.1 §7.3，AC-27）。
 
-On the desktop, every document uploaded before 3.1 moved into one project, "Documents from
-before 3.1". A report in any other project that quoted one of them keeps its evidence, but
-its own project's corpus no longer holds the file. So the per-project routes answer "no
-longer in the corpus" for a document that still exists.
-
-This module is the narrow way back, and it deliberately grants no access to the project
-the document now lives in:
-- **What may be opened** is decided by the caller's own run or session: only a version it
-  recorded as a corpus source, by id. Where it recorded a hash (a 3.1 selection), the stored
-  version must still match it.
-- **Where to look** is decided by the host, from the row: the run's own project, then on the
-  desktop the legacy project. Never from a project id the client supplies. When the run
-  recorded which corpus it read, a store with any other identity is skipped.
-- **What comes back** is that one version, through the store's own `extracted`/`blob`.
-  There is no listing, no search and no other version.
-
-Every refusal reads the same as a missing document, so a probe cannot tell "not yours"
-from "not there". Host-agnostic: no FastAPI here, so the server and the desktop share it.
-"""
+桌面旧文档迁移到历史项目后，原报告仍需能打开引用。允许读取的版本由调用方自己的来源记录决定，不能用客户端指定项目扩大权限；冻结过哈希的版本必须匹配。
+主机决定查找原项目和合法历史项目，身份不匹配则跳过。只返回那一个版本，不提供其他项目列表或搜索。所有拒绝表现为文档不存在，两种主机共用。"""
 
 from __future__ import annotations
 
@@ -31,19 +12,17 @@ from app.services.corpus_selection import document_id_of
 
 
 def no_other_projects() -> list[uuid.UUID]:
-    """Where else a cited document may live on the server: nowhere. Its projects were never
-    pooled, so a run's corpus documents are always in its own project's store. The desktop
-    passes its legacy project instead (`desktop/corpus_layout.py::legacy_project_id`)."""
+    """服务端没有旧共用语料项目，不额外搜索其他项目；桌面可传入其合法迁移历史项目。"""
     return []
 
 
 def recorded_ids(urls: Iterable[str | None]) -> set[str]:
-    """The document-version ids a run or session cited, from its recorded source URLs."""
+    """从本运行或会话记录的来源 URL 提取引用过的文档版本 ID。"""
     return {doc for url in urls if (doc := document_id_of(url or "")) is not None}
 
 
 def recorded_hashes(selection: dict | None) -> dict[str, str]:
-    """`document_id → sha256` for each version a frozen selection pinned. Empty before 3.1."""
+    """冻结选择中的文档版本 ID 到 SHA-256 映射；3.1 前为空。"""
     try:
         return {
             str(item["document_id"]): str(item["sha256"])
@@ -63,7 +42,7 @@ async def store_holding(
     corpus_id: str | None,
     projects: list[uuid.UUID],
 ):
-    """The store that holds `document_id` for this caller, or `None` for every refusal."""
+    """寻找持有目标文档且允许调用方访问的存储；所有拒绝均返回 None。"""
     if document_id not in cited:
         return None
     for project_id in dict.fromkeys(projects):

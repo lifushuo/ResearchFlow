@@ -10,6 +10,9 @@ colliding name in the first place.
 """
 
 import os
+import sys
+
+import pytest
 
 # See test_evals_support_rate.py — importing `evals.harness` runs `load_env_file()` at
 # module scope and would leak .env into os.environ for the whole session.
@@ -82,3 +85,76 @@ def test_fake_mode_records_no_model_ids(monkeypatch, tmp_path):
     )
     assert "google:gemini-2.5-flash" not in str(models)
     assert "_note" in models
+
+
+@pytest.mark.parametrize("real_mode", [False, True])
+async def test_readonly_output_refuses_before_any_query(monkeypatch, tmp_path, real_mode, capsys):
+    _route(monkeypatch, tmp_path, "google:gemini-2.5-flash", mode="real" if real_mode else "fake")
+    argv = ["harness", "--limit", "1"]
+    if real_mode:
+        argv += ["--judge", "custom:kimi-k3"]
+    monkeypatch.setattr(sys, "argv", argv)
+    called = []
+
+    async def run_one(*args, **kwargs):
+        called.append(True)
+        pytest.fail("输出目录检查失败后仍启动了研究")
+
+    def deny_creation(*args, **kwargs):
+        raise PermissionError("read-only Docker mount")
+
+    monkeypatch.setattr(harness, "run_one", run_one)
+    monkeypatch.setattr(harness.tempfile, "NamedTemporaryFile", deny_creation)
+    with pytest.raises(SystemExit) as exc:
+        await harness.main()
+    assert exc.value.code == 2
+    assert called == []
+    assert "no queries were run" in capsys.readouterr().err
+
+
+async def test_existing_explicit_output_refuses_before_any_query(monkeypatch, tmp_path):
+    _route(monkeypatch, tmp_path, "google:gemini-2.5-flash", mode="fake")
+    out = tmp_path / "existing.json"
+    out.write_text('{"original": true}')
+    monkeypatch.setattr(sys, "argv", ["harness", "--out", str(out)])
+
+    async def run_one(*args, **kwargs):
+        pytest.fail("文件名冲突后仍启动了研究")
+
+    monkeypatch.setattr(harness, "run_one", run_one)
+    with pytest.raises(SystemExit, match="write-once"):
+        await harness.main()
+    assert out.read_text() == '{"original": true}'
+
+
+async def test_custom_output_does_not_need_the_default_results_directory(monkeypatch, tmp_path):
+    import json
+
+    _route(monkeypatch, tmp_path / "default-is-a-file", "google:gemini-2.5-flash", mode="fake")
+    harness.RESULTS_DIR.write_text("not a directory")
+    out = tmp_path / "writable" / "eval.json"
+    monkeypatch.setattr(sys, "argv", ["harness", "--limit", "1", "--out", str(out)])
+
+    async def run_one(query):
+        return {"id": query["id"], "completed": True, "latency_s": 1.0}
+
+    monkeypatch.setattr(harness, "run_one", run_one)
+    await harness.main()
+    assert json.loads(out.read_text())["llm_mode"] == "fake"
+    assert harness.RESULTS_DIR.read_text() == "not a directory"
+    assert list(out.parent.glob(".eval-write-check-*")) == []
+
+
+async def test_concurrent_result_creation_never_overwrites_evidence(monkeypatch, tmp_path):
+    _route(monkeypatch, tmp_path, "google:gemini-2.5-flash", mode="fake")
+    out = tmp_path / "contended.json"
+    monkeypatch.setattr(sys, "argv", ["harness", "--limit", "1", "--out", str(out)])
+
+    async def run_one(query):
+        out.write_text('{"other_run": true}')
+        return {"id": query["id"], "completed": True, "latency_s": 1.0}
+
+    monkeypatch.setattr(harness, "run_one", run_one)
+    with pytest.raises(FileExistsError):
+        await harness.main()
+    assert out.read_text() == '{"other_run": true}'

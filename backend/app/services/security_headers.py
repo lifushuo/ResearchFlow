@@ -1,9 +1,6 @@
-"""
-Security-headers middleware (docs/architecture/06-security.md §6).
+"""API 安全响应头中间件（docs/architecture/06-security.md §6）。
 
-Applied to every API response. The frontend sets its own headers via next.config
-(docs/07); these protect the API and any directly-served responses.
-"""
+应用到所有 API 及直接响应；前端自身的响应头由 next.config 单独配置。"""
 
 from __future__ import annotations
 
@@ -18,7 +15,7 @@ _HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-    # API serves JSON only; lock scripting/framing down hard.
+    # API 主要提供 JSON，严格限制脚本执行与页面嵌入。
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
 }
 

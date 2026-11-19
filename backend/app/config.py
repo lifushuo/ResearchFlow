@@ -1,9 +1,6 @@
-"""
-Application settings.
+"""应用配置统一来自环境变量，开发时也可读取 ../.env。
 
-All configuration comes from environment variables (or ../.env in dev).
-Startup validation fails fast on dangerous values (docs/09 §3, docs/06 §7).
-"""
+启动时尽早拒绝危险配置（docs/09 §3，docs/06 §7）。"""
 
 from functools import lru_cache
 from pathlib import Path
@@ -12,7 +9,7 @@ from typing import Literal
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Well-known placeholder secrets that must never reach runtime.
+# 常见占位密钥，禁止带入实际运行。
 _PLACEHOLDER_SECRETS = {
     "change-me-to-a-long-random-secret-string-in-production",
     "changeme",
@@ -20,8 +17,7 @@ _PLACEHOLDER_SECRETS = {
     "dev-secret",
 }
 
-# Providers that run without an API key (local inference), so the production
-# key-presence check must not demand one for them.
+# 本地推理供应商不需要 API 密钥，生产环境校验也不能强制要求。
 _KEYLESS_PROVIDERS = {"ollama", "custom"}
 
 
@@ -33,12 +29,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Environment ────────────────────────────────────────────────────────────
+    # 运行环境
     environment: Literal["development", "production", "test"] = "development"
-    # fake = deterministic scripted LLMs + fixture retrievers (tests/CI)
+    # fake 使用固定脚本模型和受控检索数据，供测试及 CI 使用。
     llm_mode: Literal["real", "fake"] = "real"
 
-    # ── LLM providers (BYOK) ───────────────────────────────────────────────────
+    # 模型供应商与用户自带密钥
     google_api_key: str = ""
     anthropic_api_key: str = ""
     openai_api_key: str = ""
@@ -46,93 +42,73 @@ class Settings(BaseSettings):
     custom_api_key: str = ""
     custom_base_url: str = ""
 
-    # ── Model routing: "provider:model" (docs/04 §7) ──────────────────────────
+    # 模型路由格式为 provider:model（docs/04 §7）
     model_planner: str = "google:gemini-2.5-pro"
     model_executor: str = "google:gemini-2.5-flash"
     model_critic: str = "google:gemini-2.5-flash"
     model_synthesizer: str = "google:gemini-2.5-pro"
     model_chat: str = "google:gemini-2.5-flash"
 
-    # ── Local LLM (Ollama) ─────────────────────────────────────────────────────
-    # OpenAI-compatible endpoint of a local (or LAN) Ollama server. When the app
-    # runs in Docker, use http://host.docker.internal:11434/v1 to reach an Ollama
-    # running on the host machine (localhost inside a container is the container).
+    # 本地或局域网 Ollama 的 OpenAI 兼容端点。
+    # Docker 内访问宿主机通常使用 http://host.docker.internal:11434/v1；容器中的 localhost 指容器自身。
     ollama_base_url: str = "http://localhost:11434/v1"
 
-    # ── Project memory / embeddings (docs/14 §4) ───────────────────────────────
-    # Which provider turns approved reports into vectors. "auto" prefers a local
-    # Ollama — free, no egress, and the reason a fully local deployment can still
-    # do private retrieval — and falls back to whichever hosted provider has a key.
-    # "none" disables ingestion and project chat rather than degrading them.
+    # 项目记忆与向量化（docs/14 §4）。
+    # 指定将获批报告转成向量的供应商。auto 优先本地 Ollama，再回退有密钥的远程服务。
+    # none 表示禁用记忆摄取和项目聊天，不暗中换成其他证据来源。
     embeddings_provider: Literal["auto", "ollama", "google", "openai", "none"] = "auto"
-    # Blank means the provider's documented default. Changing this makes existing
-    # chunks invisible until they are re-indexed: vectors from different models are
-    # not comparable even at equal width, so retrieval filters on the model that
-    # produced them. `GET /projects/{id}/memory/status` reports the mismatch.
+    # 留空使用供应商默认向量模型。更换模型后旧片段需重建索引；即使维度相同也不能混用不同模型的向量。
+    # 检索按模型过滤，项目 memory/status 会披露不匹配情况。
     embeddings_model: str = ""
 
-    # ── Search retrievers ──────────────────────────────────────────────────────
+    # 搜索与检索配置
     tavily_api_key: str = ""
     brave_api_key: str = ""
 
-    # ── Data stores ────────────────────────────────────────────────────────────
+    # 数据存储配置
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
-    # Relative by default, which is fine in Docker (WORKDIR is fixed) and a trap outside
-    # it: resolved against the process working directory, running from the repo root and
-    # from `backend/` produced two different corpus roots, so a document uploaded by one
-    # was invisible to the other. Read it through `corpus_path` below, never directly.
+    # 原始目录默认可为相对路径，但不可直接使用。
+    # 不同进程工作目录不同会产生两个语料根目录；必须通过下面的 corpus_path 取得统一绝对路径。
     corpus_dir: str = "data/corpus"
 
-    # ── Auth ───────────────────────────────────────────────────────────────────
+    # 身份认证配置
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 15
     jwt_refresh_token_expire_days: int = 14
     require_email_verification: bool = False
-    # Encrypts user-supplied BYOK provider keys at rest. Falls back to
-    # jwt_secret_key (domain-separated via HKDF) so self-hosters need no extra
-    # setup; set it explicitly to rotate JWTs without invalidating stored keys.
+    # 加密用户自带密钥。默认通过 HKDF 从 jwt_secret_key 派生独立用途的密钥。
+    # 可单独配置，以便轮换 JWT 密钥时不影响已存模型密钥解密。
     encryption_key: str = ""
 
-    # ── BYOK / usage limits ────────────────────────────────────────────────────
-    # Default monthly token ceiling applied to new users (0 = unlimited). Public
-    # deployments should set this so one account can't drain a shared server key.
+    # 新用户的默认月度 Token 上限，0 表示不限。公开部署应设置限额，避免单个账号耗尽共用密钥额度。
     default_monthly_token_limit: int = 0
 
-    # ── Agent budgets (docs/04 §6) ─────────────────────────────────────────────
-    # 0 = unlimited, for all three (docs/04 §6) — the same convention as the rate limits.
-    # Unlimited by default: the dollar cap cannot act as a backstop on openrouter/custom,
-    # where `estimate_cost()` returns 0.0, so a shipped default only ever killed runs on
-    # the providers it *could* measure. Set these when a deployment wants a hard stop; cap
-    # real spend at the provider. Mirrored in `research_engine/local.py` — change both.
+    # 代理预算：费用、时长和输入 Token 都采用 0 表示不限（docs/04 §6）。
+    # openrouter/custom 的本地费用估算为 0，不能依赖它作为实际费用兜底；真实开支还需在供应商侧限制。
+    # 本地配置路径 research_engine/local.py 使用相同规则，修改时两处同步。
     max_critic_loops: int = 2
     max_cost_per_session_usd: float = 0.0
     max_wallclock_seconds: int = 0
     max_input_tokens: int = 0
-    # Research tasks run concurrently within a round (docs/12 M7). 1 = strictly
-    # sequential, which is the only setting where budget overshoot is impossible.
+    # 同一轮内研究任务可并发。1 表示严格串行，只有串行才能避免并发任务同时消耗预算导致超支（docs/12 M7）。
     max_parallel_tasks: int = 4
     celery_task_timeout_seconds: int = 660
 
-    # ── Per-user usage limits (docs/06 §2) ─────────────────────────────────────
-    # 0 = unlimited, and unlimited is the default. These are abuse guards for a
-    # multi-tenant deployment, not safety limits: this ships as a self-hosted,
-    # single-tenant app where the operator is the only user and pays their own
-    # provider bill, so throttling them protects nobody. A public demo should set
-    # both to a positive number.
+    # 用户用量限制默认 0 表示不限，用于多用户公开部署防滥用。
+    # 自托管单用户自己承担费用，不默认限流；公开演示应为两个限制设置正值（docs/06 §2）。
     #
-    # Deliberately NOT covering login/register — those limits are brute-force
-    # protection, a different concern, and stay on unconditionally.
+    # 不包含登录和注册，它们的限流用于防暴力破解，始终启用。
     research_rate_limit_per_hour: int = 0
     chat_rate_limit_per_hour: int = 0
 
-    # ── LangSmith (optional) ───────────────────────────────────────────────────
+    # 可选 LangSmith 追踪
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
     langchain_project: str = "multi-agent-research-assistant"
 
-    # ── Frontend origin (dev only; prod uses the same-origin proxy) ────────────
+    # 仅开发使用前端跨域来源；生产通过同源代理访问。
     frontend_url: str = "http://localhost:3031"
 
     @model_validator(mode="after")
@@ -164,7 +140,7 @@ class Settings(BaseSettings):
             }
             for provider in routed_providers:
                 if provider in _KEYLESS_PROVIDERS:
-                    continue  # local inference (e.g. Ollama) needs no key
+                    continue  # 本地推理（如 Ollama）不需要密钥。
                 if not provider_keys.get(provider, ""):
                     raise ValueError(
                         f"Model routing uses provider '{provider}' but no API key is "
@@ -178,20 +154,13 @@ class Settings(BaseSettings):
 
     @property
     def corpus_path(self) -> Path:
-        """Where per-project corpus databases live, as an absolute path.
+        """返回项目语料库的统一绝对目录。
 
-        A relative `corpus_dir` is anchored to the backend package root rather than the
-        process working directory, so the answer does not depend on where the server
-        happened to be started from. An absolute setting is honoured as given.
-
-        This is a data-location bug, which is the expensive kind: nothing errors, the
-        upload succeeds, and the document is simply not there when the next process looks
-        for it under a different root.
-        """
+        相对 corpus_dir 以 backend 包根目录为基准，而不是进程启动位置；绝对路径原样使用。否则不同入口虽都能成功写入，却会在不同目录查找同一文档。"""
         configured = Path(self.corpus_dir)
         if configured.is_absolute():
             return configured
-        # config.py lives at <backend>/app/config.py, so parents[1] is <backend>.
+        # config.py 位于 backend/app，parents[1] 就是 backend 根目录。
         return Path(__file__).resolve().parents[1] / configured
 
 

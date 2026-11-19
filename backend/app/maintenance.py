@@ -1,19 +1,6 @@
-"""
-One-off maintenance commands (internal/07 Phase 7).
+"""一次性维护命令，默认只预览，传 --apply 才写入（internal/07 Phase 7）。
 
-    python -m app.maintenance backfill-citation-rate [--apply]
-
-Dry-run by default. A command that writes to a production table on the strength of being
-typed correctly is a command that eventually gets typed by accident.
-
-**Backfilling a measurement is not the same as inventing one.** Migration 0015 added
-`citation_resolution_rate` with no default and no backfill on purpose: the value is
-recorded at finalize from a live outcome, and a migration that guessed one would be the
-unmeasured-as-zero bug with a version number. What this does is narrower — it recomputes
-from the report and sources *already stored on the row*, and only where the measurement
-was never taken. Where it cannot be taken (a report that made no citable claims) the row
-stays NULL, because "nothing to measure" and "everything failed" are opposite findings.
-"""
+backfill-citation-rate 只用已存报告和来源补算从未测量的引用解析率，不覆盖已有实测值。没有可引用结论时仍保留 NULL，不能编造零分。"""
 
 from __future__ import annotations
 
@@ -31,31 +18,16 @@ logger = structlog.get_logger()
 
 @dataclass(frozen=True)
 class BackfillPlan:
-    """One row that would change, and what it would change to.
-
-    Carries the row's index rather than the row so a caller can print the plan, count it,
-    and decide — the dry run is the point, not a courtesy.
-    """
+    """一条拟修改记录及其目标值。保存行索引而非 ORM 对象，方便先展示方案、计数，再决定是否应用。"""
 
     index: int
     rate: float
 
 
 def plan_backfill(sessions: list[Session]) -> list[BackfillPlan]:
-    """Which sessions can be measured from what is already stored, and to what.
+    """仅根据已有数据制定引用解析率补算方案，不访问数据库。
 
-    Pure, so the rules below are testable without a database — they are the whole of the
-    command's judgement:
-
-    - **COMPLETED only.** A draft is not a report; measuring one would publish a number
-      for text no human approved, and it would change under the reader on approval.
-    - **Never overwrite.** A rate recorded at finalize was computed against the live
-      outcome; recomputing from a stored report is second-hand, so an existing value wins.
-    - **No citations stays NULL.** `resolution_rate` returns `None` for a report with no
-      markers, and that `None` is a finding, not a gap to fill.
-    - **All-dangling records 0.0.** That *is* a measurement — the ⚠-chip case — and it
-      has to be findable in History rather than hidden as unmeasured.
-    """
+    只处理 COMPLETED，不测未批准草稿；已有指标不覆盖；没有引用保持 NULL；引用全部无法解析才是实测 0.0。"""
     plans: list[BackfillPlan] = []
     for i, s in enumerate(sessions):
         if s.status != SessionStatus.COMPLETED:
@@ -72,7 +44,7 @@ def plan_backfill(sessions: list[Session]) -> list[BackfillPlan]:
 
 
 async def backfill_citation_rate(*, apply: bool) -> int:
-    """Recompute the rate for completed sessions that never had one. Returns the count."""
+    """为从未测量的已完成会话补算引用解析率，返回修改条数。"""
     from sqlalchemy import select
 
     from app.db.base import AsyncSessionLocal, engine
@@ -135,5 +107,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover — entry point
+if __name__ == "__main__":  # pragma: no cover — 命令行入口
     raise SystemExit(main())

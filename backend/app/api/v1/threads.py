@@ -1,21 +1,7 @@
-"""
-Project chat: threads, retrieval, and cited answers (docs/14 §5, §8).
+"""项目聊天：基于项目内获批研究检索和带引用回答（docs/14 §5、§8）。
 
-This is the milestone's payload — chat over a project's *approved* research, where every
-claim resolves to a report a human signed off on.
-
-**Isolation is the SQL predicate in `memory.retrieve`, not a sentence in the prompt.**
-The prompt does tell the model to answer only from what it was given, and that matters
-for answer quality; it is not what stops project A's research reaching project B's chat.
-A prompt instruction is not a security control (docs/06 §4). Ownership is checked, the
-query is filtered by `project_id`, and only then does any text reach a model.
-
-**Retrieved excerpts are untrusted input.** They originate from web pages fetched during
-research, so an injection captured months ago is still an injection when it resurfaces
-here — arguably a worse one, since nobody is watching the run any more. They are wrapped
-in `<untrusted_web_content>` unconditionally, exactly as the retriever's output is during
-a run.
-"""
+隔离由 memory.retrieve 的 project_id 查询条件保证，不靠提示词承诺。先校验归属并过滤项目，再把内容交给模型。
+检索片段源自网页，始终是不可信输入，统一包在 untrusted_web_content 中，避免历史页面注入在聊天中重新生效。"""
 
 from __future__ import annotations
 
@@ -59,11 +45,7 @@ router = APIRouter(tags=["Project chat"])
 
 
 async def _owned_thread(db: AsyncSession, thread_id: uuid.UUID, user_id: uuid.UUID) -> ChatThread:
-    """A thread this user owns, or 404.
-
-    Joined through `projects` so a thread in someone else's project is indistinguishable
-    from one that does not exist — the same shape as every other ownership check here.
-    """
+    """通过项目归属验证聊天线程，非当前用户拥有或不存在都返回 404，避免泄露他人线程。"""
     thread = (
         await db.execute(
             select(ChatThread)
@@ -87,7 +69,7 @@ async def _message_counts(db: AsyncSession, thread_ids: list[uuid.UUID]) -> dict
     return {tid: n for tid, n in rows.all()}
 
 
-# ── Threads ────────────────────────────────────────────────────────────────────────
+# 聊天线程管理
 
 
 @router.get("/projects/{project_id}/threads", response_model=ThreadListResponse)
@@ -154,7 +136,7 @@ async def delete_thread(
     current_user: User = Depends(get_current_user),
 ):
     thread = await _owned_thread(db, thread_id, current_user.id)
-    await db.delete(thread)  # messages cascade
+    await db.delete(thread)  # 消息随线程级联删除。
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -179,16 +161,13 @@ async def thread_history(
     )
 
 
-# ── The cited answer ───────────────────────────────────────────────────────────────
+# 带引用的回答
 
 
 def _grounding(retrieved: list[memory.Retrieved]) -> tuple[str, list[dict]]:
-    """Numbered excerpts for the prompt, and the citations they resolve to.
+    """按检索顺序给片段编号，并建立引用映射；R1 是最近匹配。
 
-    Marker order is retrieval order, so [R1] is the nearest match. Citations are built
-    here — before the model runs — because they describe what was *retrieved*, which is a
-    fact, rather than what the model chose to cite, which is a claim.
-    """
+    在模型回答前生成，因为检索到哪些内容是已知事实，与模型最终选择引用哪些内容不同。"""
     blocks: list[str] = []
     citations: list[dict] = []
     for index, hit in enumerate(retrieved, start=1):
@@ -201,9 +180,7 @@ def _grounding(retrieved: list[memory.Retrieved]) -> tuple[str, list[dict]]:
         citations.append(
             {
                 "marker": marker,
-                # `report_id`, not `session_id`: memory indexes reports from either run
-                # table, and naming the field after one of them made the payload claim an
-                # identity half of it does not have.
+                # 使用 report_id 而非 session_id；记忆可能来自会话或研究运行，不能把两者都冒称为会话。
                 "report_id": str(report.id),
                 "report_kind": report.kind,
                 "title": report.title,
@@ -222,30 +199,23 @@ async def send_thread_message(
     current_user: User = Depends(get_current_user),
     _rl: None = Depends(enforce_chat_rate_limit),
 ):
-    """Answer a question from this project's approved research, with citations."""
+    """从项目获批研究回答问题，并提供引用。"""
     thread = await _owned_thread(db, thread_id, current_user.id)
 
     keys = crypto.user_provider_keys(current_user)
     scope = payload.scope
-    # Which scopes actually need a vector. A web-only follow-up needs none, which is why
-    # this is checked rather than assumed: embedding unconditionally made a project with
-    # no embeddings provider unable to ask *any* question, including ones that never
-    # touch memory.
+    # 先判断范围是否需要向量。纯网页追问不读项目记忆，不应因未配置向量模型而无法聊天。
     needs_embedder = scope in ("report", "corpus", "everything")
     embedder = await adapters.embeddings_for(keys) if needs_embedder else None
 
     citations: list = []
     excerpts = ""
     if scope in ("report", "everything"):
-        # Embed the question and retrieve *before* writing anything. An unavailable
-        # provider must not leave a user message stranded in a thread that never got an
-        # answer.
+        # 先向量化和检索再保存用户消息，避免供应商不可用时留下永远没有回答的消息。
         try:
             query_vector = (await embedder.embed([payload.message]))[0]
         except EmbeddingsUnavailable as e:
-            # 503, not a cheerful ungrounded answer: for these scopes this endpoint's
-            # whole contract is that answers come from approved research, and it cannot
-            # honour that right now.
+            # 无法取得获批研究证据时返回 503，不能换成没有依据的回答。
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
 
         retrieved = await memory.retrieve(
@@ -257,8 +227,7 @@ async def send_thread_message(
         )
         excerpts, citations = _grounding(retrieved)
 
-    # Resolved only for the scopes that read it, so one that never does still does not
-    # touch the filesystem. `for_project` answers `None` when this project has no corpus.
+    # 只在所选范围确实读取语料时解析文件路径；项目没有语料时 for_project 返回 None。
     corpus_store = None
     if scope in ("report", "corpus", "everything"):
         from app.adapters import ServerCorpusLocator
@@ -313,9 +282,7 @@ async def send_thread_message(
 
     history = await recent_turns(db, ChatMessage.thread_id == thread_id)
 
-    # PROJECT_CHAT_PROMPT's refusal line stays first and unchanged — its Definition of
-    # Done tests for it (docs/14 §9), and widening the scope is exactly when a model is
-    # most tempted to answer from its own knowledge instead of saying "not in here".
+    # 保留 PROJECT_CHAT_PROMPT 开头的拒答规则；扩大范围时尤其不能用模型自身知识冒充项目证据（docs/14 §9）。
     system = (
         f"{system_prompt('chat.project')}\n\n"
         f"{chat_scope.system_suffix(grounding)}\n\n"
@@ -333,8 +300,8 @@ async def send_thread_message(
         keys_token = set_user_keys(keys)
         acc = ""
         try:
-            llm = get_llm("chat")  # raises with an actionable message if no key
-            # Citations go first so the client can render the chips as text streams in.
+            llm = get_llm("chat")  # 没有密钥时返回能指导用户处理的错误。
+            # 先发送引用映射，方便客户端随正文逐步渲染引用。
             yield (
                 "data: "
                 + json.dumps(
@@ -354,9 +321,7 @@ async def send_thread_message(
                     acc += text
                     yield f"data: {json.dumps({'type': 'chunk', 'text': text})}\n\n"
 
-            # Persist only the citations the answer actually used. An unused excerpt is
-            # not a citation, and showing it as one would be the "sources theatre" the
-            # ⚠ chip exists to avoid (docs/27).
+            # 只保存回答实际使用的引用；检索到但未使用的片段不算引用，避免展示虚假的来源背书（docs/27）。
             used = [c for c in citations if f"[{c['marker']}]" in acc]
             msg = ChatMessage(
                 thread_id=thread_id, role="assistant", content=acc, citations=used or None
@@ -378,7 +343,7 @@ async def send_thread_message(
     return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
-# ── Memory status ──────────────────────────────────────────────────────────────────
+# 项目记忆状态
 
 
 @router.get("/projects/{project_id}/memory/status", response_model=MemoryStatusResponse)
@@ -387,7 +352,7 @@ async def memory_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """What this project remembers, and what it is missing (docs/14 §8)."""
+    """返回项目已索引的内容及尚未索引的缺口（docs/14 §8）。"""
     project = await resolve_project(db, current_user.id, project_id)
     embedder = await adapters.embeddings_for(crypto.user_provider_keys(current_user))
     result = await memory.status(db, project_id=project.id, current_model=embedder.model_id)

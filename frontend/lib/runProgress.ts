@@ -1,33 +1,22 @@
 import { AGENTS, latestAgentOrder, taskProgress } from "./pipeline";
 import type { AgentEvent, RunStatus } from "./types";
 
-/**
- * What a running research run is actually doing, derived from state the backend
- * really reports.
- *
- * **There is no percentage here, and there must never be one.** The backend publishes
- * discrete agent events and a run status; it does not publish completion. A progress bar
- * would have to invent the denominator, and an invented measurement is the one thing this
- * product cannot ship (AGENTS.md, "the product claim is verifiability"). So the stages are
- * a checklist of steps that have *observably* happened, and the only number on it —
- * research tasks gathered — comes from counting planner and executor events, with the
- * total omitted entirely when the planner has not said what it is.
- *
- * Pure and separate from the component so the derivation is testable without a DOM: the
- * interesting cases are a run that failed mid-pipeline and a run watched from PENDING,
- * neither of which is convenient to reproduce by rendering.
- */
+/** 根据后端实际报告的状态推导研究正在做什么。
+  * 此处不能显示百分比：后端只提供离散事件和研究状态，没有完成度，进度条会虚构分母，
+  * 违背可验证性承诺。阶段列表只标记已观察到的步骤；任务数量来自规划器和执行器事件，
+  * 规划器尚未报告总数时不显示分母。
+  * 纯函数与组件分离，便于在不渲染 DOM 的情况下测试中途失败和从排队开始观察的情况。 */
 
 export type StageState =
-  /** Not reached. */
+  /** 尚未到达。 */
   | "pending"
-  /** Happening now. */
+  /** 正在进行。 */
   | "active"
-  /** Observed to have finished. */
+  /** 已观察到完成。 */
   | "done"
-  /** Waiting on the person reading this. */
+  /** 正在等待用户操作。 */
   | "waiting"
-  /** The run ended before this step ran. */
+  /** 研究结束时尚未执行此步骤。 */
   | "stopped";
 
 export interface Stage {
@@ -36,34 +25,34 @@ export interface Stage {
   actionLabel: string;
   label: string;
   state: StageState;
-  /** A fact about this stage, or null. Never a guess. */
+  /** 本阶段已知的事实，或 null；不能猜测。 */
   detail: string | null;
 }
 
-/** The four engine agents, in pipeline order, with the words a reader recognises. */
+/** 按流水线顺序列出四个引擎智能体，并给出便于理解的名称。 */
 const AGENT_STAGES: { id: string; agentName: string; actionLabel: string; label: string }[] = [
   {
     id: "planner",
-    agentName: "Planner",
-    actionLabel: "Planning the research",
+    agentName: "规划器",
+    actionLabel: "规划研究",
     label: "Planner: Planning the research",
   },
   {
     id: "executor",
-    agentName: "Executor",
-    actionLabel: "Searching sources and gathering evidence",
+    agentName: "执行器",
+    actionLabel: "搜索来源并收集证据",
     label: "Executor: Searching sources and gathering evidence",
   },
   {
     id: "critic",
-    agentName: "Critic",
-    actionLabel: "Checking the evidence",
+    agentName: "评审器",
+    actionLabel: "核查证据",
     label: "Critic: Checking the evidence",
   },
   {
     id: "synthesizer",
-    agentName: "Synthesizer",
-    actionLabel: "Drafting the report",
+    agentName: "综合器",
+    actionLabel: "撰写报告草稿",
     label: "Synthesizer: Drafting the report",
   },
 ];
@@ -71,21 +60,13 @@ const AGENT_STAGES: { id: string; agentName: string; actionLabel: string; label:
 export interface ProgressInput {
   status: RunStatus | string;
   events: AgentEvent[];
-  /** Whether this run has a design gate at all. A run that skipped it never shows one. */
+  /** 此研究是否启用了计划审核关卡；跳过关卡的研究不应显示这个步骤。 */
   planGate: boolean;
-  /** True once a PLAN review has been recorded. */
+  /** 已有 PLAN 审核记录时为 true。 */
   planDecided: boolean;
 }
 
-/**
- * The stage checklist for a run.
- *
- * The rules mirror `PipelineRail`'s, which were arrived at by watching real runs:
- * a status that parks the graph (either gate, or a terminal) is authoritative about the
- * agents around it, and the event stream is only consulted for the middle of a live run.
- * Reading it the other way round made a run parked at the design gate claim the executor
- * was busy, because the furthest-along agent in the backlog said so.
- */
+/** 生成研究阶段清单。与 PipelineRail 一样，关卡暂停或终态对相邻智能体状态具有最高解释权，只有运行中间态才参考事件流；否则回放积压事件可能让停在计划关卡的研究误显示执行器正在工作。 */
 export function deriveStages({ status, events, planGate, planDecided }: ProgressInput): Stage[] {
   const order = latestAgentOrder(events);
   const running = status === "PENDING" || status === "RUNNING";
@@ -97,8 +78,8 @@ export function deriveStages({ status, events, planGate, planDecided }: Progress
 
   const agentState = (i: number): StageState => {
     if (agentsDone) return "done";
-    // Parked at the design gate: the planner is finished and nothing after it has run,
-    // whatever the furthest-along agent in the replayed backlog happens to be.
+    // 停在计划关卡时，规划器已完成，后续步骤尚未运行，
+    // 无论回放的历史事件中最靠后的智能体是什么。
     if (atPlanGate) return i === 0 ? "done" : "pending";
     if (ended) {
       if (order < 0) return "stopped";
@@ -117,21 +98,21 @@ export function deriveStages({ status, events, planGate, planDecided }: Progress
   AGENT_STAGES.forEach((stage, i) => {
     const state = agentState(i);
     let detail: string | null = null;
-    // Only the executor gets a count, and only once the planner has said how many tasks
-    // there are. `done` alone would read as progress toward an unknown finish.
+    // 只有执行器显示数量，且必须先由规划器给出任务总数；
+    // 单独显示 done 会让用户误以为知道距离完成还有多少。
     if (stage.id === "executor" && total > 0 && (state === "active" || state === "done")) {
-      detail = `${Math.min(done, total)} of ${total} research tasks gathered`;
+      detail = `已收集 ${Math.min(done, total)} / ${total} 项研究任务的证据`;
     }
     stages.push({ ...stage, state, detail });
 
-    // The design gate sits between the planner and the executor, and only for runs that
-    // have one. Drawing it on a run that skipped it would show a step that never existed.
+    // 计划关卡位于规划器与执行器之间，且仅在实际启用时绘制；
+    // 不能在跳过关卡的研究中展示一个从未存在的步骤。
     if (i === 0 && planGate) {
       stages.push({
         id: "plan-gate",
-        agentName: "Plan review",
-        actionLabel: "Your plan review",
-        label: "Plan review: Your plan review",
+        agentName: "待审核计划",
+        actionLabel: "请审核研究计划",
+        label: "计划审核：等待你审核",
         state: atPlanGate
           ? "waiting"
           : planDecided || agentsDone || order >= 1
@@ -139,22 +120,22 @@ export function deriveStages({ status, events, planGate, planDecided }: Progress
             : ended
               ? "stopped"
               : "pending",
-        detail: atPlanGate ? "Approve the plan to start searching" : null,
+        detail: atPlanGate ? "批准计划后开始搜索" : null,
       });
     }
   });
 
   stages.push({
     id: "review",
-    agentName: "Final review",
-    actionLabel: "Your review",
-    label: "Final review: Your review",
+    agentName: "最终审核",
+    actionLabel: "请审核研究报告",
+    label: "最终审核：等待你审核",
     state: completed ? "done" : atReview ? "waiting" : ended ? "stopped" : "pending",
-    detail: atReview ? "Approve the draft to create a verifiable artifact" : null,
+    detail: atReview ? "批准草稿以生成可验证的成果文件" : null,
   });
 
   return stages;
 }
 
-/** Sanity check kept next to the derivation: the agent list it walks is the engine's. */
+/** 在派生逻辑旁检查其使用的智能体顺序与引擎一致。 */
 export const AGENT_STAGE_COUNT = AGENTS.length;

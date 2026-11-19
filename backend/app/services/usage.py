@@ -1,14 +1,6 @@
-"""
-Token/cost usage aggregation for the profile page and the monthly limit.
+"""从用户已有会话聚合 Token 和费用，不另存容易失同步的计数。
 
-Usage is derived from the `sessions` rows a user already owns — there is no
-separate counter to drift out of sync. Three windows are reported:
-
-- month: the current calendar month (UTC). This is the window the limit applies
-  to, so it resets on the 1st, matching how users read "monthly limit".
-- week: a rolling 7 days.
-- last_session: the most recently created session on its own.
-"""
+月度按 UTC 自然月，与限额每月一日重置一致；周度为滚动 7 天；最近会话只取最新创建的一条。"""
 
 from __future__ import annotations
 
@@ -72,7 +64,7 @@ async def _last_session(db: AsyncSession, user_id: uuid.UUID) -> UsageWindow:
 
 
 async def monthly_tokens(db: AsyncSession, user_id: uuid.UUID) -> int:
-    """Total tokens used in the current calendar month — the limit's basis."""
+    """本 UTC 自然月的总 Token 消耗，作为月度限额依据。"""
     window = await _window(db, user_id, month_start())
     return window.tokens_total
 

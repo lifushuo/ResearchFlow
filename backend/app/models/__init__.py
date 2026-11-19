@@ -1,8 +1,6 @@
-"""ORM model registry.
+"""ORM 模型注册入口。
 
-Importing a model here is what registers it on `Base.metadata`, which is what both
-`alembic --autogenerate` (server) and `create_all` (desktop) walk.
-"""
+这里导入的模型会加入 Base.metadata，供服务端 Alembic 自动生成迁移以及桌面 create_all 创建表。"""
 
 from app.models.agent_log import AgentLog
 from app.models.audit_log import AuditLog
@@ -25,20 +23,16 @@ from app.models.revision import Claim, ClaimEvidenceLink, Revision
 from app.models.session import Session, SessionStatus
 from app.models.user import User
 
-#: Tables that cannot exist on SQLite, and the single source of truth for that fact.
+# 统一定义 SQLite 不支持的表。
 #:
-#: Each carries a pgvector column, or references a table that does. The desktop host builds
-#: its schema with `create_all` and must skip exactly these — previously it filtered one
-#: table name inline in `sidecar.py`, which is the "two homes, one contract" shape this
-#: repository keeps rediscovering. The sidecar now imports this set instead.
+# 这些表自身带 pgvector 列或引用此类表，桌面 create_all 必须统一跳过，不能在 sidecar 再维护一份名单。
 #:
-#: Project memory is the one feature absent on desktop by design (internal/12 M10): the
-#: local corpus has its own SQLite store and local embeddings.
+# 桌面按设计不提供项目记忆；本地语料有独立 SQLite 与向量实现（internal/12 M10）。
 POSTGRES_ONLY_TABLES = frozenset(
     {
         MemoryChunk.__tablename__,
         ProjectMemoryItem.__tablename__,
-        # Provenance to a table that does not exist is meaningless, so it goes with it.
+        # 来源关系指向的表不存在时，该关系表也必须一起排除。
         ProjectMemoryProvenance.__tablename__,
     }
 )
@@ -56,7 +50,7 @@ __all__ = [
     "MemoryChunk",
     "AuditLog",
     "RefreshToken",
-    # The research domain.
+    # 注册研究领域模型。
     "ResearchRun",
     "ResearchPlan",
     "Source",

@@ -6,15 +6,10 @@ import type { AgentRole, ModelCatalog, PromptDefaults, User } from "@/lib/types"
 
 import { AgentsSection } from "./AgentsSection";
 
-/**
- * Settings → Agents: how each agent behaves, apart from which model it uses (scope freeze
- * §12). Exactly the five public roles, a visible shipped/customized state, one editor at a
- * time, reset through `ResetToDefault` sending `null`, the model shown read-only with a way
- * to where it is changed — and nothing that creates an agent or names a protected purpose.
- */
+/** 智能体设置只管理行为，与模型选择分离（范围约定 §12）。仅展示五个公开角色及内置/自定义状态，一次打开一个编辑器；恢复默认通过 ResetToDefault 发送 null。模型只读展示并链接到修改位置，不创建角色，也不暴露受保护用途。 */
 
 const ROLES: AgentRole[] = ["planner", "executor", "critic", "synthesizer", "chat"];
-const LABELS = ["Planner", "Executor", "Critic", "Synthesizer", "Follow-up chat"];
+const LABELS = ["规划器", "执行器", "评审器", "综合器", "追问对话"];
 
 const DEFAULTS: PromptDefaults = {
   max_chars: 2500,
@@ -83,19 +78,19 @@ beforeEach(() => {
 describe("the page", () => {
   it("says what it is for", () => {
     show();
-    expect(screen.getByText("Customize how your research agents behave.")).toBeInTheDocument();
+    expect(screen.getByText("自定义研究智能体的行为。")).toBeInTheDocument();
   });
 
   it("lists exactly the five public agents, in order", () => {
     show();
-    const items = within(screen.getByRole("list", { name: "Agents" })).getAllByRole("listitem");
+    const items = within(screen.getByRole("list", { name: "智能体" })).getAllByRole("listitem");
     expect(items.map((li) => li.getAttribute("aria-label"))).toEqual(LABELS);
   });
 
   it("states that customization is recorded in the artifact and needs a current verifier", () => {
     show();
-    expect(screen.getByText(/verification bundle records them in full/)).toHaveTextContent(
-      /format v2, which a verifier from before this release refuses/,
+    expect(screen.getByText(/验证包会完整记录指令/)).toHaveTextContent(
+      /使用 v2 格式，旧版验证器会拒绝/,
     );
   });
 
@@ -106,17 +101,17 @@ describe("the page", () => {
 
   it("offers no way to create an agent", () => {
     show();
-    expect(screen.queryByRole("button", { name: /create|add|new/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /创建|添加|新建/ })).not.toBeInTheDocument();
   });
 
   it("never names a protected purpose, even with every editor opened in turn", async () => {
     const { container } = show({ critic: "Grade harshly." });
     for (const label of LABELS) {
       const button = within(card(label)).getByRole("button", {
-        name: /Customize|Edit instructions/,
+        name: /自定义|编辑指令/,
       });
       await userEvent.click(button);
-      await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await userEvent.click(screen.getByRole("button", { name: "取消" }));
     }
     for (const name of ["citation_verify", "contradiction_detector", "synthesizer.repair", "chat.project"]) {
       expect(container.textContent).not.toContain(name);
@@ -127,53 +122,53 @@ describe("the page", () => {
 describe("each agent's state", () => {
   it("marks a shipped agent as shipped and offers Customize", () => {
     show();
-    const planner = card("Planner");
-    expect(within(planner).getByText("Shipped")).toBeInTheDocument();
-    expect(within(planner).getByRole("button", { name: "Customize" })).toBeInTheDocument();
-    expect(within(planner).queryByRole("button", { name: "Reset to default" })).not.toBeInTheDocument();
+    const planner = card("规划器");
+    expect(within(planner).getByText("内置默认")).toBeInTheDocument();
+    expect(within(planner).getByRole("button", { name: "自定义" })).toBeInTheDocument();
+    expect(within(planner).queryByRole("button", { name: "恢复默认" })).not.toBeInTheDocument();
   });
 
   it("marks a customized agent and offers Edit instructions and Reset to default", () => {
     show({ critic: "Grade harshly." });
-    const critic = card("Critic");
-    expect(within(critic).getByText("Customized")).toBeInTheDocument();
-    expect(within(critic).getByRole("button", { name: "Edit instructions" })).toBeInTheDocument();
-    expect(within(critic).getByRole("button", { name: "Reset to default" })).toBeInTheDocument();
-    expect(within(card("Planner")).getByText("Shipped")).toBeInTheDocument();
+    const critic = card("评审器");
+    expect(within(critic).getByText("已自定义")).toBeInTheDocument();
+    expect(within(critic).getByRole("button", { name: "编辑指令" })).toBeInTheDocument();
+    expect(within(critic).getByRole("button", { name: "恢复默认" })).toBeInTheDocument();
+    expect(within(card("规划器")).getByText("内置默认")).toBeInTheDocument();
   });
 });
 
 describe("editing", () => {
   it("Customize opens that agent's editor on the shipped text", async () => {
     show();
-    await userEvent.click(within(card("Executor")).getByRole("button", { name: "Customize" }));
-    expect(screen.getByRole("textbox", { name: "Instructions for Executor" })).toHaveValue(
+    await userEvent.click(within(card("执行器")).getByRole("button", { name: "自定义" }));
+    expect(screen.getByRole("textbox", { name: "执行器的指令" })).toHaveValue(
       "Shipped executor prompt.",
     );
   });
 
   it("Edit instructions opens that agent's editor on the saved text", async () => {
     show({ critic: "Grade harshly." });
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Edit instructions" }));
-    expect(screen.getByRole("textbox", { name: "Instructions for Critic" })).toHaveValue(
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "编辑指令" }));
+    expect(screen.getByRole("textbox", { name: "评审器的指令" })).toHaveValue(
       "Grade harshly.",
     );
   });
 
   it("keeps one editor open at a time", async () => {
     show();
-    await userEvent.click(within(card("Planner")).getByRole("button", { name: "Customize" }));
+    await userEvent.click(within(card("规划器")).getByRole("button", { name: "自定义" }));
     expect(screen.getAllByRole("textbox")).toHaveLength(1);
-    expect(within(card("Critic")).getByRole("button", { name: "Customize" })).toBeDisabled();
+    expect(within(card("评审器")).getByRole("button", { name: "自定义" })).toBeDisabled();
   });
 
   it("saves that agent's text alone", async () => {
     show();
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Customize" }));
-    const box = screen.getByRole("textbox", { name: "Instructions for Critic" });
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "自定义" }));
+    const box = screen.getByRole("textbox", { name: "评审器的指令" });
     await userEvent.clear(box);
     await userEvent.type(box, "Grade harshly.");
-    await userEvent.click(screen.getByRole("button", { name: "Save instructions" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存指令" }));
     expect(updateProfile.mutateAsync).toHaveBeenCalledWith({
       preferences: { prompt_overrides: { critic: "Grade harshly." } },
     });
@@ -188,9 +183,9 @@ describe("editing", () => {
       ),
     );
     show();
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Customize" }));
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "自定义" }));
     await userEvent.type(screen.getByRole("textbox"), " more");
-    await userEvent.click(screen.getByRole("button", { name: "Save instructions" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存指令" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "prompt override for 'critic' is 2501 characters; the maximum is 2500",
     );
@@ -201,16 +196,16 @@ describe("editing", () => {
 describe("resetting", () => {
   it("shows one Reset to default per agent at a time — the card's yields to the editor's", async () => {
     show({ critic: "Grade harshly." });
-    const critic = card("Critic");
-    expect(within(critic).getAllByRole("button", { name: "Reset to default" })).toHaveLength(1);
-    await userEvent.click(within(critic).getByRole("button", { name: "Edit instructions" }));
-    expect(within(critic).getAllByRole("button", { name: "Reset to default" })).toHaveLength(1);
+    const critic = card("评审器");
+    expect(within(critic).getAllByRole("button", { name: "恢复默认" })).toHaveLength(1);
+    await userEvent.click(within(critic).getByRole("button", { name: "编辑指令" }));
+    expect(within(critic).getAllByRole("button", { name: "恢复默认" })).toHaveLength(1);
   });
 
   it("can reset from inside an open editor, then closes it", async () => {
     show({ critic: "Grade harshly." });
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Edit instructions" }));
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Reset to default" }));
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "编辑指令" }));
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "恢复默认" }));
     expect(updateProfile.mutateAsync).toHaveBeenCalledWith({
       preferences: { prompt_overrides: { critic: null } },
     });
@@ -219,7 +214,7 @@ describe("resetting", () => {
 
   it("sends null for that agent alone", async () => {
     show({ critic: "Grade harshly.", planner: "Plan in three steps." });
-    await userEvent.click(within(card("Critic")).getByRole("button", { name: "Reset to default" }));
+    await userEvent.click(within(card("评审器")).getByRole("button", { name: "恢复默认" }));
     expect(updateProfile.mutateAsync).toHaveBeenCalledWith({
       preferences: { prompt_overrides: { critic: null } },
     });
@@ -229,9 +224,9 @@ describe("resetting", () => {
 describe("the model, read-only", () => {
   it("shows each agent's current model and links to Models to change it", () => {
     show();
-    const planner = card("Planner");
-    expect(within(planner).getByText(/Model: Claude Sonnet/)).toBeInTheDocument();
-    expect(within(planner).getByRole("link", { name: "Change in Models" })).toHaveAttribute(
+    const planner = card("规划器");
+    expect(within(planner).getByText(/模型：Claude Sonnet/)).toBeInTheDocument();
+    expect(within(planner).getByRole("link", { name: "前往模型设置修改" })).toHaveAttribute(
       "href",
       "/settings/models",
     );
@@ -249,14 +244,14 @@ describe("loading and failure", () => {
     state.me = user(null);
     state.defaults = { data: undefined, isLoading: true, isError: false };
     render(<AgentsSection />);
-    expect(screen.queryByRole("list", { name: "Agents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "智能体" })).not.toBeInTheDocument();
   });
 
   it("says the instructions could not be loaded, and offers nothing to edit", () => {
     state.me = user(null);
     state.defaults = { data: undefined, isLoading: false, isError: true };
     render(<AgentsSection />);
-    expect(screen.getByText(/could not be loaded/)).toBeInTheDocument();
+    expect(screen.getByText(/无法加载智能体内置指令/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Customize|Edit instructions/ })).not.toBeInTheDocument();
   });
 });

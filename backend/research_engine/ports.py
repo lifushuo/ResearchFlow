@@ -1,31 +1,8 @@
-"""
-The engine's ports (docs/13 §4, docs/12 M6 step 3).
+"""引擎端口，见 docs/13 §4、docs/12 M6。
 
-Protocols only — every implementation lives in a host. The server supplies Postgres/
-Redis-backed versions (`app/adapters.py`); the desktop build (docs/12 M9) supplies
-SQLite and in-process ones. `research_engine` depends on these shapes and nothing else,
-which is what lets one graph run in both places.
-
-Three ports. Two came from docs/13 (EventSink, Cache); Embeddings arrived with project
-memory (docs/14 §4) and is a port for the same reason — the server embeds through Ollama
-or a hosted provider, the desktop build through a local model, and the engine should not
-know which.
-
-The two candidates that were dropped were interfaces where data was sufficient:
-
-- **KeyProvider** — provider keys are resolved by the host *before* a run (the server
-  decrypts them from `users.api_key_encrypted`) and handed over as a plain
-  `{provider: key}` mapping. Wrapping that in a callable would add a lookup indirection
-  the engine never exercises, so `runner.run(provider_keys=…)` takes the data instead.
-- **RunLock** — guarding against two workers running the same session is host
-  scheduling, not pipeline behaviour: the server needs a Redis token lock because
-  Celery can redeliver, and a single-process desktop app needs at most an
-  `asyncio.Lock`. It stays in the host, wrapped around the runner call.
-
-Checkpointing needs no port either — LangGraph's saver interface *is* the port
-(`AsyncPostgresSaver` on the server, `AsyncSqliteSaver` locally). The host constructs
-and `setup()`s the saver, then passes it in; schema creation is a host concern.
-"""
+只定义协议，由宿主提供数据库、缓存、事件和嵌入实现，使同一张图可在服务端和桌面运行。
+密钥在运行前作为普通映射传入，无需多包一层查找接口；
+运行锁属于宿主调度，不属于图；检查点则直接采用 LangGraph saver 接口。"""
 
 from __future__ import annotations
 
@@ -34,22 +11,18 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class EventSink(Protocol):
-    """Receives one pipeline event. Installed via `events.set_emitter`.
+    """接收一个流水线事件，通过 events.set_emitter 安装。
 
-    The server implementation writes an `agent_logs` row (durable SSE replay) and then
-    publishes to Redis (live fan-out); a desktop one pushes onto an in-process queue.
-    """
+    服务端落库并发布 Redis；桌面可在进程内转发。"""
 
     async def __call__(self, session_id: str, event: dict) -> None: ...
 
 
 @runtime_checkable
 class Cache(Protocol):
-    """Best-effort key/value cache for search results. Installed via `cache.set_cache`.
+    """尽力而为的搜索键值缓存，通过 cache.set_cache 安装。
 
-    Implementations may fail or no-op freely: `retrievers.search` treats every cache
-    operation as advisory and never lets one break a search.
-    """
+    允许失败或不缓存，检索不能因缓存故障被中断。"""
 
     async def get(self, key: str) -> str | None: ...
 
@@ -58,17 +31,10 @@ class Cache(Protocol):
 
 @runtime_checkable
 class Embeddings(Protocol):
-    """Turns text into vectors for project memory (docs/14 §4).
+    """把文本转成项目记忆向量，见 docs/14 §4。
 
-    A third port rather than a direct client call, for the same reason as the other two:
-    the server embeds through Ollama or a hosted provider, and the desktop build embeds
-    locally with no key at all. The engine states the shape; hosts supply the client.
-
-    `model_id` and `dimensions` are part of the contract, not decoration. Vectors from
-    different models are not comparable even when their dimensions match, so every stored
-    chunk records the model that produced it and retrieval filters on it — mixing them
-    silently would return confident nonsense (docs/14 §4).
-    """
+    引擎只规定协议，宿主选择客户端。model_id 和 dimensions 都是契约：
+    不同模型的向量即使维数相同也不可混排，存储和检索必须按模型隔离。"""
 
     @property
     def model_id(self) -> str: ...
@@ -81,18 +47,11 @@ class Embeddings(Protocol):
 
 @runtime_checkable
 class Corpus(Protocol):
-    """A closed document corpus as a search source (internal/12 M10, docs/13 "Three privacy tiers").
+    """作为检索来源的封闭文档库，见 internal/12 M10。
 
-    Corpus-only mode's retrieval connector. `search` returns exactly the shape
-    `retrievers.search` returns — `{title, url, snippet}` — so the executor needs no
-    branch and the graph does not change; `read` resolves one of those URLs back to
-    the text at that exact document location, replacing `read_webpage`'s fetch.
-
-    Installed via `corpus.set_corpus` and selected per-run by `RunConfig.corpus_mode`:
-    when that flag is set, `retrievers.search` delegates here exclusively and
-    `read_webpage` refuses every non-corpus URL — no retrieval egress (internal/12 M10
-    DoD). Model calls are routed separately and are not restricted here.
-    """
+    search 返回 title、url、snippet，read 将 URL 还原到精确文档位置，保持执行器无需分支。
+    由 corpus.set_corpus 安装；corpus_mode 启用后仅使用此端口并拒绝普通网页地址。
+    该限制控制检索来源，代理模型是否外发另由路由决定。"""
 
     async def search(self, query: str, max_results: int) -> list[dict]: ...
 

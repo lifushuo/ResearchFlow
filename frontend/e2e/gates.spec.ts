@@ -29,7 +29,7 @@ test.describe("plan gate", () => {
     await expect(page.getByRole("heading", { name: "Research plan" })).toBeVisible({
       timeout: 180_000,
     });
-    await expect(page.getByText(/the research plan is waiting for your approval/)).toBeVisible();
+    await expect(page.getByText("搜索尚未开始：请先审核并批准研究计划。")).toBeVisible();
 
     // 2. The plan is real: the planner's tasks and the outline it chose.
     const planPanel = page.getByRole("tabpanel");

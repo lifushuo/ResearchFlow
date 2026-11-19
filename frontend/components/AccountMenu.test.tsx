@@ -10,8 +10,8 @@ vi.mock("next/navigation", () => ({ usePathname: () => "/research", useRouter: (
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light", setTheme: vi.fn() }) }));
 vi.mock("@/hooks/queries", () => ({
   useLogout: () => ({ mutate: vi.fn(), isPending: false }),
-  // A host WITH accounts, so the menu renders its full set — these tests are about what the
-  // chrome must never show (the address), which is the harder case to keep honest.
+  // 模拟支持账户的宿主，以渲染完整菜单；这些测试检查
+  // 界面在功能最完整时也不能显示邮箱地址。
   useCapabilities: () => ({ accounts: true }),
 }));
 
@@ -27,13 +27,7 @@ function user(overrides: Partial<User> = {}): User {
   } as User;
 }
 
-/**
- * The sidebar is on screen for the whole session — in every screen share, every
- * screenshot, and over every shoulder. An email address is the one identifier in this
- * app that is also a credential somewhere else, and identifying the signed-in account
- * does not need it: the display name and the avatar do that. It belongs on Profile,
- * which the user opens deliberately.
- */
+/** 侧边栏会一直出现在共享屏幕、截图和旁观者视野中。邮箱既是身份标识，也可能是其他服务的登录凭据；此处显示名称和头像已经足够，邮箱只放在用户主动打开的个人资料页。 */
 describe("AccountMenu keeps the address out of the chrome", () => {
   it("does not render the email in the resting sidebar row", () => {
     render(<AccountMenu user={user()} />);
@@ -45,10 +39,10 @@ describe("AccountMenu keeps the address out of the chrome", () => {
     render(<AccountMenu user={user()} />);
     await userEvent.click(screen.getByRole("button", { name: /ada/i }));
 
-    expect(screen.getByRole("menu", { name: "Account" })).toBeInTheDocument();
+    expect(screen.getByRole("menu", { name: "账户" })).toBeInTheDocument();
     expect(screen.queryByText(EMAIL)).toBeNull();
-    // Profile is where it lives, so the way to it stays one click from here.
-    expect(screen.getByRole("menuitem", { name: /profile/i })).toHaveAttribute(
+    // 邮箱只在个人资料中显示，因此保留一步直达该页面的入口。
+    expect(screen.getByRole("menuitem", { name: /个人资料/i })).toHaveAttribute(
       "href",
       "/profile",
     );
@@ -62,7 +56,7 @@ describe("AccountMenu keeps the address out of the chrome", () => {
 
   it("still names an account that has no display name, without showing the address", () => {
     render(<AccountMenu user={user({ display_name: null })} />);
-    // The local part is a derived label, not the address: it cannot be sent to.
+    // 这里只展示推导出的本地名称，不是可用于发送邮件的完整地址。
     expect(screen.getByText(firstNameOf(user({ display_name: null })))).toBeInTheDocument();
     expect(screen.queryByText(EMAIL)).toBeNull();
   });

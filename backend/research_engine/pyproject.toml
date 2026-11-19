@@ -1,19 +1,13 @@
-# research_engine — installable independently of the server host (docs/12 M6, docs/13 §3).
+# research_engine 可独立于服务端安装，见 docs/12 M6、docs/13 §3。
 #
-# This file exists to make the dependency boundary REAL rather than notional. The engine
-# must be installable without FastAPI, Celery, SQLAlchemy, asyncpg, Redis, bcrypt, PyJWT,
-# or WeasyPrint, because the desktop sidecar (docs/12 M9) ships none of them. If a future
-# change makes the engine need one of those, this list is where the pressure shows up —
-# and adding a server dependency here is the signal that something belongs in the host.
+# 依赖清单让引擎与宿主的边界真正可检查。桌面包不包含 FastAPI、Celery、SQLAlchemy、
+# asyncpg、Redis、bcrypt、PyJWT 或 WeasyPrint，引擎不能依赖这些服务端组件。
+# 若新增功能需要它们，应先检查该功能是否属于宿主，而非直接增加依赖。
 #
-# The package currently lives inside backend/ so that the api/worker Docker build context
-# (./backend, with `COPY . /app`) still finds it and requirements.txt keeps working
-# unchanged. When the desktop build needs to install it standalone, `git mv` this
-# directory to a top-level packages/ and point the compose build context at the repo root
-# — the code does not change, only the path.
+# 当前放在 backend 内，让原有 API/Worker Docker 构建上下文及 requirements.txt 继续工作。
+# 若将来迁到顶层 packages，需同步调整 Compose 构建上下文；这只影响打包路径。
 #
-# Versions are kept consistent with ../requirements.txt; that file remains the source of
-# truth for the server image.
+# 依赖版本与 ../requirements.txt 保持一致，服务端镜像仍以该文件为准。
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -27,17 +21,17 @@ requires-python = ">=3.14"
 license = { text = "MIT" }
 
 dependencies = [
-    # Orchestration
+    # 图编排
     "langgraph>=1.0",
     "langchain-core>=0.3",
-    # Structured outputs / schemas
+    # 结构化输出与数据校验
     "pydantic>=2.10,<3.0",
-    # Retrieval + page fetching
+    # 检索与网页抓取
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
     "lxml>=5.2",
-    # Corpus documents (PDF, Word, spreadsheets). Exact pins for the new parsers — see
-    # backend/requirements.txt for why extraction must not float.
+    # 资料库文档解析，包括 PDF、Word 和表格；新增解析器固定版本，
+    # 原因见 backend/requirements.txt，避免升级后原文提取规则变化。
     "pypdf>=6.16.2",
     "numpy",
     "python-docx==1.2.0",
@@ -45,24 +39,23 @@ dependencies = [
     "striprtf==0.0.35",
     "tavily-python>=0.5",
     "ddgs",
-    # Logging
+    # 日志
     "structlog>=24.4",
 ]
 
 [project.optional-dependencies]
-# Model providers are optional so a deployment installs only what it routes to, and the
-# desktop build can ship local-only inference (docs/12 M8).
+# 供应商依赖按需安装，让部署只安装实际路由使用的客户端，也允许桌面仅含本地推理，见 docs/12 M8。
 google = ["langchain-google-genai>=2.0"]
 anthropic = ["langchain-anthropic>=0.3"]
 openai = ["langchain-openai>=0.2"]
-# The local host: SQLite checkpointing for `research_engine.cli` and the desktop sidecar
-# (docs/12 M9). The SQLite search cache in local.py needs nothing beyond stdlib sqlite3.
+# CLI 与桌面宿主使用 SQLite 检查点，见 docs/12 M9。
+# local.py 的搜索缓存只需标准库 sqlite3，无额外依赖。
 local = ["langgraph-checkpoint-sqlite>=3.0"]
 
 [project.scripts]
 research-engine = "research_engine.cli:main"
 
 [tool.setuptools]
-# Flat layout: this directory *is* the package.
+# 平铺布局：当前目录本身就是 research_engine 包。
 packages = ["research_engine"]
 package-dir = { research_engine = "." }
