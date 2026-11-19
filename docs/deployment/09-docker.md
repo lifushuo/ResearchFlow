@@ -185,4 +185,15 @@ Tagging `vX.Y.Z` triggers the release workflow, which builds multi-architecture 
 `arm64`) api, worker, and frontend images to GHCR and cuts a GitHub Release. The desktop
 workflow builds and attaches the desktop bundles with a `SHA256SUMS` file.
 
+## GitHub Pages in a personal repository
+
+The Pages workflow always builds and checks the static site. In a personal copy, publishing
+is opt-in: first select **GitHub Actions** under **Settings → Pages**, then set the repository
+Actions variable `ENABLE_PAGES_DEPLOYMENT` to `true`. Re-run the Pages workflow to publish.
+The original upstream repository keeps its existing automatic publishing behaviour.
+
+Without this opt-in the build and artifact upload still run, but deployment is skipped.
+The workflow does not try to create a Pages site with its restricted `GITHUB_TOKEN`.
+This setting only affects the public documentation site, not the self-hosted Docker app.
+
 Next: [Production deployment](30-production.md) · [Operations](31-operations.md)

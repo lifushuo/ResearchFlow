@@ -47,7 +47,12 @@ jobs:
       # The default checkout is shallow and has no tags, so they used to skip here. One tag,
       # one commit deep, is all they read.
       - name: Fetch the v3.0.2 tag the compatibility tests read
-        run: git fetch --no-tags --depth=1 origin +refs/tags/v3.0.2:refs/tags/v3.0.2
+        # 新建仓库不一定带有历史标签；兼容测试读取原项目的固定发布版本。
+        # 同时校验提交，避免远端标签移动后静默改变测试基准。
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/adityamhaske/Multi-Agent-Research-Assistant.git \
+            +refs/tags/v3.0.2:refs/tags/v3.0.2
+          test "$(git rev-parse 'v3.0.2^{commit}')" = 0a9de70ee90485531120856fce7f5dde4041c0aa
       # The backend image's Python (`backend/Dockerfile`): no job builds the image before a
       # tag, so this job and golden-e2e are where the server's code meets its interpreter.
       # Every setup-python in every workflow moves with the image, the desktop engine's

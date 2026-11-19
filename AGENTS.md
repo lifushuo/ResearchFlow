@@ -742,6 +742,11 @@ All of these are already available in this environment — nothing to install.
 
 ## Housekeeping
 
+新建个人仓库可能没有上游历史标签，也没有启用 GitHub Pages。后端兼容测试必须从原项目
+读取 `v3.0.2` 并核对固定提交，不能假定 `origin` 带有该标签；Pages 的静态构建始终验收，
+个人仓库发布需先配置站点并显式设置 `ENABLE_PAGES_DEPLOYMENT=true`，不能靠工作流令牌自动开站。
+这两处曾分别在测试开始前和成功构建后导致整轮 Actions 失败。
+
 Runtime artifacts must not be committed. `data/corpus/*.sqlite`, `__pycache__`, `.venv`,
 `.next`, and tool directories (`.qoder/`) are ignored — but an ignore rule does not
 untrack a file that is already tracked. `corpus_dir` defaults to the **relative** path

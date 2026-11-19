@@ -105,6 +105,11 @@ that `npm run lint` does not run.
 Jobs: `backend`, `frontend`, `golden-e2e`, and `eval-artifacts`. Dependency audits
 (`pip-audit`, `npm audit`) run non-blocking.
 
+The backend's compatibility tests read the original `v3.0.2` source. CI fetches that tag
+from `adityamhaske/Multi-Agent-Research-Assistant` and verifies its peeled commit is
+`0a9de70ee90485531120856fce7f5dde4041c0aa`. A personal repository does not need to publish
+the old release tag, and a moved upstream tag fails the check instead of changing the baseline.
+
 ### Evaluation results are write-once
 
 The `eval-artifacts` job fails the build if a committed file under `backend/evals/results/`
