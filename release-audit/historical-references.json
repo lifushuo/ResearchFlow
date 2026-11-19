@@ -2,6 +2,11 @@
   "about": "Every line of user-facing text that names a version, reviewed. A1.09 fails on a line that names a version and is not here, and on an entry whose line no longer exists — an edit to a reviewed line asks for a fresh review. Keyed on the line's text (whitespace-normalised), not its number. The changelog and frontend/lib/releases.ts are version histories by design and are not scanned. See RELEASE.md, Phase 1.",
   "references": [
     {
+      "path": "docs/developers/08-testing-and-evaluation.md",
+      "text": "The backend's compatibility tests read the original `v3.0.2` source. CI fetches that tag",
+      "reason": "The compatibility baseline deliberately uses the original release, pinned to commit 0a9de70ee90485531120856fce7f5dde4041c0aa; this is not the current application version."
+    },
+    {
       "path": ".github/workflows/desktop.yml",
       "text": "# Every macOS build from 1.0.1 to 3.0.0 shipped with only the signature the linker",
       "reason": "workflow comment recording the incident its guard exists for"
