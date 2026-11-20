@@ -655,6 +655,17 @@ class EvaluationClosure:
             "caveat": "Only matched configuration and inputs; external web evidence or stochastic model outputs may drift.",
         }
 
+    def record_audit(self, owner_id: str, action: str, target_id: str, summary: Any) -> None:
+        """回流等评测中心 UI 动作与 Worker 摄取共用同一审计表，动作与目标必须非空。"""
+        with self._db(write=True) as db:
+            self._audit(
+                db,
+                nonempty(owner_id, "owner_id", 120),
+                nonempty(action, "action", 80),
+                nonempty(target_id, "target_id", 200),
+                summary,
+            )
+
     def audit_log(self, owner_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._db() as db:
             rows = db.execute(

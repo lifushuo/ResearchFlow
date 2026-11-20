@@ -170,6 +170,20 @@ INTENTIONAL_SERVER_ONLY: dict[str, str] = {
             "GET /evaluation/closure/compare",
         )
     },
+    # Planner self-evolution backflow reads and writes the evaluation job volume's
+    # planner-evolution/ directory. The desktop has no evaluation center (no accounts,
+    # no shared job volume); its UI renders a notice and never calls these routes.
+    **{
+        route: "server-only planner self-evolution backflow; desktop has no evaluation job volume"
+        for route in (
+            "GET /evaluation/evolution/overview",
+            "GET /evaluation/evolution/dataset",
+            "GET /evaluation/evolution/annotations",
+            "GET /evaluation/evolution/bad-cases",
+            "POST /evaluation/evolution/backflow",
+            "GET /evaluation/evolution/experiments",
+        )
+    },
 }
 
 #: On the desktop host and deliberately not on the server.

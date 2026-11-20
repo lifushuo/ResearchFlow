@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.evaluation_closure import make_router
 from app.dependencies import get_current_user
 from app.models.user import User
-from app.services.evaluation_closure import ClosureError, EvaluationClosure
+from app.services.evaluation_closure import ClosureError, EvaluationClosure, NotFound
 from app.services.evaluation_closure.storage import store_at
 from app.services.evaluation_dataset_registry import (
     DatasetRegistryError,
@@ -28,6 +29,15 @@ from app.services.evaluation_pipeline_v13 import (
 )
 from app.services.evaluation_pipeline_v13 import (
     capabilities as pipeline_capabilities,
+)
+from app.services.planner_evolution_center import (
+    BackflowError,
+    backflow,
+    benchmark_bad_cases,
+    list_experiments,
+    load_benchmark_annotations,
+    merged_dataset,
+    overview,
 )
 
 router = APIRouter(prefix="/evaluation", tags=["Evaluation"])
@@ -201,3 +211,97 @@ def evaluation_get_pipeline_v13(
         return get_pipeline(job_root(), str(current_user.id), pipeline_id)
     except (KeyError, PipelineError) as exc:
         raise HTTPException(status_code=404, detail="Pipeline not found") from exc
+
+
+def verify_backflow_action(action: str | None) -> None:
+    # 与评测执行分开的显式动作头：回流写入评测卷，不能被隐性触发。
+    if action != "planner-backflow-v1":
+        raise HTTPException(status_code=403, detail="Explicit backflow action required")
+
+
+def _evolution_call(function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except NotFound:
+        raise HTTPException(404, "Resource not found") from None
+    except (BackflowError, ClosureError) as exc:
+        raise HTTPException(409, str(exc)) from None
+    except JobError, sqlite3.Error:
+        raise HTTPException(503, "Evaluation storage unavailable") from None
+    except OSError:
+        raise HTTPException(503, "Evaluation storage unavailable") from None
+    except ValueError as exc:
+        # JobError 是 ValueError 子类，已在上方先行拦截；其余值错误面向复核人展示。
+        raise HTTPException(422, str(exc)) from None
+
+
+class BackflowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str = Field(min_length=1, max_length=80)
+    group: str = Field(min_length=1, max_length=80)
+    aspects: list[str]
+    review_note: str
+    stage: Literal["planner", "retrieval", "report"]
+    bad_case_id: str | None = Field(default=None, min_length=1, max_length=120)
+    manual_query: str | None = None
+    manual_depth: Literal["fast", "balanced", "comprehensive"] = "balanced"
+
+
+@router.get("/evolution/overview")
+def evolution_overview(
+    store: EvaluationClosure = Depends(_closure_store),
+    root: Path = Depends(_evaluation_root),
+    owner: str = Depends(_closure_owner),
+):
+    return _evolution_call(overview, store, owner, root)
+
+
+@router.get("/evolution/dataset")
+def evolution_dataset(root: Path = Depends(_evaluation_root)):
+    return _evolution_call(merged_dataset, root)
+
+
+@router.get("/evolution/annotations")
+def evolution_annotations(root: Path = Depends(_evaluation_root)):
+    return _evolution_call(load_benchmark_annotations)
+
+
+@router.get("/evolution/bad-cases")
+def evolution_bad_cases(
+    review_status: str | None = None,
+    store: EvaluationClosure = Depends(_closure_store),
+    root: Path = Depends(_evaluation_root),
+    owner: str = Depends(_closure_owner),
+):
+    return _evolution_call(benchmark_bad_cases, store, owner, review_status=review_status)
+
+
+@router.get("/evolution/experiments")
+def evolution_experiments(root: Path = Depends(_evaluation_root)):
+    return _evolution_call(list_experiments, root)
+
+
+@router.post("/evolution/backflow")
+def evolution_backflow(
+    payload: BackflowRequest,
+    store: EvaluationClosure = Depends(_closure_store),
+    root: Path = Depends(_evaluation_root),
+    owner: str = Depends(_closure_owner),
+    action: str | None = Header(default=None, alias="X-ResearchFlow-Eval-Action"),
+):
+    verify_backflow_action(action)
+    return _evolution_call(
+        backflow,
+        store,
+        owner,
+        root,
+        case_id=payload.case_id,
+        group=payload.group,
+        aspects=payload.aspects,
+        review_note=payload.review_note,
+        stage=payload.stage,
+        bad_case_id=payload.bad_case_id,
+        manual_query=payload.manual_query,
+        manual_depth=payload.manual_depth,
+    )

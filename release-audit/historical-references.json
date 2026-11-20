@@ -3,6 +3,11 @@
   "references": [
     {
       "path": "docs/developers/08-testing-and-evaluation.md",
+      "text": "前两条环境命令创建单独的虚拟环境并安装项目依赖及 GEPA 0.1.4。演示执行真实 GEPA 搜索，Planner、Judge 与反思结果用脚本构造，模型调用量为零。它写入新的 `experiment.json` 和 `candidate.json`，输出留出集覆盖率和门禁状态。演示产物带 `scripted_demo` 标签，可用于验收流程。",
+      "reason": "GEPA 0.1.4 is the pinned optional optimizer dependency, verified by the offline demo; this is not the ResearchFlow application version or a claim of real-model improvement."
+    },
+    {
+      "path": "docs/developers/08-testing-and-evaluation.md",
       "text": "The backend's compatibility tests read the original `v3.0.2` source. CI fetches that tag",
       "reason": "The compatibility baseline deliberately uses the original release, pinned to commit 0a9de70ee90485531120856fce7f5dde4041c0aa; this is not the current application version."
     },

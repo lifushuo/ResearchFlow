@@ -74,8 +74,20 @@ export const DATASET_ZH = {
   },
 } satisfies Readonly<Record<DatasetId, DatasetZhInfo>>;
 
+// 注册表里不进入 Pipeline 能力清单的数据集（自进化开发集）：同样只展示，不改 ID 与载荷。
+const NON_PIPELINE_ZH = {
+  "planner-evolution-reviewed": {
+    label: "Planner 自进化开发集",
+    english: "Planner Evolution Dev Set",
+    short: "训练/验证/留出三组题目，人工标注必答维度",
+    description: "Planner Prompt 自进化（GEPA）的开发集。由规划演化 CLI 与独立评分模型打分，不由评测 Worker 运行；配套文件标注研究报告评测的必答维度，供坏例回流预填。",
+    metrics: "逐题必答维度覆盖率（训练/验证/留出）、留出集提升幅度",
+  },
+} satisfies Readonly<Record<string, DatasetZhInfo>>;
+
 function datasetInfo(id: string): DatasetZhInfo | undefined {
-  return Object.hasOwn(DATASET_ZH, id) ? DATASET_ZH[id as DatasetId] : undefined;
+  if (Object.hasOwn(DATASET_ZH, id)) return DATASET_ZH[id as DatasetId];
+  return Object.hasOwn(NON_PIPELINE_ZH, id) ? NON_PIPELINE_ZH[id as keyof typeof NON_PIPELINE_ZH] : undefined;
 }
 
 export function getDatasetLabel(id: string, fallback?: string): string {

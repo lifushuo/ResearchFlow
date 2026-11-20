@@ -40,3 +40,13 @@ Judge Trace 另设 `RF_JUDGE_BATCH_TRACE_DIR`，并共用 `RF_EVAL_BATCH_LEDGER_
 八套接入表示可执行适配与数据契约，不代表全部真实模型评测已通过；不宣称未经对照验证的准确率或 P95 提升。
 
 当前代码和验收入口见 [精简记录](internal/agent-evaluation/cleanup-2026-11-16-run1/README.md)。
+
+## Planner Prompt 自进化
+
+使用 GEPA 从规划漏项反馈生成候选 Prompt，在独立留出集上比较必答维度覆盖率，再用现有 Report Harness 复评报告完成和引用支持。通过两层门禁后可生成 Agent 设置的发布与回滚配置。
+
+代码包内含无密钥演示。数据准备、PowerShell 命令与复评口径见 [Planner Prompt 自进化使用说明](docs/developers/08-testing-and-evaluation.md#planner-prompt-自进化)。
+
+这是 CLI 驱动的受控实验能力：坏例维度由人工标注，候选经门禁后导出配置并人工应用。
+前端「自进化」页面描述闭环流程、提供坏例回流入口并展示实验证据；付费运行与发布仍只在 CLI。
+复用现有运行级 Prompt 快照，支持回滚配置；离线演示通过不代表已经证明真实模型质量提升。

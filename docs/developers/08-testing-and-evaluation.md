@@ -873,3 +873,115 @@ Responses API 等未覆盖路径明确记录 `unavailable`，不得凭 Token 等
 另存 `judge-*.badcase.json`，包含 Trace 文件/序号，不冒充已确认根因。诊断 API 与模型证据包保留这份安全投影，
 外发仍须既有人工确认。历史没有采集的字段不回填；恢复的旧批次不会新增模型调用，有观测时原样关联。
 观测字段不进入恢复指纹，不改变 `rf-judge-reliability/2`、`METRICS_VERSION=5` 或既有成绩。
+## Planner Prompt 自进化
+
+这套实验以 Planner 的系统提示词为优化对象，沿用生产 `planner_node`、`PlannerOutput` 和模型配置。GEPA 读取开发集上生成的检索任务与漏项，用验证集选出一个候选，再冻结该候选运行留出集。通过的候选进入现有 Report Harness 做整图回归。
+
+运行入口为 `python -m evals.agent_eval_ext.planner_evolution`。Python 版本沿用项目的 3.14。下面的 PowerShell 命令从仓库根目录开始执行。
+
+### 无密钥演示
+
+```powershell
+cd backend
+uv venv --python 3.14 ..\data\.venv-planner-evolution
+uv pip install --python ..\data\.venv-planner-evolution\Scripts\python.exe -r requirements.txt -r evals\requirements-planner-evolution.txt
+$PlannerPython = '..\data\.venv-planner-evolution\Scripts\python.exe'
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution optimize --demo --out-dir ..\data\evaluation-runs\planner-demo-01
+```
+
+前两条环境命令创建单独的虚拟环境并安装项目依赖及 GEPA 0.1.4。演示执行真实 GEPA 搜索，Planner、Judge 与反思结果用脚本构造，模型调用量为零。它写入新的 `experiment.json` 和 `candidate.json`，输出留出集覆盖率和门禁状态。演示产物带 `scripted_demo` 标签，可用于验收流程。
+
+### 准备评分集与坏例
+
+以 `backend/evals/agent_eval_ext/fixtures/planner_evolution_demo.json` 为结构模板，建立 `planner-reviewed.json`。每题标注独立的必答维度，模型评分时须为每个维度返回实际任务编号。`group` 相同的题须在同一分组，模型改写的问题也放在原题分组。三个 `split` 为 `train`、`validation` 和 `holdout`。自建并复核的数据将 `provenance` 设为 `reviewed`。建议准备约 30 题，覆盖实际问题的类型和难度。
+
+`seed-case` 可从现有评测卷选择一个 `report-benchmark` 坏例。它按已有 owner 和 Bad Case ID 查记录并验证原始输入指纹。运营者复核轨迹并确认属于 Planner 漏项后，填写 `--aspect`。下列命令的尖括号值需要替换为本机实际路径或 ID。
+
+```powershell
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution seed-case --job-root '<评测卷目录>' --owner '<当前案例用户ID>' --bad-case-id '<坏例ID>' --case-id planner-gap-01 --group research-comparison --aspect '参考解定义' --aspect '测试硬件' --aspect '时间预算' --out .\planner-gap-01.json
+```
+
+`--job-root` 指含 `closure-v1.sqlite3` 的评测目录。命令从已有记录读出问题和研究深度，生成一条带来源 ID 的 `train` 样本。把该对象加入 `planner-reviewed.json` 的 `cases` 数组后再运行优化。对于独立的留出题，标注人员先确定案例和评分口径，再让优化器运行。
+
+### 真实模型验证与发布
+
+复用项目根目录 `.env` 中的 `MODEL_*` 和供应商配置。`EVAL_JUDGE_MODEL` 需指定不同于所有被测节点及反思模型的固定模型。`--reflector` 可指定专门的反思模型，省略时复用 Planner 的模型。局部研究正常使用的密钥和 Judge 配置由现有模型工厂读取。
+
+```powershell
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution optimize --live --dataset .\planner-reviewed.json --out-dir ..\data\evaluation-runs\planner-01 --max-evals 80 --proposals 4
+```
+
+`--max-evals` 限制整轮 Planner/Judge 案例对数，含留出集两个版本的运行。`--proposals` 控制 GEPA 的候选搜索次数，`--min-gain` 默认要求至少提高 5 个百分点。CLI 写入 Prompt 差异、模型路由、数据指纹与逐题覆盖结果。所有留出题须完成判定，已经覆盖的维度丢失也会拦截候选。真实模型模式可能产生费用。若搜索没有选出可验证的改进，结果保留在 `experiment.json`，命令返回非零状态。
+
+```powershell
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution report --live --experiment ..\data\evaluation-runs\planner-01\experiment.json --out-dir ..\data\evaluation-runs\planner-01-report
+```
+
+报告阶段按同一批固定报告题分别运行基线和候选，使用现有独立引用 Judge、Trace 与增量落盘。每一臂的路径与配置指纹彼此独立。`--case-id llm-memory` 可先做一次可选的单题试运行。发布要求完整报告集、对应的 Prompt 与模型指纹、候选达到项目的报告门槛，并且报告完成与引用支持率相比基线没有回退。
+
+评分中断后，如果该次报告 A/B 的各案例研究草稿均已落盘，可在新目录运行 `report`，加 `--resume-from <旧目录的 progress>`，沿用原评分配置。草稿与有效批次由原 Harness 校验和复用。
+
+```powershell
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution release --experiment ..\data\evaluation-runs\planner-01\experiment.json --report ..\data\evaluation-runs\planner-01-report\report-ab.json --out-dir ..\data\evaluation-runs\planner-01-release --approved-by '你的名字'
+```
+
+此命令从逐题记录重新验证两层门禁，写入审批记录 `release.json`、发布配置 `apply.json` 和回滚配置 `rollback.json`，属于本地审阅命令。确认 Agent 设置里的当前 Planner 对应实验基线后，把 `apply.json` 中 `preferences.prompt_overrides.planner` 的文字保存到 Planner 设置。回滚时应用 `rollback.json` 中的值，`null` 对应恢复默认。新 Run 首次执行时会冻结当次 Prompt，已有审批任务继续读取自己的快照。下轮优化把当前已批准的内容保存为 `{"planner": "当前 Prompt"}`，使用 `optimize --baseline <文件>`。
+
+这里的覆盖率按题平均，分母是人工标注的必答维度。报告回归集用于守住既有能力，已知报告坏例可用于开发。实验 JSON 中的全量 Claim 判定率是引用 Judge 的覆盖程度，支持率单独衡量已判定的引用。正式简历结果使用真实模型留出成绩，保留样本量、配置与对应实验产物。
+
+### 发布证据与失败保存
+
+优化输出目录会在模型调用前实际试写，逐次观测、候选冻结与完成状态以独占文件写入 `journal/`。
+反思失败时仍可查看此前已保存的观测；日志写入失败会停止后续调用。日志用于排查和核对花费来源，
+不表示可以自动恢复 GEPA 的内部搜索状态，也不承诺崩溃窗口内零重复计费。
+反思或日志保存失败后会锁定停止状态，避免 GEPA 捕获异常后的回退路径再次请求模型；供应商 SDK
+原有重试机制保持不变，不能把应用层停止保护理解为所有 HTTP 请求都绝不重试。
+
+真实留出门禁要求每个维度都有对应任务编号或明确的空列表，发布时从这些证据重算覆盖率。
+未披露实际 Judge 身份时可以保留观测，但不得通过发布门禁。报告门禁严格校验布尔状态、报告与逐 Claim
+判定，重建两臂的实际 Judge 身份并排除与研究或反思模型重合的情况；汇总字段不能代替逐条证据。
+
+该功能通过 CLI 生成发布和回滚配置，仍需人工在现有 Agent 设置中应用。前端「自进化」页面（`/evolution`，与评测中心同为
+仅服务端能力）描述闭环流程并提供坏例回流入口；付费优化、报告 A/B 与发布仍只能由 CLI 发起，页面不提供自动运行或
+自动批准。运行级 Prompt 快照复用已有实现。离线演示与故障注入验证流程正确性，不代表已证明真实模型质量提升。
+
+### 评测中心接入与坏例回流
+
+自进化与评测中心通过评测卷上的 `planner-evolution/` 目录共享证据：
+
+- `cases/`：复核归因为 Planner 漏项的回流记录，参与数据集组装
+- `reviews/`：归因检索或报告环节的复核记录，仅作证据保留，不进优化数据集
+- `experiments/`：CLI `--out-dir` 约定目录；页面扫描 `experiment.json`、`report-gate.json` 与 `release.json` 的摘要投影，不返回逐题观测正文
+
+回流 API（`/evaluation/evolution/*`，仅服务端）复用 `seed-case` 的同一套校验：坏例必须属于已测量的
+report-benchmark 运行，且最近一次输入指纹与基准题源一致。去重顺序为案例 ID → 坏例来源 → 问题文本；
+`reviews/` 记录同样参与坏例去重，先归因检索再改归因 Planner 的二次回流会被拦截。回流写入前预检分组与
+种子数据集的 split 冲突与种子查重，合并视图只做兑底披露。评测轨迹默认只含元数据，Planner 实际任务列表
+不被补造；复核结论由复核人对照评测中心轨迹填写。
+
+开发集是仓库内 reviewed 种子（`evals/datasets/planner/planner-reviewed-v1.json`，30 题，训练/验证/留出
+三 split）加上回流训练例；报告基准的必答维度标注在 `benchmark-aspects-v1.json`，供回流预填与复核参照。
+两者已登记进数据集注册表（`planner-evolution-reviewed`，标注为由规划演化 CLI 评分，不由评测 Worker 运行）。
+`dataset` 子命令导出与页面同源的活跃数据集，直接交给 `optimize --dataset`：
+
+```powershell
+& $PlannerPython -m evals.agent_eval_ext.planner_evolution dataset --cases-dir '<评测卷>\planner-evolution\cases' --out .\planner-active.json
+```
+
+汇总页面入口为 `/evolution`：闭环流程与各阶段状态、坏例回流表单（按基准标注预填）、开发集合并视图与
+实验证据摘要；命令模板内嵌在实验记录页。
+
+## 按模型查看 Token 用量
+
+评测总览与单题诊断提供模型用量表，分别显示研究和独立 Judge 的输入、输出、已披露合计、调用次数和用量缺失数。
+按当前 Pipeline、数据集及案例的同轮证据汇总，不把父节点与 LLM span 同时累计，也不将恢复批次计入本轮新增消耗。
+校准和证据评测的模型调用可以来自执行轨迹；没有采集的向量化或工具服务用量不会估算成模型 Token。
+
+普通研究工作台和历史会话报告复用同一展示。新研究的每次模型调用通过现有事件端口写入 `agent_logs` 的
+`llm_usage` 事件，包含角色、配置路由、实际披露模型、输入/输出计数与调用状态，不记录 Prompt、正文或密钥。
+Web 与桌面共用查询和汇总；暂停与恢复继续读取同一运行的事件，不从累计检查点反复相加。不需要新增数据库表。
+
+没有供应商用量时显示未披露；只有部分用量时显示已披露部分。实际模型身份缺失时保留配置路由作为参考，
+不把配置名称当成供应商已证明的模型。脚本用量明确标注未调用供应商。旧记录缺少按模型事件时，不能从历史总数
+反推角色或模型消耗；旧版累计仅作为原记录展示，默认零值不当作已测量零消耗。Token 不等于实际费用，
+供应商未披露的 SDK 内部重试及中断前消耗可能不可见。

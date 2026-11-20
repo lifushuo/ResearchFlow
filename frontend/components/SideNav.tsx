@@ -178,6 +178,15 @@ export function SideNav({ user }: { user?: User }) {
             onClick={() => isMobile && setMobileOpen(false)}
           />
         )}
+        {!isDesktop && (
+          <NavItem
+            href="/evolution"
+            label="自进化"
+            icon={<IconResearch />}
+            collapsed={collapsed && !isMobile}
+            onClick={() => isMobile && setMobileOpen(false)}
+          />
+        )}
         {/* 项目对话依赖 pgvector 项目记忆；由宿主报告可用性，不能用构建标志代替能力检查。 */}
         {projectChat && (
           <div className="my-2 border-t border-border" aria-hidden />
