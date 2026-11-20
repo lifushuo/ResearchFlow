@@ -34,6 +34,7 @@ from app.services.planner_evolution_center import (
     BackflowError,
     backflow,
     benchmark_bad_cases,
+    benchmark_cases,
     list_experiments,
     load_benchmark_annotations,
     merged_dataset,
@@ -275,6 +276,12 @@ def evolution_bad_cases(
     owner: str = Depends(_closure_owner),
 ):
     return _evolution_call(benchmark_bad_cases, store, owner, review_status=review_status)
+
+
+@router.get("/evolution/benchmark-cases")
+def evolution_benchmark_cases(_root: Path = Depends(_evaluation_root)):
+    """评测中心基准题目与人工标注，供自进化页选题回流（只读）。"""
+    return _evolution_call(benchmark_cases)
 
 
 @router.get("/evolution/experiments")

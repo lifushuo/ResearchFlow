@@ -55,6 +55,21 @@ export type BenchmarkAnnotations = {
   aspects: Record<string, { required_aspects: string[]; rationale: string }>;
 };
 
+export type BenchmarkCase = {
+  case_id: string;
+  query: string;
+  depth: string;
+  required_aspects: string[] | null;
+  rationale: string | null;
+};
+
+export type BenchmarkCaseSet = {
+  dataset_id: string;
+  case_count: number;
+  annotated_case_count: number;
+  cases: BenchmarkCase[];
+};
+
 export type EvolutionBadCase = {
   bad_case_id: string;
   case_id: string;
@@ -145,6 +160,10 @@ export function evolutionAnnotations() {
 
 export function evolutionBadCases() {
   return apiFetch<{ bad_cases: EvolutionBadCase[]; annotated_cases: number }>(`${base}/bad-cases`);
+}
+
+export function evolutionBenchmarkCases() {
+  return apiFetch<BenchmarkCaseSet>(`${base}/benchmark-cases`);
 }
 
 export function evolutionExperiments() {

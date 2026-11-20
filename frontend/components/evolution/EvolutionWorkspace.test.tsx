@@ -8,6 +8,7 @@ const api = vi.hoisted(() => ({
   dataset: vi.fn(),
   annotations: vi.fn(),
   badCases: vi.fn(),
+  benchmarkCases: vi.fn(),
   experiments: vi.fn(),
   backflow: vi.fn(),
 }));
@@ -17,11 +18,42 @@ vi.mock("@/lib/evaluation-evolution", () => ({
   evolutionDataset: api.dataset,
   evolutionAnnotations: api.annotations,
   evolutionBadCases: api.badCases,
+  evolutionBenchmarkCases: api.benchmarkCases,
   evolutionExperiments: api.experiments,
   evolutionBackflow: api.backflow,
   evolutionError: (error: unknown) => `错误：${String(error)}`,
   stageLabel: { planner: "Planner 漏项（进开发集）", retrieval: "检索环节问题（仅存证）", report: "报告环节问题（仅存证）" },
   splitLabel: { train: "训练集", validation: "验证集", holdout: "留出集" },
+}));
+
+vi.mock("@/lib/evaluation-datasets", () => ({
+  evaluationDatasets: vi.fn().mockResolvedValue({
+    schema_version: 1,
+    registry_sha256: "ab".repeat(32),
+    read_only: true,
+    datasets: [
+      {
+        id: "report-benchmark",
+        title: "报告基准评测",
+        origin: "upstream",
+        category: "report",
+        split: "dev_holdout",
+        collection: "cases",
+        source: "evals/queries.json",
+        declared_count: 10,
+        verified_count: 10,
+        count_basis: "source_verified",
+        source_status: "available",
+        source_sha256: "cd".repeat(32),
+        supporting_file_count: 1,
+        supporting_files_valid: true,
+        execution: "online",
+        score_family: "report",
+        description: "十道报告题",
+        warnings: [],
+      },
+    ],
+  }),
 }));
 
 const overview: EvolutionOverview = {
@@ -96,6 +128,20 @@ beforeEach(() => {
     aspects: { "llm-memory": { required_aspects: badCase.suggested_aspects!, rationale: "四个可核查维度" } },
   });
   api.badCases.mockResolvedValue({ bad_cases: [badCase], annotated_cases: 10 });
+  api.benchmarkCases.mockResolvedValue({
+    dataset_id: "report-benchmark",
+    case_count: 10,
+    annotated_case_count: 10,
+    cases: [
+      {
+        case_id: "postgres-vs-mysql",
+        query: "Compare transactional semantics of Postgres and MySQL.",
+        depth: "balanced",
+        required_aspects: ["transaction semantics differences", "replication characteristics"],
+        rationale: "选型对比维度",
+      },
+    ],
+  });
   api.experiments.mockResolvedValue([
     {
       name: "planner-demo-01",
@@ -183,6 +229,21 @@ it("开发数据集按 split 展示种子与回流题目", async () => {
   expect(screen.getByText(/来自坏例 bc-1/)).toBeVisible();
   fireEvent.change(screen.getByLabelText("按 split 筛选"), { target: { value: "validation" } });
   expect(screen.queryByText("tsp-baselines")).toBeNull();
+});
+
+it("开发数据集列出评测中心注册表并从基准题预填回流", async () => {
+  render(<EvolutionWorkspace />);
+  fireEvent.click(await screen.findByRole("button", { name: "开发数据集" }));
+  expect(await screen.findByText(/评测中心数据集注册表/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "展开数据集" }));
+  expect(screen.getByText("报告基准评测")).toBeVisible();
+  expect(screen.getByText("可选题回流")).toBeVisible();
+  fireEvent.click(await screen.findByRole("button", { name: "预填回流" }));
+  const query = await screen.findByLabelText("研究问题");
+  expect((query as HTMLTextAreaElement).value).toContain("Postgres");
+  const aspects = screen.getByLabelText("必答维度（每行一条；已按基准标注预填，请对照轨迹确认或修改）");
+  expect((aspects as HTMLTextAreaElement).value).toContain("transaction semantics differences");
+  expect(api.backflow).not.toHaveBeenCalled();
 });
 
 it("实验记录展示留出集门禁结论与证据来源", async () => {

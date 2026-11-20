@@ -412,6 +412,35 @@ def list_experiments(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def benchmark_cases() -> dict[str, Any]:
+    """report-benchmark 题目与人工维度标注，供自进化页从评测中心选题回流。
+
+    题目原文来自评测中心的同源题集，维度来自人工维护标注；两者都不在这里生成。
+    未标注的题保留 ``required_aspects=None``，由复核人在回流表单里自行填写。
+    """
+    cases, _ = sources("report-benchmark", 0)
+    annotations = load_benchmark_annotations()["aspects"]
+    rows = []
+    for case_id, source in cases.items():
+        case = source["case"]
+        annotation = annotations.get(case_id, {})
+        rows.append(
+            {
+                "case_id": case_id,
+                "query": case.get("query"),
+                "depth": case.get("depth", "balanced"),
+                "required_aspects": annotation.get("required_aspects"),
+                "rationale": annotation.get("rationale"),
+            }
+        )
+    return {
+        "dataset_id": "report-benchmark",
+        "case_count": len(rows),
+        "annotated_case_count": len(annotations),
+        "cases": rows,
+    }
+
+
 def benchmark_bad_cases(
     store: EvaluationClosure, owner: str, *, review_status: str | None = None
 ) -> dict[str, Any]:

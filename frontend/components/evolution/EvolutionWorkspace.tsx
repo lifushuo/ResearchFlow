@@ -6,6 +6,7 @@ import {
   evolutionAnnotations,
   evolutionBackflow,
   evolutionBadCases,
+  evolutionBenchmarkCases,
   evolutionDataset,
   evolutionError,
   evolutionExperiments,
@@ -14,11 +15,14 @@ import {
   stageLabel,
   type BackflowRequest,
   type BenchmarkAnnotations,
+  type BenchmarkCase,
+  type BenchmarkCaseSet,
   type EvolutionBadCase,
   type EvolutionDatasetState,
   type EvolutionExperimentRow,
   type EvolutionOverview,
 } from "@/lib/evaluation-evolution";
+import { evaluationDatasets, type DatasetEntry } from "@/lib/evaluation-datasets";
 
 const button = "rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-40 hover:bg-bg-base";
 const input = "min-w-0 w-full rounded-lg border border-border bg-bg-base p-2 text-sm";
@@ -92,17 +96,26 @@ function FlowOverview({ overview, annotations }: { overview: EvolutionOverview |
   );
 }
 
-function BackflowPanel({ onChanged }: { onChanged: () => void }) {
+type BackflowPrefill = {
+  query: string;
+  depth: string;
+  aspects: string[];
+  caseId: string;
+  group: string;
+};
+
+function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill: BackflowPrefill | null }) {
   const [cases, setCases] = useState<EvolutionBadCase[]>([]);
   const [annotations, setAnnotations] = useState<BenchmarkAnnotations | null>(null);
   const [selected, setSelected] = useState<EvolutionBadCase | null>(null);
-  const [manualMode, setManualMode] = useState(false);
-  const [caseId, setCaseId] = useState("");
-  const [group, setGroup] = useState("");
-  const [aspects, setAspects] = useState("");
+  const [manualMode, setManualMode] = useState(prefill !== null);
+  const [caseId, setCaseId] = useState(prefill?.caseId ?? "");
+  const [group, setGroup] = useState(prefill?.group ?? "");
+  const [aspects, setAspects] = useState((prefill?.aspects ?? []).join("\n"));
   const [note, setNote] = useState("");
   const [stage, setStage] = useState<BackflowRequest["stage"]>("planner");
-  const [manualQuery, setManualQuery] = useState("");
+  const [manualQuery, setManualQuery] = useState(prefill?.query ?? "");
+  const manualDepth = prefill?.depth ?? "balanced";
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [busy, setBusy] = useState(false);
@@ -135,7 +148,7 @@ function BackflowPanel({ onChanged }: { onChanged: () => void }) {
     setBusy(true); setError(""); setDone("");
     const aspectList = aspects.split("\n").map((x) => x.trim()).filter(Boolean);
     const body: BackflowRequest = manualMode
-      ? { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, manual_query: manualQuery, manual_depth: "balanced" }
+      ? { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, manual_query: manualQuery, manual_depth: manualDepth as BackflowRequest["manual_depth"] }
       : { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, bad_case_id: selected?.bad_case_id };
     try {
       const record = await evolutionBackflow(body);
@@ -209,16 +222,79 @@ function BackflowPanel({ onChanged }: { onChanged: () => void }) {
   );
 }
 
-function DatasetPanel({ state, revision, onReload }: { state: EvolutionDatasetState | null; revision: number; onReload: () => void }) {
+function DatasetPanel({
+  state,
+  revision,
+  onReload,
+  registry,
+  benchmark,
+  onReflow,
+}: {
+  state: EvolutionDatasetState | null;
+  revision: number;
+  onReload: () => void;
+  registry: DatasetEntry[];
+  benchmark: BenchmarkCaseSet | null;
+  onReflow: (prefill: BackflowPrefill) => void;
+}) {
   const [filter, setFilter] = useState<string>("all");
+  const [registryOpen, setRegistryOpen] = useState(false);
   const cases = state?.dataset?.cases;
   const visible = cases?.filter((c) => filter === "all" || c.split === filter) ?? [];
+  const reflowCase = (row: BenchmarkCase) => {
+    const aspects = row.required_aspects ?? [];
+    onReflow({
+      query: row.query,
+      depth: row.depth,
+      aspects,
+      caseId: `planner-gap-${row.case_id.slice(0, 24).replace(/[^a-zA-Z0-9._-]/g, "-").toLowerCase()}`,
+      group: row.case_id.replace(/[^a-zA-Z0-9._-]/g, "-").toLowerCase(),
+    });
+  };
   return (
     <section className="space-y-4" aria-label="开发数据集">
       <p className="text-sm text-text-muted">
-        开发集 = 仓库内 reviewed 种子数据集 + 坏例回流训练例。GEPA 只接触训练与验证 split；留出集在候选冻结后独立评分。
-        CLI 用 <code>dataset</code> 子命令导出与本页同源的活跃数据集交给 <code>optimize --dataset</code>。
+        先在此查看评测中心当前数据集，从 report-benchmark 选题并预填回流；回流后的训练集与下方自进化开发集合并，交给 GEPA 优化。
+        GEPA 只接触训练与验证 split；留出集在候选冻结后独立评分。
       </p>
+      <div className="rounded-lg border border-border p-4 space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="font-semibold">评测中心数据集注册表（{registry.length || "…"} 套，只读）</p>
+          <button className={button} onClick={() => setRegistryOpen((v) => !v)}>
+            {registryOpen ? "收起" : "展开数据集"}
+          </button>
+        </div>
+        <p className="text-xs text-text-muted">与评测中心「数据集」页同源；数量来源与执行方式各不相同，不可合成为总准确率。</p>
+        {registryOpen && (
+          <ul className="space-y-1">
+            {registry.map((row) => (
+              <li key={row.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-2 text-sm">
+                <span className="font-medium">{row.title}</span>
+                <span className={chip}>{row.id}</span>
+                <span className={chip}>{row.declared_count} 题</span>
+                <span className={chip}>{row.count_basis === "source_verified" ? "源已核对" : row.count_basis === "registry_declared" ? "清单声明" : "仅上报"}</span>
+                {row.id === "report-benchmark" && <span className="chip text-accent">可选题回流</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="rounded-lg border border-border p-4 space-y-2">
+        <p className="font-semibold">从评测中心题目预填回流</p>
+        <p className="text-xs text-text-muted">
+          report-benchmark 的题目与人工维度标注来自评测中心；选择后跳到「坏例回流」并预填问题、分组与必答维度，复核结论仍需你对照轨迹填写。
+        </p>
+        {!benchmark && <p className="text-sm text-text-muted">正在读取基准题目…</p>}
+        <ul className="space-y-1">
+          {(benchmark?.cases ?? []).map((row) => (
+            <li key={row.case_id} className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-2 text-sm">
+              <span className="font-medium">{row.case_id}</span>
+              <span className="text-xs text-text-muted">{row.query}</span>
+              <button className={button} onClick={() => reflowCase(row)}>预填回流</button>
+            </li>
+          ))}
+        </ul>
+      </div>
       {state?.error && <p role="alert" className="text-sm">合并失败：{state.error}（请在坏例回流中修正分组）</p>}
       {state && (
         <div className="flex flex-wrap gap-2" role="status">
@@ -342,6 +418,9 @@ export default function EvolutionWorkspace() {
   const [experiments, setExperiments] = useState<EvolutionExperimentRow[]>([]);
   const [experimentsLoaded, setExperimentsLoaded] = useState(false);
   const [datasetRevision, setDatasetRevision] = useState(0);
+  const [registry, setRegistry] = useState<DatasetEntry[]>([]);
+  const [benchmark, setBenchmark] = useState<BenchmarkCaseSet | null>(null);
+  const [prefill, setPrefill] = useState<BackflowPrefill | null>(null);
   const [error, setError] = useState("");
 
   const reloadAll = useCallback(() => {
@@ -349,6 +428,8 @@ export default function EvolutionWorkspace() {
     evolutionOverview().then((r) => { if (alive) { setOverview(r); setError(""); } }).catch((e) => { if (alive) setError(evolutionError(e)); });
     evolutionDataset().then((r) => { if (alive) setDatasetState(r); }).catch(() => undefined);
     evolutionAnnotations().then((r) => { if (alive) setAnnotations(r); }).catch(() => undefined);
+    evolutionBenchmarkCases().then((r) => { if (alive) setBenchmark(r); }).catch(() => undefined);
+    evaluationDatasets().then((r) => { if (alive) setRegistry(r.datasets); }).catch(() => undefined);
     evolutionExperiments().then((r) => { if (alive) { setExperiments(r); setExperimentsLoaded(true); } }).catch(() => { if (alive) setExperimentsLoaded(true); });
     return () => { alive = false; };
   }, []);
@@ -379,8 +460,17 @@ export default function EvolutionWorkspace() {
         ))}
       </nav>
       {tab === "flow" && <FlowOverview overview={overview} annotations={annotations} />}
-      {tab === "backflow" && <BackflowPanel onChanged={reloadAll} />}
-      {tab === "dataset" && <DatasetPanel state={datasetState} revision={datasetRevision} onReload={() => { setDatasetRevision((x) => x + 1); reloadAll(); }} />}
+      {tab === "backflow" && <BackflowPanel key={prefill?.caseId ?? "blank"} onChanged={reloadAll} prefill={prefill} />}
+      {tab === "dataset" && (
+        <DatasetPanel
+          state={datasetState}
+          revision={datasetRevision}
+          onReload={() => { setDatasetRevision((x) => x + 1); reloadAll(); }}
+          registry={registry}
+          benchmark={benchmark}
+          onReflow={(value) => { setPrefill(value); setTab("backflow"); }}
+        />
+      )}
       {tab === "experiments" && (
         <div className="space-y-8">
           <ExperimentsPanel rows={experiments} loaded={experimentsLoaded} />

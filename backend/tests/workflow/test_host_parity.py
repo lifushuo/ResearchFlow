@@ -180,6 +180,7 @@ INTENTIONAL_SERVER_ONLY: dict[str, str] = {
             "GET /evaluation/evolution/dataset",
             "GET /evaluation/evolution/annotations",
             "GET /evaluation/evolution/bad-cases",
+            "GET /evaluation/evolution/benchmark-cases",
             "POST /evaluation/evolution/backflow",
             "GET /evaluation/evolution/experiments",
         )

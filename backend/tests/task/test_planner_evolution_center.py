@@ -13,6 +13,7 @@ from app.services.planner_evolution_center import (
     BackflowError,
     backflow,
     benchmark_bad_cases,
+    benchmark_cases,
     list_experiments,
     load_benchmark_annotations,
     load_seed_dataset,
@@ -165,6 +166,19 @@ def test_bad_case_listing_prefills_annotations(tmp_path: Path) -> None:
     assert row["case_id"] == BENCH_CASE
     assert row["suggested_aspects"], "回流预填必须带基准维度标注"
     assert result["annotated_cases"] == 10
+
+
+def test_benchmark_cases_expose_real_queries_and_annotations() -> None:
+    result = benchmark_cases()
+    assert result["dataset_id"] == "report-benchmark"
+    assert result["case_count"] == result["annotated_case_count"] == 10
+    source_cases, _ = sources("report-benchmark", 0)
+    rows = {row["case_id"]: row for row in result["cases"]}
+    assert set(rows) == set(source_cases)
+    for case_id, row in rows.items():
+        assert row["query"] == source_cases[case_id]["case"]["query"]
+        assert len(row["required_aspects"]) >= 2
+        assert row["rationale"]
 
 
 def test_annotations_cover_every_benchmark_case() -> None:
@@ -336,6 +350,10 @@ def test_api_backflow_conflict_and_read_endpoints(
         annotations = client.get("/api/v1/evaluation/evolution/annotations")
         assert annotations.status_code == 200
         assert len(annotations.json()["aspects"]) == 10
+
+        benchmark = client.get("/api/v1/evaluation/evolution/benchmark-cases")
+        assert benchmark.status_code == 200
+        assert benchmark.json()["case_count"] == 10
 
         state = client.get("/api/v1/evaluation/evolution/overview")
         assert state.status_code == 200
