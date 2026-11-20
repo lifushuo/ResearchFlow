@@ -174,11 +174,25 @@ def changelog(ctx: Ctx) -> Outcome:
     return ok(f"v{ctx.version} — {heading}")
 
 
+#: A1.08's private packages are three manifests pinned at 0.1.0 that publish nothing.
+#: A third-party dependency's installed version is not a carrier: it records which
+#: optimizer actually produced an experiment, and must not be guessed from a pin.
+#: Keyed by file so a new reader has to be named here explicitly to be allowed.
+THIRD_PARTY_VERSION_READS: dict[str, str] = {
+    "backend/evals/agent_eval_ext/planner_evolution/__main__.py": "gepa",
+}
+
+
 @check("A1.08", 1, "Nothing reads the private package versions (they are not version carriers)")
 def non_carriers(ctx: Ctx) -> Outcome:
     # frontend/package.json, desktop/package.json and research_engine/pyproject.toml say 0.1.0
     # and are published nowhere. The day something reads one, it becomes a carrier
     # sync_version.py does not know about — which is how /health said 1.0.0 for two releases.
+    #
+    # Reading an *installed third-party* version is different: the experiment record must name
+    # the optimizer that actually ran (docs/08 §Planner Prompt 自进化), and a pin cannot stand
+    # in for it. Only the named file/distribution pair below is exempt; a new reader has to
+    # be reviewed into this table, and any read in another file still fails.
     readers = []
     for p in ctx.tracked():
         if (
@@ -189,12 +203,23 @@ def non_carriers(ctx: Ctx) -> Outcome:
         ):
             continue
         text = ctx.read(p)
-        if re.search(
+        package_read = re.search(
             r"npm_package_version|importlib\.metadata|from ['\"][./]*package\.json['\"]"
             r"|require\(['\"][./]*package\.json['\"]\)|CARGO_PKG_VERSION",
             text,
-        ):
-            readers.append(p)
+        )
+        if not package_read:
+            continue
+        allowed_dist = THIRD_PARTY_VERSION_READS.get(p)
+        if allowed_dist and package_read.group(0) == "importlib.metadata":
+            # A named third-party read, and no other version source in the same file.
+            called = re.findall(r"\bversion\(\s*['\"]([^'\"]+)['\"]\s*\)", text)
+            if called and set(called) == {allowed_dist} and not re.search(
+                r"npm_package_version|package\.json|CARGO_PKG_VERSION|from importlib\.metadata import version\s*,\s*",
+                text,
+            ):
+                continue
+        readers.append(p)
     problems = [
         f"{p} is not private"
         for p in ("frontend/package.json", "desktop/package.json")

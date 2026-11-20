@@ -276,7 +276,7 @@ behind for a whole patch line; a tag pushed ahead of its bump would have publish
 | A1.05 | This release's entry has a headline, `improved`, `improvedSummary`, and `known` + `knownSummary` (empty `known` is a WARN to confirm) | all |
 | A1.06 | Pre-tag: entry is `unreleased: true`. Post-release: it is not, and its date is the tag's | pre-tag → post-release |
 | A1.07 | The changelog has `## vX.Y.Z — unreleased` (pre-tag) / `— <date>` matching `releases.ts` (post-release), with a **Known** block | pre-tag → post-release |
-| A1.08 | The private package manifests stay non-carriers: nothing reads a package version | all |
+| A1.08 | The private package manifests stay non-carriers: nothing reads a private package version. An installed third-party version recorded for experiment provenance is a named exception (`scripts/release_checks/repository.py::THIRD_PARTY_VERSION_READS`) | all |
 | A1.09 | Every line of user-facing text that names a version is in `release-audit/historical-references.json` with a reason; no stale entries | all |
 | A1.10 | No user-facing text names a version newer than this release | all |
 | A1.11 | Pre-tag: the working tree is clean and `HEAD` is `origin/main` | pre-tag |

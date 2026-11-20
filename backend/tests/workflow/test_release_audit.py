@@ -72,6 +72,7 @@ from release_checks.evaluate import (  # noqa: E402
     setup_steps,
     version_references,
 )
+from release_checks.repository import THIRD_PARTY_VERSION_READS  # noqa: E402
 
 V = "9.8.7"
 #: The last version that published Windows and Linux installers.
@@ -865,6 +866,44 @@ def test_the_record_parser_reads_statuses_and_the_sign_off():
     assert statuses == {"M7.03": "PASS", "M8.01": "NOT RUN"}
     assert approved
     assert parse_record(record.replace("[x]", "[ ]"))[1] is False
+
+
+def test_a_third_party_provenance_read_is_allowed_but_a_new_one_is_not():
+    path = "backend/evals/agent_eval_ext/planner_evolution/__main__.py"
+    assert THIRD_PARTY_VERSION_READS[path] == "gepa"
+    a1_08 = next(c for c in REGISTRY if c.id == "A1.08")
+
+    def audit(files: dict[str, str]) -> Outcome:
+        args = argparse.Namespace(
+            version=V,
+            stage="ci",
+            root=Path("."),
+            offline=True,
+            download=False,
+            docker=False,
+            repo="o/r",
+            site="https://example.test",
+            previous=None,
+        )
+        ctx = Ctx(args)
+        fixtures = {
+            "frontend/package.json": '{"private": true}',
+            "desktop/package.json": '{"private": true}',
+            **files,
+        }
+        ctx.read = fixtures.get  # type: ignore[method-assign]
+        ctx.tracked = lambda: list(fixtures)  # type: ignore[method-assign]
+        return a1_08.fn(ctx)
+
+    provenance = "from importlib.metadata import version\noptimizer = version('gepa')\n"
+    assert audit({path: provenance}).status == PASS
+    # The same call in a new file has no named exception.
+    assert audit({"backend/new_reader.py": provenance}).status == FAIL
+    # A private package, or a second distribution smuggled into the exempt file, still fails.
+    private = "from importlib.metadata import version\nv = version('research_engine')\n"
+    assert audit({path: private}).status == FAIL
+    assert audit({path: provenance + "other = version('frontend')\n"}).status == FAIL
+    assert audit({path: provenance + "n = process.env.npm_package_version\n"}).status == FAIL
 
 
 def test_a_squash_merged_pr_is_in_scope_as_surely_as_a_merge_commit():
