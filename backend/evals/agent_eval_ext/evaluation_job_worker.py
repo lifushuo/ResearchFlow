@@ -25,6 +25,10 @@ def _env() -> dict[str, str]:
         "HOME": "/tmp",
         "PYTHONUNBUFFERED": "1",
         "RF_EVAL_CONTENT_TRACE": "1",
+        # Without SystemRoot, Winsock cannot initialise in the child (WinError
+        # 10106): every offline suite that touches an HTTP client fails before
+        # writing any artifact. Absent on Linux, where the allowlist above is exact.
+        **({"SystemRoot": os.environ["SystemRoot"]} if "SystemRoot" in os.environ else {}),
         **({"RF_EVAL_TRACE_RUN_ID": trace.run_id} if trace is not None else {}),
     }
 

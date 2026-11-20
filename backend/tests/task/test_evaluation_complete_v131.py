@@ -1,4 +1,9 @@
-"""v1.3.1 eight-dataset execution contracts without paid model calls."""
+"""v1.3.1 dataset execution contracts without paid model calls.
+
+The registry also carries planner-evolution-reviewed (collection=cases): a
+planner-evolution training set scored by the CLI, not a runnable pipeline dataset,
+so the eight runnable contracts below are pinned separately from its inventory row.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from evals.agent_eval_ext.judge_calibration_runner_v131 import validate_source
 REQUEST = "d27c880d-84dc-4200-8888-c4eb79162fb9"
 
 
-def test_all_eight_verified_source_counts():
+def test_runnable_dataset_verified_source_counts():
     inventory = list_datasets()
     assert {x["id"]: x["verified_count"] for x in inventory["datasets"]} == {
         "report-benchmark": 10,
@@ -29,6 +34,7 @@ def test_all_eight_verified_source_counts():
         "planner-replay-v1": 4,
         "executor-regression-v1": 7,
         "tool-contract-v1": 4,
+        "planner-evolution-reviewed": 30,
     }
     assert all(x["source_status"] == "available" for x in inventory["datasets"])
     assert all(x["count_basis"] == "source_verified" for x in inventory["datasets"])

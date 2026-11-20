@@ -104,6 +104,9 @@ def run(output: Path, *, timeout: int = 180) -> dict:
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         "RF_EXECUTOR_CASE_TRACE_DIR": str(output.parent / "traces"),
         "RF_EVAL_TRACE_RUN_ID": os.environ.get("RF_EVAL_TRACE_RUN_ID") or output.parent.name,
+        # Without SystemRoot, Winsock cannot initialise in the nested pytest child
+        # (WinError 10106) and every collected test errors at import. Absent on Linux.
+        **({"SystemRoot": os.environ["SystemRoot"]} if "SystemRoot" in os.environ else {}),
     }
     # pytest-asyncio plugin is explicitly loaded; all other auto-loaded plugins
     # are excluded to keep this fixed suite deterministic.

@@ -48,6 +48,33 @@
         "cost_usd": 2.3e-05,
         "tokens_input": 100,
         "tokens_output": 50,
+        "token_usage": {
+          "schema_version": 1,
+          "scope": "observed_application_calls",
+          "models": [
+            {
+              "kind": "research",
+              "llm_mode": "fake",
+              "served_model": null,
+              "configured_model": null,
+              "roles": [
+                "planner"
+              ],
+              "calls": 1,
+              "failed_calls": 0,
+              "missing_usage_calls": 0,
+              "known_input_tokens": 100,
+              "known_output_tokens": 50,
+              "known_total_tokens": 150
+            }
+          ],
+          "calls": 1,
+          "missing_usage_calls": 0,
+          "collection_incomplete": false,
+          "known_input_tokens": 100,
+          "known_output_tokens": 50,
+          "known_total_tokens": 150
+        },
         "elapsed_seconds": null,
         "citation_resolution_rate": null,
         "error_message": null,
@@ -152,6 +179,36 @@
         "cost_usd": 0.000225,
         "tokens_input": 1000,
         "tokens_output": 500,
+        "token_usage": {
+          "schema_version": 1,
+          "scope": "observed_application_calls",
+          "models": [
+            {
+              "kind": "research",
+              "llm_mode": "fake",
+              "served_model": null,
+              "configured_model": null,
+              "roles": [
+                "critic",
+                "executor",
+                "planner",
+                "synthesizer"
+              ],
+              "calls": 10,
+              "failed_calls": 0,
+              "missing_usage_calls": 0,
+              "known_input_tokens": 1000,
+              "known_output_tokens": 500,
+              "known_total_tokens": 1500
+            }
+          ],
+          "calls": 10,
+          "missing_usage_calls": 0,
+          "collection_incomplete": false,
+          "known_input_tokens": 1000,
+          "known_output_tokens": 500,
+          "known_total_tokens": 1500
+        },
         "elapsed_seconds": null,
         "citation_resolution_rate": null,
         "error_message": null,
@@ -592,6 +649,36 @@
         "cost_usd": 0.000315,
         "tokens_input": 1400,
         "tokens_output": 700,
+        "token_usage": {
+          "schema_version": 1,
+          "scope": "observed_application_calls",
+          "models": [
+            {
+              "kind": "research",
+              "llm_mode": "fake",
+              "served_model": null,
+              "configured_model": null,
+              "roles": [
+                "critic",
+                "executor",
+                "planner",
+                "synthesizer"
+              ],
+              "calls": 14,
+              "failed_calls": 0,
+              "missing_usage_calls": 0,
+              "known_input_tokens": 1400,
+              "known_output_tokens": 700,
+              "known_total_tokens": 2100
+            }
+          ],
+          "calls": 14,
+          "missing_usage_calls": 0,
+          "collection_incomplete": false,
+          "known_input_tokens": 1400,
+          "known_output_tokens": 700,
+          "known_total_tokens": 2100
+        },
         "elapsed_seconds": null,
         "citation_resolution_rate": null,
         "error_message": null,
@@ -1316,6 +1403,36 @@
         "cost_usd": 0.000315,
         "tokens_input": 1400,
         "tokens_output": 700,
+        "token_usage": {
+          "schema_version": 1,
+          "scope": "observed_application_calls",
+          "models": [
+            {
+              "kind": "research",
+              "llm_mode": "fake",
+              "served_model": null,
+              "configured_model": null,
+              "roles": [
+                "critic",
+                "executor",
+                "planner",
+                "synthesizer"
+              ],
+              "calls": 14,
+              "failed_calls": 0,
+              "missing_usage_calls": 0,
+              "known_input_tokens": 1400,
+              "known_output_tokens": 700,
+              "known_total_tokens": 2100
+            }
+          ],
+          "calls": 14,
+          "missing_usage_calls": 0,
+          "collection_incomplete": false,
+          "known_input_tokens": 1400,
+          "known_output_tokens": 700,
+          "known_total_tokens": 2100
+        },
         "elapsed_seconds": null,
         "citation_resolution_rate": 1.0,
         "error_message": null,
