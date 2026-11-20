@@ -1,6 +1,7 @@
 "use client";
 
 import UnifiedExecutionTrace from "./UnifiedExecutionTrace";
+import { TokenUsagePanel } from "@/components/TokenUsagePanel";
 import { JudgeProgress, ReportEvaluationState } from "./JudgeProgress";
 
 import { useEffect, useState } from "react";
@@ -65,6 +66,7 @@ export function DiagnosticDetails({ pipe, dataset, initialCase = "" }: { pipe: s
       <p className="text-xs text-text-muted break-all">运行器开始：{data.execution_observation?.started_at || "原运行未记录"} · 结束：{data.execution_observation?.finished_at || "原运行未记录/尚未结束"} · 子进程退出码：{data.execution_observation?.exit_code ?? "未测量"}</p>
     </div>
     {!!data.report_states?.length && <details className="rounded-lg border border-border p-3"><summary className="cursor-pointer">草稿保存与评分恢复详情</summary><div className="mt-3 space-y-2">{data.report_states.map((s, i) => <ReportEvaluationState key={`${s.case_id}-${s.phase}-${i}`} state={s} />)}</div></details>}
+    <TokenUsagePanel usage={data.token_usage} title={data.case_id ? `${data.case_id} · 模型 Token 用量` : "本轮模型 Token 用量"} />
     {data.case_evidence && <section className="space-y-3" aria-label="本题原始报告与判定"><h3 className="font-semibold">本题报告与逐条 Claim 判定</h3>{!data.case_evidence.claims.length && <p>本题未保存 Claim 判定；不能视作评分通过。</p>}{data.case_evidence.claims.filter((c) => !c.judged || c.supported === false).map((c, i) => <div key={i} className="rounded border border-warning p-3"><p className="font-medium">{c.judged ? "已判定：证据不支持" : "未判定"}</p><p className="mt-1 text-sm">{c.text}</p></div>)}<details className="rounded border border-border p-3"><summary className="cursor-pointer">全部已保存 Claim 判定（{data.case_evidence.claims.length} 条）</summary>{data.case_evidence.claims.map((c, i) => <p key={i} className="mt-2 text-sm">{i + 1}. {c.judged ? c.supported ? "支持" : "不支持" : "未判定"} · {c.text}</p>)}{data.case_evidence.claims_truncated && <p>列表已截断，不代表全部输入。</p>}</details><details className="rounded border border-border p-3"><summary className="cursor-pointer">已保存报告正文（脱敏片段）</summary><pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words text-sm">{data.case_evidence.report_excerpt || "本题没有已保存的报告正文"}</pre>{data.case_evidence.report_truncated && <p>正文超过展示上限，片段已截断。</p>}</details></section>}
     <section aria-label="故障分析" className="space-y-3">
       <h3 className="font-semibold">异常事实与根因分析</h3>

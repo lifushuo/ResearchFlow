@@ -163,10 +163,10 @@ export function ReportPanel({ graph }: { graph: RunGraph }) {
         </div>
         <div>
           <dt className="font-mono text-[length:var(--text-micro)] uppercase tracking-wider text-text-muted">
-            Tokens
+            旧版累计 Token
           </dt>
           <dd className="mt-0.5 font-mono tabular-nums text-text-secondary">
-            {formatNumber(tokens)}
+            {tokens > 0 ? formatNumber(tokens) : "未披露"}
           </dd>
         </div>
       </dl>

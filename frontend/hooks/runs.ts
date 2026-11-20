@@ -230,6 +230,10 @@ export function useRunStream(runId: string, enabled: boolean, runKey?: string | 
         if (seen.has(id)) return;
         seen.add(id);
       }
+      if (payload.type === "llm_usage") {
+        qc.invalidateQueries({ queryKey: runKeys.run(runId) });
+        return;
+      }
       setEvents((prev) => [...prev, payload]);
 
       const gate = GATE_PARKS_AT[payload.type];

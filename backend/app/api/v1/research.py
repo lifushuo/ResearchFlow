@@ -184,7 +184,11 @@ async def get_session(
     current_user: User = Depends(get_current_user),
 ):
     session = await _authorized_session(db, session_id, current_user.id)
-    return SessionDetail.model_validate(session)
+    from app.services.model_usage import load_model_usage
+
+    return SessionDetail.model_validate(session).model_copy(
+        update={"token_usage": await load_model_usage(db, session.id)}
+    )
 
 
 async def _cited_session_store(db, session_id, document_id, current_user, corpus, also_in):

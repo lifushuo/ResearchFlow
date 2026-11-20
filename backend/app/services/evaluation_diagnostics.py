@@ -15,6 +15,7 @@ from app.services.evaluation_closure.core import SECRET_NAME, SECRET_STRING, inp
 from app.services.evaluation_jobs import now, update_status
 from app.services.evaluation_pipeline_v13 import DATASETS, _read_owned, _rows
 from app.services.evaluation_timeline import build_timeline, timestamp
+from app.services.evaluation_usage import model_token_usage as _model_token_usage
 from research_engine.response_diagnostics import safe_response_diagnostic
 from research_engine.trace_content import content_snapshot
 
@@ -209,6 +210,7 @@ def traces(base: Path, allowed_cases: list[str], *, journal=False, case_filter=N
                     "schema_status",
                     "parsing_error_type",
                     "strategy",
+                    "llm_mode",
                 ]:
                     if token(meta.get(name)):
                         safe_meta[name] = meta[name]
@@ -546,6 +548,8 @@ def judge_observations(
                         key: result.get(key)
                         for key in [
                             "case_id",
+                            "judge_route",
+                            "llm_mode",
                             "phase",
                             "trace_complete",
                             "observed_batches",
@@ -816,6 +820,12 @@ def analyze(request: dict, step: dict, base: Path, *, case_id=None) -> dict:
         "timeline": timeline,
         "traces": graph,
         "judge_traces": judges,
+        "token_usage": _model_token_usage(
+            graph,
+            judges,
+            [] if case_id else lifecycle,
+            scripted=DATASETS.get(step["dataset_id"]) == "offline",
+        ),
         "report_states": report_status,
         "execution_traces": lifecycle,
         "unified_trace": unified_trace(graph, judges, [] if case_id else lifecycle),

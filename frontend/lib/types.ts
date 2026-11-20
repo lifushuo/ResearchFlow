@@ -195,6 +195,7 @@ export interface SessionSummary {
 }
 
 export interface SessionDetail extends SessionSummary {
+  token_usage?: import("./token-usage").TokenUsage | null;
   draft_report: string | null;
   final_report: string | null;
   sources: Source[] | null;
@@ -540,6 +541,7 @@ export interface Run {
   tokens_input: number;
   tokens_output: number;
   elapsed_seconds: number | null;
+  token_usage?: import("./token-usage").TokenUsage | null;
   /** Null means UNMEASURED. Rendering it as 0 is the bug this field exists to prevent. */
   citation_resolution_rate: number | null;
   error_message: string | null;

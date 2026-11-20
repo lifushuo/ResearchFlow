@@ -85,6 +85,11 @@ export function useSessionStream(sessionId: string, enabled: boolean, runKey?: s
         return;
       }
 
+      if (payload.type === "llm_usage") {
+        qc.invalidateQueries({ queryKey: queryKeys.session(sessionId) });
+        return;
+      }
+
       if (payload.type === "HITL_READY" || payload.type === "COMPLETED" || payload.type === "FAILED") {
         // Authoritative status/draft/report/cost live on the session row.
         qc.invalidateQueries({ queryKey: queryKeys.session(sessionId) });

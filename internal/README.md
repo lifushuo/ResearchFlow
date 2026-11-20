@@ -15,6 +15,8 @@ If you want to know how the system actually works, read [`../docs/`](../docs/00_
 | File | What it is |
 |---|---|
 | `12_Launch_Plan.md` | Milestone plan M5–M19, defect log, budget and scale assumptions. Cited from source comments as `docs/12`. |
+| [`reliability/2026-11-10-baseline-audit.md`](reliability/2026-11-10-baseline-audit.md) | 可靠性测量盘点、现有能力边界与低成本基线方案；相邻目录保留本次离线测试、脚本评测和只读运行快照。 |
+| [`agent-evaluation/README.md`](agent-evaluation/README.md) | 当前评测说明、关键真实验收结论及原始证据目录索引。 |
 
 **Do not link to these from `docs/` or from the README.** The docs site renders every
 Markdown file under `docs/`, so a note that belongs here and is filed there gets published.

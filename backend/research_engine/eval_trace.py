@@ -25,6 +25,8 @@ import structlog
 from langgraph.errors import GraphBubbleUp
 
 from research_engine.response_diagnostics import safe_response_diagnostic
+from research_engine.token_usage import invoke as usage_invoke
+from research_engine.token_usage import usage_session
 from research_engine.trace_content import configured_secrets, content_snapshot
 
 _LOG = structlog.get_logger()
@@ -364,14 +366,15 @@ def traced_node(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 
         @wraps(fn)
         async def wrapped(state: Any, *args: Any, **kwargs: Any) -> Any:
-            if _ACTIVE.get() is None:
-                return await fn(state, *args, **kwargs)
-            with trace_span(name, kind="graph_node", inputs=state) as span:
-                result = await fn(state, *args, **kwargs)
-                span.observe(output=result)
-                if isinstance(result, dict) and result.get("error"):
-                    span.status = "business_error"
-                return result
+            with usage_session(state.get("session_id") if isinstance(state, dict) else None):
+                if _ACTIVE.get() is None:
+                    return await fn(state, *args, **kwargs)
+                with trace_span(name, kind="graph_node", inputs=state) as span:
+                    result = await fn(state, *args, **kwargs)
+                    span.observe(output=result)
+                    if isinstance(result, dict) and result.get("error"):
+                        span.status = "business_error"
+                    return result
 
         return wrapped
 
@@ -394,7 +397,7 @@ async def traced_ainvoke(
 ) -> Any:
     """观测现有调用；仅当宿主明确启用时采集诊断正文。"""
     if _ACTIVE.get() is None:
-        return await model.ainvoke(messages)
+        return await usage_invoke(model, messages, role=role, configured_route=configured_route)
     with trace_span(f"llm.{role}", kind="llm", metadata={"role": role}, inputs=messages) as span:
         # 请求的模型路由不一定是最终实际响应的模型。
         try:
@@ -414,7 +417,9 @@ async def traced_ainvoke(
             pass
         result = None
         try:
-            result = await model.ainvoke(messages)
+            result = await usage_invoke(
+                model, messages, role=role, configured_route=configured_route
+            )
         finally:
             if role == "judge":
                 try:

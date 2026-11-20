@@ -23,7 +23,7 @@ class AgentLog(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(UuidType, nullable=False, index=True)
     event_type: Mapped[str] = mapped_column(
         String(40), nullable=False
-    )  # 允许的事件类型：agent_log、PLAN_READY、HITL_READY、COMPLETED、FAILED。
+    )  # 事件类型包含 agent_log、llm_usage、人工关卡及终态；用量只含安全元数据。
     agent_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
     payload: Mapped[dict] = mapped_column(JsonType, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

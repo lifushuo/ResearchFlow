@@ -72,6 +72,14 @@ OVERRIDES_UNUSABLE = "UNUSABLE"
 PROMPT_OVERRIDE_STATUSES = (OVERRIDES_NONE, OVERRIDES_APPLIED, OVERRIDES_UNUSABLE)
 
 
+def prompt_settings_payload(overrides: dict[str, str | None]) -> dict[str, Any]:
+    """构造已校验的 Agent 设置更新；某个角色传 null 表示恢复默认提示词。"""
+    from app.schemas.auth import UserPreferences
+
+    preferences = UserPreferences(prompt_overrides=overrides)
+    return {"preferences": preferences.model_dump(exclude_unset=True)}
+
+
 def snapshot_overrides(user: HasPreferences | None) -> tuple[dict[str, str], str]:
     """首次开始时读取并冻结覆盖及状态，之后不重新解析。
 

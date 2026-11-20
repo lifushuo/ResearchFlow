@@ -12,6 +12,7 @@ import DatasetRegistryPanel from "./DatasetRegistryPanel";
 import ExecutionIncidentPanel from "./ExecutionIncidentPanel";
 import { DiagnosticDetails } from "./PipelineDiagnosticsPanel";
 import EvaluationCaseTable, { EvaluationSummary } from "./EvaluationCaseTable";
+import { TokenUsagePanel } from "@/components/TokenUsagePanel";
 
 type Tab = "overview" | "runs" | "cases" | "trace" | "badcases" | "compare" | "datasets";
 const tabs: [Tab, string][] = [["overview", "总览"], ["runs", "评测运行"], ["cases", "逐题用例"], ["trace", "执行轨迹"], ["badcases", "坏例排查"], ["compare", "版本对比"], ["datasets", "数据集"]];
@@ -148,6 +149,7 @@ export default function LiveEvaluationWorkspace() {
     </div>
     {error && <p role="alert">{error}</p>}
     <nav aria-label="评测分区" className="flex flex-wrap gap-1 border-b border-border pb-2">{tabs.map(([id, name]) => <button key={id} className={`${button} ${tab === id ? "text-accent bg-bg-elevated font-semibold" : "text-text-secondary"}`} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>{name}</button>)}</nav>
+    {(tab === "overview" || tab === "cases") && dataset && <TokenUsagePanel usage={evidence?.token_usage} title={`${getDatasetLabel(dataset)} · 模型 Token 用量`} />}
     {tab === "runs" && <UnifiedEvaluationRunnerV13 key={launchRevision} initial={preset} onCreated={created} showResults={false} />}
     {tab === "datasets" && <DatasetRegistryPanel onCreated={created} />}
     {tab === "overview" && <section className="space-y-4" aria-label="本次运行总览"><h2 className="font-semibold text-lg">本次运行总览</h2>{current ? <>

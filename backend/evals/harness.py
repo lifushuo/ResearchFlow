@@ -48,7 +48,9 @@ from evals.query_selection import select_queries
 from research_engine.eval_trace import eval_trace_run, trace_span, traced_ainvoke
 from research_engine.graph import build_graph
 from research_engine.local import load_env_file, run_config_from_env
+from research_engine.prompts import PLANNER_PROMPT_V2
 from research_engine.runconfig import (
+    RunConfig,
     reset_run_config,
     set_process_default,
     set_run_config,
@@ -345,14 +347,14 @@ def _check_output_path(out: Path) -> None:
 
 
 @contextmanager
-def _pipeline_scope(prompt_overrides: dict[str, str] | None) -> Iterator[None]:
+def _pipeline_scope(
+    prompt_overrides: dict[str, str] | None, *, base_config: RunConfig | None = None
+) -> Iterator[None]:
     """The config the pipeline runs under — baseline or candidate — for this block only.
 
-    **Both runs derive from `RUN_CONFIG` here, by construction.** The baseline used to read
-    the process default while a candidate would be built from `RUN_CONFIG`. Those are the
-    same object in production, but only because of an unstated coupling at import; if they
-    ever diverged, a "prompt comparison" would silently compare two routings. Building both
-    from one reference makes "differs only in the prompts" true by construction.
+    **Each experiment uses one base config for both arms.** Report evaluation uses
+    `RUN_CONFIG`. The Planner optimizer supplies its explicitly configured local run
+    config so it can reuse this boundary without changing the report harness defaults.
 
     **Scoped, never process-wide.** `set_process_default` would outlive the query and still
     be live when the judge runs. A context-local config exists only inside the `with`, so the
@@ -360,7 +362,9 @@ def _pipeline_scope(prompt_overrides: dict[str, str] | None) -> Iterator[None]:
     prompt may change what the pipeline produces, never what the harness measures).
     Synchronous by design — entered with `with`, not `async with`, around an awaited call.
     """
-    token = set_run_config(replace(RUN_CONFIG, prompt_overrides=prompt_overrides or {}))
+    token = set_run_config(
+        replace(base_config or RUN_CONFIG, prompt_overrides=prompt_overrides or {})
+    )
     try:
         yield
     finally:
@@ -512,6 +516,7 @@ async def run_one(
     query: dict,
     *,
     prompt_overrides: dict[str, str] | None = None,
+    evaluation_arm: str | None = None,
     trace_dir: Path | None = None,
     trace_run_id: str | None = None,
     trace_artifact_root: Path | None = None,
@@ -551,6 +556,7 @@ async def run_one(
             query=query["query"],
             depth=query.get("depth", "balanced"),
             prompt_overrides=prompt_overrides,
+            evaluation_arm=evaluation_arm,
         )
         store = ctx.store_for(config)
         try:
@@ -730,7 +736,7 @@ async def run_one(
     if completed and RUN_CONFIG.llm_mode == "real" and not (store and store.save_failed):
         # Judge observation is outside both candidate prompts and the graph trace (docs/08 §5).
         judge_trace_dir = os.environ.get("RF_JUDGE_BATCH_TRACE_DIR")
-        phase = "candidate" if prompt_overrides is not None else "baseline"
+        phase = evaluation_arm or ("candidate" if prompt_overrides is not None else "baseline")
         if store is not None and store.resume is not None:
             phase += "-resume"
         if ctx is not None:
@@ -1467,6 +1473,10 @@ async def _main() -> None:
         "this spec — and reports both against the same thresholds (report mode only)",
     )
     parser.add_argument(
+        "--baseline",
+        help="Optional approved {role: prompt} spec to compare with --candidate in report mode",
+    )
+    parser.add_argument(
         "--judge",
         type=str,
         default=None,
@@ -1526,11 +1536,16 @@ async def _main() -> None:
         parser.error("--judge applies to a real-mode report eval; this run judges nothing")
 
     candidate = None
+    baseline = None
+    if args.baseline and (not args.candidate or args.mode != "report"):
+        parser.error("--baseline requires --candidate in report mode")
     if args.candidate:
         if args.mode != "report":
             parser.error("--candidate applies to the report eval (RFC §14.2), not --mode memory")
         try:
             candidate = load_candidate(Path(args.candidate))
+            if args.baseline:
+                baseline = load_candidate(Path(args.baseline))
         except CandidateSpecError as e:
             parser.error(str(e))
 
@@ -1599,7 +1614,12 @@ async def _main() -> None:
             flag = "✓" if row.get("pass_test") else "✗"
             print(f"  {flag} {q['id']:24s} type={q['type']} latency={row.get('latency_s')}s")
         else:
-            row = await run_one(q, **trace_kwargs)
+            baseline_kwargs = (
+                {"prompt_overrides": baseline, "evaluation_arm": "baseline"}
+                if baseline is not None
+                else {}
+            )
+            row = await run_one(q, **baseline_kwargs, **trace_kwargs)
             rows.append(row)
             flag = "✓" if row.get("completed") else "✗"
             print(
@@ -1672,9 +1692,14 @@ async def _main() -> None:
         "results": rows,
     }
     if candidate is not None:
-        # The top-level `aggregate`/`release_criteria`/`results` stay the shipped baseline,
+        # The top-level `aggregate`/`release_criteria`/`results` stay the baseline,
         # exactly as in a plain run, so a reader of the existing schema reads it unchanged.
         payload["candidate"] = candidate_section(candidate, candidate_rows)
+        payload["method"]["case_set_sha256"] = long_run.canonical_hash(queries)
+        payload["method"]["baseline_prompt_sha256"] = {
+            role: long_run.sha256_text(text)
+            for role, text in {"planner": PLANNER_PROMPT_V2, **(baseline or {})}.items()
+        }
     if args.case_id is not None:
         payload["method"]["case_id"] = args.case_id
     if judging:

@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 
 import { useV2Cancel } from "@/hooks/runs";
+import { TokenUsagePanel } from "@/components/TokenUsagePanel";
 import type { RunGraph } from "@/lib/types";
 import { isTab, type Tab } from "@/lib/runTabs";
 
@@ -136,6 +137,7 @@ export function RunWorkspace({
 
   return (
     <div className="space-y-4">
+      <TokenUsagePanel usage={graph.run.token_usage} />
       {/* Overflows horizontally rather than wrapping into three rows on a phone: eight
           labels with counts do not fit, and a wrapped tab strip stops reading as one
           control. */}

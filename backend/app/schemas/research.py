@@ -158,6 +158,7 @@ class SessionSummary(BaseModel):
 
 
 class SessionDetail(SessionSummary):
+    token_usage: dict | None = None
     draft_report: str | None = None
     final_report: str | None = None
     sources: list[SourceSchema] | None = None

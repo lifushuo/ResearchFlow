@@ -54,6 +54,7 @@ from app.services.corpus_selection import SelectionError, freeze_selection
 from app.services.document_headers import download_headers, media_type_for
 from app.services.event_stream import sse_frames
 from app.services.host_ports import get_corpus_locator
+from app.services.model_usage import load_model_usage
 from app.services.sse import SSE_HEADERS
 from app.workers.dispatch import get_run_dispatcher
 from research_engine import citation_rate
@@ -198,6 +199,7 @@ async def project_run(db: AsyncSession, run: ResearchRun) -> dict:
             "cost_usd": float(run.cost_usd),
             "tokens_input": run.tokens_input,
             "tokens_output": run.tokens_output,
+            "token_usage": await load_model_usage(db, run.id),
             "elapsed_seconds": float(run.elapsed_seconds) if run.elapsed_seconds else None,
             # NULL 表示未测量，不能显示成 0；未知和实测为零是两回事。
             "citation_resolution_rate": (

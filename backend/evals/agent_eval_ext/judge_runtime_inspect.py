@@ -191,6 +191,7 @@ def summarize(path: Path | str, *, total_claims: int | None = None, batch_size: 
                 "http_status",
                 "exception_type",
                 "response_diagnostic",
+                "served_model",
             )
         }
         for e in responses
@@ -203,6 +204,8 @@ def summarize(path: Path | str, *, total_claims: int | None = None, batch_size: 
         "case_id": identity[2] if identity else None,
         "phase": identity[3] if identity else None,
         "trace_complete": complete,
+        "judge_route": events[0].get("judge_route") if events else None,
+        "llm_mode": events[0].get("llm_mode") if events else None,
         "case_status": events[-1].get("status") if ended else None,
         "case_exception_type": events[-1].get("exception_type") if ended else None,
         "observed_batches": len(batches),

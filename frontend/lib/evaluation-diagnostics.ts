@@ -36,6 +36,7 @@ export type Timeline = {
   parallel_note: string; wait_note: string;
 };
 export type Diagnostic = {
+  token_usage?: import("./token-usage").TokenUsage | null;
   available_case_ids?: string[];
   case_evidence?: { report_excerpt: string; report_truncated: boolean; claims: { text: string; judged: boolean; supported: boolean | null }[]; claims_truncated: boolean };
   pipeline_id: string; dataset_id: DatasetId; case_id: string | null; state: string; reason: string | null;

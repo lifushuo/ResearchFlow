@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from research_engine.response_diagnostics import safe_response_diagnostic
+from research_engine.runconfig import get_run_config
 from research_engine.trace_content import configured_secrets, content_snapshot
 
 LOG = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ _FIELDS = frozenset(
     {
         "event",
         "judge_route",
+        "llm_mode",
         "status",
         "trace_available",
         "batch_no",
@@ -147,6 +149,7 @@ class JudgeBatchRecorder:
             {
                 "event": "case_start",
                 "judge_route": self.judge_route,
+                "llm_mode": get_run_config().llm_mode,
                 **(
                     {"total_claims": self.total_claims, "batch_size": self.batch_size}
                     if self.total_claims is not None

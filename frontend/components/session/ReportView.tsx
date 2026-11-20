@@ -14,6 +14,7 @@ import { citedDocumentUrl } from "@/components/preview/DocumentPreview";
 import { Disclosure } from "@/components/ui/Disclosure";
 
 import { ChatPanel } from "./ChatPanel";
+import { TokenUsagePanel } from "@/components/TokenUsagePanel";
 import { ModelAttribution } from "./ModelAttribution";
 
 /**
@@ -110,6 +111,7 @@ export function ReportView({ session }: { session: SessionDetail }) {
 
   return (
     <div className="space-y-6">
+      <TokenUsagePanel usage={session.token_usage} />
       {preview && (
         <PreviewDrawer
           open
@@ -173,7 +175,7 @@ export function ReportView({ session }: { session: SessionDetail }) {
         <div className="mb-6 flex flex-wrap gap-x-8 gap-y-3 border-y border-border py-3">
           <Metric label="Duration" value={formatDuration(session.elapsed_seconds)} />
           <Metric label="Cost" value={formatCost(session.total_cost_usd)} />
-          <Metric label="Tokens" value={formatNumber(tokens)} />
+          <Metric label="旧版累计 Token" value={tokens > 0 ? formatNumber(tokens) : "未披露"} />
           <Metric label="Sources" value={String(sources.length)} />
         </div>
 

@@ -682,6 +682,7 @@ def build_config(
     query: str,
     depth: str,
     prompt_overrides: dict[str, str] | None = None,
+    evaluation_arm: str | None = None,
 ) -> dict[str, Any]:
     """The original run configuration, allowlisted so no key can enter a fingerprint."""
     from evals.judge_config import judge_generation_fingerprint
@@ -706,7 +707,7 @@ def build_config(
         "case_id": case_id,
         "query": query,
         "depth": depth,
-        "phase": "candidate" if prompt_overrides is not None else "baseline",
+        "phase": evaluation_arm or ("candidate" if prompt_overrides is not None else "baseline"),
         "prompt_overrides_sha256": canonical_hash(prompt_overrides or {}),
     }
 
