@@ -47,6 +47,8 @@ jobs:
                 tests/task/test_evaluation_core_scope.py tests/task/test_evaluation_offline_adapters.py \
                 tests/task/test_evaluation_diagnostics.py \
                 tests/task/test_long_run_reliability.py tests/task/test_long_run_acceptance.py tests/task/test_evaluation_process.py \
+                tests/task/test_planner_evolution.py tests/task/test_planner_evolution_safety.py \
+                tests/task/test_model_token_usage.py \
                 tests/task/test_judge_response_diagnostics.py \
                 tests/task/test_judge_label_bounds.py tests/workflow/test_executor_regression_compiled.py' \
             2>&1 | tee agent-eval-artifacts/tests.log

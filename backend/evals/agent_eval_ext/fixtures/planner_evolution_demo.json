@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "dataset_id": "planner-evolution-demo-v1",
+  "provenance": "demo",
+  "cases": [
+    {
+      "case_id": "tsp-baselines",
+      "group": "routing-optimization",
+      "split": "train",
+      "query": "比较学习型 TSP 求解器与 LKH，分别查找相同规模下的解质量、参考解、测试硬件和运行预算。",
+      "required_aspects": ["相同实例规模的解质量", "参考解定义", "测试硬件", "运行预算"]
+    },
+    {
+      "case_id": "atsp-benchmarks",
+      "group": "routing-optimization",
+      "split": "train",
+      "query": "比较大规模 ATSP 的两种求解路线，关注使用的数据集、解质量差距和停止条件。",
+      "required_aspects": ["ATSP 测试数据集", "相对参考解的差距", "停止条件"]
+    },
+    {
+      "case_id": "workflow-recovery",
+      "group": "workflow-engines",
+      "split": "train",
+      "query": "从文档比较两种工作流引擎的中断恢复能力，说明恢复粒度、任务幂等要求和执行历史保留。",
+      "required_aspects": ["中断恢复粒度", "任务幂等要求", "执行历史保留方式"]
+    },
+    {
+      "case_id": "worker-queues",
+      "group": "workflow-engines",
+      "split": "train",
+      "query": "比较常见 Python 异步任务框架的任务取消、消息确认和失败重投语义。",
+      "required_aspects": ["取消执行的语义", "消息确认时机", "失败重投行为"]
+    },
+    {
+      "case_id": "retrieval-fusion",
+      "group": "information-retrieval",
+      "split": "validation",
+      "query": "比较关键词和向量检索的融合方法，收集排序指标、语料特点、消融设置和查询延迟。",
+      "required_aspects": ["排序指标", "语料特点", "消融条件", "查询延迟"]
+    },
+    {
+      "case_id": "reranking",
+      "group": "information-retrieval",
+      "split": "validation",
+      "query": "评估加重排模型对知识库检索的收益，整理召回候选规模、准确率和额外推理耗时。",
+      "required_aspects": ["重排候选规模", "相关性指标", "额外推理耗时"]
+    },
+    {
+      "case_id": "building-energy",
+      "group": "building-systems",
+      "split": "validation",
+      "query": "比较办公楼两种节能改造策略，收集气候区、基线耗能和生命周期成本的数据。",
+      "required_aspects": ["气候区", "基线能耗", "生命周期成本"]
+    },
+    {
+      "case_id": "building-ventilation",
+      "group": "building-systems",
+      "split": "validation",
+      "query": "比较办公楼两种通风控制策略，关注舒适度标准、换气率和季节性运行成本。",
+      "required_aspects": ["舒适度标准", "换气率", "季节性运行成本"]
+    },
+    {
+      "case_id": "vector-index-storage",
+      "group": "databases",
+      "split": "holdout",
+      "query": "比较 HNSW 与 IVF 在向量数据库中的适用场景，记录索引构建内存、更新方式、查准率和延迟。",
+      "required_aspects": ["索引构建内存", "索引更新方式", "检索查准率", "检索延迟"]
+    },
+    {
+      "case_id": "database-migrations",
+      "group": "databases",
+      "split": "holdout",
+      "query": "比较两种在线数据库表结构变更方案，说明锁持有时间、磁盘开销和回滚方式。",
+      "required_aspects": ["锁持有时间", "额外磁盘开销", "回滚方式"]
+    },
+    {
+      "case_id": "packet-transit",
+      "group": "networking",
+      "split": "holdout",
+      "query": "比较 HTTP/2 与 HTTP/3 在弱网下的表现，分别核对丢包条件、握手时间和连接迁移能力。",
+      "required_aspects": ["实验丢包条件", "连接握手时间", "跨网络连接迁移"]
+    },
+    {
+      "case_id": "realtime-transport",
+      "group": "networking",
+      "split": "holdout",
+      "query": "对比 SSE 和 WebSocket 在后台任务状态推送中的连接模型、重连补传与代理部署条件。",
+      "required_aspects": ["连接与消息方向", "重连补传语义", "代理部署条件"]
+    }
+  ]
+}

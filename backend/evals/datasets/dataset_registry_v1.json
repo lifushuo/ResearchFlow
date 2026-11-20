@@ -140,6 +140,23 @@
       "execution": "controlled_fixture",
       "score_family": "tool selection / argument / order / forbidden-tool detection",
       "description": "Synthetic tool contract fixtures; NOT measured real-LLM tool-selection accuracy."
+    },
+    {
+      "id": "planner-evolution-reviewed",
+      "title": "Planner 自进化开发集 路 30 annotated cases",
+      "origin": "custom",
+      "category": "planning",
+      "split": "dev_holdout",
+      "collection": "cases",
+      "source": "evals/datasets/planner/planner-reviewed-v1.json",
+      "supporting_files": [
+        "evals/datasets/planner/benchmark-aspects-v1.json"
+      ],
+      "declared_count": 30,
+      "case_ids": [],
+      "execution": "optional_paid",
+      "score_family": "planner task coverage per annotated aspect (train/validation/holdout)",
+      "description": "Reviewed Planner Prompt evolution development set: train/validation/holdout with human-annotated required aspects. Scored by the planner evolution CLI with an independent judge, never by the evaluation worker; supporting file annotates report-benchmark aspects for bad-case backflow."
     }
   ]
 }

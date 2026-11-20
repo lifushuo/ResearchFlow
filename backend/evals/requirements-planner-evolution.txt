@@ -1,0 +1,2 @@
+# Optional optimizer for evals.agent_eval_ext.planner_evolution. Uses the repo's LLM client.
+gepa==0.1.4

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "dataset_id": "report-benchmark",
+  "source": "evals/queries.json",
+  "note": "人工维护的必答维度标注，用于评测中心坏例回流时预填与复核参照。标注是评分口径证据，不是测量结果；回流时复核人须对照轨迹确认或修改。Aspect 标签与题目同为英文，供独立 Judge 与英文任务查询匹配。",
+  "aspects": {
+    "llm-memory": {
+      "required_aspects": ["memory write and retrieval mechanism", "measured effectiveness evidence", "latency or cost overhead", "documented failure modes"],
+      "rationale": "比较长期记忆方案时，机制、实测收益、开销与失败模式构成可核查的四个维度。"
+    },
+    "postgres-vs-mysql": {
+      "required_aspects": ["transaction semantics differences", "operational and replication characteristics", "ecosystem and tooling fit", "recent performance comparisons"],
+      "rationale": "事务语义、运维与复制、生态适配与近期性能对比是 2025 年选型对比的可检索维度。"
+    },
+    "solid-state-batteries": {
+      "required_aspects": ["commercialization milestones", "energy density and cycle life data", "manufacturing scale-up obstacles", "safety characteristics"],
+      "rationale": "商业化现状与主要障碍需拆成量产里程碑、性能数据、制造放大与安全性。"
+    },
+    "ozempic-mechanism": {
+      "required_aspects": ["mechanism of action", "documented adverse effects", "open research questions"],
+      "rationale": "作用机制、已记录风险与开放问题对应问题的三个分句。"
+    },
+    "carbon-capture-cost": {
+      "required_aspects": ["direct air capture cost per tonne", "alternative removal methods costs", "energy requirements", "cost accounting boundary"],
+      "rationale": "成本有效性比较必须固定每吨成本、替代方法成本、能耗与核算边界。"
+    },
+    "rust-adoption": {
+      "required_aspects": ["adoption motivations", "documented shortcomings versus C++", "migration and interoperability friction"],
+      "rationale": "采用动机、相对 C++ 的不足与迁移摩擦对应问题的两个分句。"
+    },
+    "remote-work-productivity": {
+      "required_aspects": ["study designs and samples", "measured productivity outcomes", "conflicting findings"],
+      "rationale": "证据强度梳理需要研究设计与样本、产出测量结果与分歧解释。"
+    },
+    "quantum-error-correction": {
+      "required_aspects": ["recent correction demonstrations", "physical-to-logical qubit overhead", "remaining engineering obstacles"],
+      "rationale": "进展与容错距离对应近期演示、量子比特开销与剩余工程障碍。"
+    },
+    "eu-ai-act": {
+      "required_aspects": ["specific provider obligations", "applicability timeline", "enforcement and penalties"],
+      "rationale": "义务清单、适用时间线与执法处罚构成法规问题的可检索维度。"
+    },
+    "mediterranean-diet": {
+      "required_aspects": ["study design types", "effect sizes with uncertainty", "evidence limitations"],
+      "rationale": "证据强度需按研究设计、带不确定度的效应量与局限性分层。"
+    }
+  }
+}

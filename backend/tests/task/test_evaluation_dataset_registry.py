@@ -61,10 +61,10 @@ def backend(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_list_finds_all_eight(backend: Path) -> None:
+def test_list_finds_all_nine(backend: Path) -> None:
     result = list_datasets(backend)
     assert result["read_only"] is True
-    assert len(result["datasets"]) == 8
+    assert len(result["datasets"]) == 9
     assert [d["id"] for d in result["datasets"]].count("report-benchmark") == 1
 
 
@@ -77,6 +77,7 @@ def test_official_counts_verified_from_bytes(backend: Path) -> None:
         ("grounding-v1", 425),
         ("tool-contract-v1", 4),
         ("planner-replay-v1", 4),
+        ("planner-evolution-reviewed", 30),
     ):
         assert rows[name]["verified_count"] == count
         assert rows[name]["count_basis"] == "source_verified"
