@@ -41,6 +41,19 @@ def output_limit(role: str, max_tokens: int):
         _OUTPUT_LIMITS.reset(token)
 
 
+_NO_SDK_RETRIES: ContextVar[bool] = ContextVar("no_sdk_retries", default=False)
+
+
+@contextmanager
+def no_sdk_retries():
+    """Strict per-request hosts disable retries only inside their own context."""
+    token = _NO_SDK_RETRIES.set(True)
+    try:
+        yield
+    finally:
+        _NO_SDK_RETRIES.reset(token)
+
+
 # ── 每用户 BYOK 密钥 ──
 # Worker 仅在本轮运行上下文安装用户解密密钥，避免并发运行串用。
 # 不写文件或日志；未配置用户密钥时回退部署密钥。
@@ -274,7 +287,17 @@ def get_llm(role: str) -> BaseChatModel:
 
         return fake_model(role)
     provider, _, model = cfg.model_for(role).partition(":")
-    return _build(provider, model, role)
+    if _NO_SDK_RETRIES.get() and provider not in {"custom", "openai", "openrouter", "ollama"}:
+        raise ValueError("strict request accounting requires an OpenAI-compatible provider")
+    client = _build(provider, model, role)
+    if _NO_SDK_RETRIES.get():
+        for name in ("root_client", "root_async_client"):
+            sdk = getattr(client, name, None)
+            if sdk is None or not hasattr(sdk, "max_retries"):
+                raise ValueError("cannot verify SDK retry accounting")
+            sdk.max_retries = 0
+        client.max_retries = 0
+    return client
 
 
 def text_of(message_or_chunk) -> str:

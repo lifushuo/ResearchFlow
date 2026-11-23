@@ -15,6 +15,7 @@ quality comparison needs a real-mode run, which is a release activity, not a tes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -23,7 +24,6 @@ import pytest
 
 _ENV_BEFORE = dict(os.environ)
 from evals import harness  # noqa: E402
-from research_engine.prompt_composition import recording_provenance  # noqa: E402
 from research_engine.runconfig import get_run_config  # noqa: E402
 
 os.environ.clear()
@@ -172,21 +172,23 @@ def test_a_second_custom_run_the_same_day_is_numbered_not_overwritten(monkeypatc
 
 async def test_the_candidate_reaches_the_real_pipeline():
     """Not a stand-in: the compiled graph, whose planner node composes through the real
-    `system_prompt`. The PR-7b recorder shows what that node was actually given."""
-    with recording_provenance() as seen:
-        row = await harness.run_one(QUERY, prompt_overrides={"planner": BODY})
+    `system_prompt`. The harness exports a hash of the prompt its own recorder observed."""
+    row = await harness.run_one(QUERY, prompt_overrides={"planner": BODY})
     assert row["completed"], row.get("error")
-    assert seen["planner.main"]["effective_prompt"] == BODY
-    assert seen["planner.main"]["overridden"] is True
+    evidence = row["planner_evidence"]
+    assert evidence["prompt_sha256"] == hashlib.sha256(BODY.encode("utf-8")).hexdigest()
+    assert evidence["tasks"]
 
 
 async def test_the_baseline_real_pipeline_is_given_the_shipped_prompt():
     from research_engine import prompts
 
-    with recording_provenance() as seen:
-        await harness.run_one(QUERY)
-    assert seen["planner.main"]["effective_prompt"] == prompts.PLANNER_PROMPT_V2
-    assert seen["planner.main"]["overridden"] is False
+    row = await harness.run_one(QUERY)
+    assert row["completed"], row.get("error")
+    assert (
+        row["planner_evidence"]["prompt_sha256"]
+        == hashlib.sha256(prompts.PLANNER_PROMPT_V2.encode("utf-8")).hexdigest()
+    )
 
 
 async def test_nothing_remains_installed_after_a_real_candidate_run():

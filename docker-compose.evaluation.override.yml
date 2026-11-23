@@ -9,10 +9,30 @@ services:
       # Set RF_EVAL_ONLINE_ENABLED=0 to force-disable online evaluation.
       RF_EVAL_ONLINE_ENABLED: ${RF_EVAL_ONLINE_ENABLED:-}
       RF_EVAL_JUDGE_ROUTE: ${RF_EVAL_JUDGE_ROUTE:-}
+      RF_GEPA_LIVE_ENABLED: ${RF_GEPA_LIVE_ENABLED:-0}
+      RF_GEPA_ALLOWED_OWNERS: ${RF_GEPA_ALLOWED_OWNERS:-}
+      RF_GEPA_FINAL_LIVE_ENABLED: ${RF_GEPA_FINAL_LIVE_ENABLED:-0}
+      RF_GEPA_JUDGE_TIMEOUT_SECONDS: ${RF_GEPA_JUDGE_TIMEOUT_SECONDS:-240}
+      EVAL_JUDGE_MAX_OUTPUT_TOKENS: ${EVAL_JUDGE_MAX_OUTPUT_TOKENS:-4096}
     volumes:
       - type: volume
         source: rf_eval_job_data
         target: /app/evaluation-jobs
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json
+        read_only: true
+        bind: { create_host_path: false }
 
 # BEGIN UNIFIED PIPELINE v1.3
   eval-pipeline-offline:
@@ -77,6 +97,71 @@ services:
         source: rf_eval_job_data
         target: /app/evaluation-jobs
     restart: unless-stopped
+  # Separate GEPA lanes do not occupy the regular evaluation pipeline worker.
+  eval-gepa-offline:
+    build:
+      context: ./backend
+      target: gepa-worker
+    command: ["python", "-m", "evals.agent_eval_ext.planner_evolution_job_worker", "--mode", "demo"]
+    environment:
+      RF_EVAL_JOB_ROOT: /app/evaluation-jobs
+      LLM_MODE: fake
+      PYTHONUNBUFFERED: "1"
+    network_mode: none
+    read_only: true
+    healthcheck: { disable: true }
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    volumes:
+      - type: volume
+        source: rf_eval_job_data
+        target: /app/evaluation-jobs
+    restart: unless-stopped
+
+  # Explicitly opt in with --profile gepa-live AND server-side owner allowlist.
+  eval-gepa-online:
+    profiles: ["gepa-live"]
+    build:
+      context: ./backend
+      target: gepa-worker
+    command: ["python", "-m", "evals.agent_eval_ext.planner_evolution_job_worker", "--mode", "live"]
+    env_file: [.env]
+    environment:
+      RF_EVAL_JOB_ROOT: /app/evaluation-jobs
+      RF_GEPA_LIVE_ENABLED: ${RF_GEPA_LIVE_ENABLED:-0}
+      RF_GEPA_ALLOWED_OWNERS: ${RF_GEPA_ALLOWED_OWNERS:-}
+      RF_GEPA_FINAL_LIVE_ENABLED: ${RF_GEPA_FINAL_LIVE_ENABLED:-0}
+      LLM_MODE: real
+      PYTHONUNBUFFERED: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    healthcheck: { disable: true }
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    volumes:
+      - type: volume
+        source: rf_eval_job_data
+        target: /app/evaluation-jobs
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json
+        target: /internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json
+        read_only: true
+        bind: { create_host_path: false }
+    restart: unless-stopped
+
 # END UNIFIED PIPELINE v1.3
 
 volumes:

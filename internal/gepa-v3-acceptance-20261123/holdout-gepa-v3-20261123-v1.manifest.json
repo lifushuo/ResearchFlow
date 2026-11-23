@@ -1,0 +1,7 @@
+{
+ "dataset_id": "planner-holdout-gepa-v3-20261123-v1",
+ "content_sha256": "2a9d296b1628595a04a6e1c2c3736bedf02ca1cfb918ba973888ee29d95e8b3d",
+ "file_sha256": "32bdcc45dd4e4ea689bc4fecfdf73c0a0a8dd7c66c2cf695a87804c4c121376e",
+ "frozen_at": "2026-11-23",
+ "status": "FROZEN_READ_ONLY"
+}

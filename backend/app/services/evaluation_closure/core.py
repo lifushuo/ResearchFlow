@@ -425,6 +425,33 @@ class EvaluationClosure:
                 )
             ]
 
+    def case_result(self, owner_id: str, run_id: str, case_id: str) -> dict[str, Any]:
+        """按账号读取某次运行的真实逐题记录，禁止仅凭浏览器输入的 Run ID 越权读取。"""
+        with self._db() as db:
+            run = self._owned(db, "runs", "run_id", run_id, owner_id)
+            result = db.execute(
+                "SELECT * FROM case_results WHERE run_id=? AND case_id=?",
+                (run_id, case_id),
+            ).fetchone()
+            if result is None:
+                raise NotFound("Evaluation case not found")
+            return {
+                "run": dict(run),
+                "result": to_dict(result, ("metrics_json", "details_json")),
+            }
+
+    def case_results(self, owner_id: str, run_id: str) -> list[dict[str, Any]]:
+        """只列当前用户实际测过的题目，不接受预期列表充当结果。"""
+        with self._db() as db:
+            self._owned(db, "runs", "run_id", run_id, owner_id)
+            return [
+                to_dict(row)
+                for row in db.execute(
+                    "SELECT run_id,case_id,status,input_sha256,finished_ms FROM case_results WHERE run_id=? ORDER BY case_id LIMIT 20",
+                    (run_id,),
+                )
+            ]
+
     def list_bad_cases(
         self, owner_id: str, *, review_status: str | None = None, limit: int = 50, offset: int = 0
     ) -> list[dict[str, Any]]:

@@ -183,6 +183,20 @@ INTENTIONAL_SERVER_ONLY: dict[str, str] = {
             "GET /evaluation/evolution/benchmark-cases",
             "POST /evaluation/evolution/backflow",
             "GET /evaluation/evolution/experiments",
+            # GEPA v3 evidence, isolated search/final workers and their request ledgers.
+            "GET /evaluation/evolution/bad-cases/{bad_case_id}/planner-evidence",
+            "GET /evaluation/evolution/reviewable-cases",
+            "GET /evaluation/evolution/reviewable-cases/{run_id}/{case_id}/planner-evidence",
+            "POST /evaluation/evolution/reviewable-cases/{run_id}/{case_id}/judge-suggestion",
+            "GET /evaluation/evolution/jobs",
+            "POST /evaluation/evolution/jobs",
+            "GET /evaluation/evolution/jobs/capabilities",
+            "GET /evaluation/evolution/jobs/{job_id}",
+            "GET /evaluation/evolution/jobs/{job_id}/audit",
+            "GET /evaluation/evolution/jobs/{job_id}/result",
+            "GET /evaluation/evolution/jobs/{job_id}/final/preview",
+            "POST /evaluation/evolution/jobs/{job_id}/final",
+            "POST /evaluation/evolution/jobs/{job_id}/cancel",
         )
     },
 }

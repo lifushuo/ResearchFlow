@@ -156,3 +156,13 @@ backend/research_engine/_build.py
 /internal/**/junit*.xml
 /internal/**/reference/
 /internal/**/*-reference/
+
+# Local GEPA run evidence stays on disk; only the frozen runtime protocol is versioned.
+/internal/gepa-*-run[0-9]*/
+/internal/gepa-web-v3-acceptance-*/
+/internal/gepa-v3-acceptance-*/*
+!/internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json
+!/internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json
+!/internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json
+/internal/GEPA_*.md
+/internal/gepa-local-scratch/

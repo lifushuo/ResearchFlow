@@ -18,11 +18,12 @@ def test_unified_surface_rejects_retired_routes(tmp_path, monkeypatch):
     assert "/api/v1/evaluation/pipelines" in paths
     assert "/api/v1/evaluation/datasets" in paths
     assert not any(
-        path.endswith(
-            ("/model", "/model-evidence", "/triage", "/promote", "/review-decision", "/jobs")
-        )
+        path.endswith(("/model", "/model-evidence", "/triage", "/promote", "/review-decision"))
         for path in paths
     )
+    # GEPA jobs are the dedicated optimizer queue; the retired evaluation job API stays absent.
+    assert "/api/v1/evaluation/jobs" not in paths
+    assert "/api/v1/evaluation/evolution/jobs" in paths
     with TestClient(app) as client:
         for path in ["/datasets", "/pipelines", "/closure/runs", "/closure/execution-incidents"]:
             assert client.get("/api/v1/evaluation" + path).status_code == 401

@@ -68,3 +68,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
     CMD celery -A app.workers.celery_app.celery_app inspect ping || exit 1
 CMD ["celery", "-A", "app.workers.celery_app.celery_app", "worker", \
      "--concurrency=4", "--loglevel=info"]
+
+# GEPA is optional and deliberately kept out of the regular research worker image.
+# Both demo (network:none) and explicitly enabled paid optimizer use this target.
+FROM runtime AS gepa-worker
+USER root
+RUN /venv/bin/pip install --no-cache-dir -r /app/evals/requirements-planner-evolution.txt
+USER appuser
+HEALTHCHECK NONE

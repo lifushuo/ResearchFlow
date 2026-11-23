@@ -1,0 +1,35 @@
+{
+ "schema_version": 1,
+ "holdout_id": "planner-holdout-gepa-v3-20261123-v1",
+ "content_sha256": "2a9d296b1628595a04a6e1c2c3736bedf02ca1cfb918ba973888ee29d95e8b3d",
+ "file_sha256": "32bdcc45dd4e4ea689bc4fecfdf73c0a0a8dd7c66c2cf695a87804c4c121376e",
+ "decision": "FROZEN_USAGE_POLICY",
+ "allowed_purposes": ["planner_final_ab"],
+ "allowed_conditions": [
+  "candidate prompt is frozen",
+  "allow_single_final_ab is set",
+  "exactly one pre-agreed final Planner A/B; no retries on this set"
+ ],
+ "denied_purposes": [
+  "report_ab",
+  "search",
+  "candidate_selection",
+  "prompt_adjustment",
+  "calibration"
+ ],
+ "historical_usage_disclosure": {
+  "planner_gepa_experiments": "none: 137 journal observations across 6 experiments contain only the 31-case planner dataset; no task_queries from these 9 questions",
+  "report_quality_evals": "used in 11 historical report eval results (eval-*.json) with no task_queries",
+  "report_ab_pin": "pinned as report_dataset_sha256=959e8b36385be268174867c1559e6afa1af992ce2fb9971d8bc356793d330567 in 4 earlier GEPA experiments (config only; no planner trace)",
+  "consequence": "Planner-independent but NOT virgin; cannot serve as a fresh independent report A/B sample, and must not be reused for report A/B acceptance"
+ },
+ "enforcement": {
+  "module": "backend/evals/holdout_usage_guard.py",
+  "entry_points": [
+   "evals/report_ab_dataset.py::fixed_report_queries (report A/B path)",
+   "evals/agent_eval_ext/planner_evolution/__main__.py (search dataset path)"
+  ],
+  "fail_mode": "raise HoldoutUsageError before any model call; reason is recorded to audit log"
+ },
+ "note": "0444 file mode and SHA-256 prevent silent editing; this policy adds purpose-based access control, which file permissions cannot provide."
+}

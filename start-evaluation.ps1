@@ -2,7 +2,8 @@
 param(
     [switch]$Build,
     [switch]$CheckOnly,
-    [switch]$OfflineOnly
+    [switch]$OfflineOnly,
+    [switch]$EnableGepaLive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ $root = $PSScriptRoot
 $compose = @('compose', '-p', 'researchflow', '-f', (Join-Path $root 'docker-compose.full.yml'),
     '-f', (Join-Path $root 'docker-compose.evaluation.override.yml'))
 if (-not $OfflineOnly) { $compose += @('--profile', 'eval-online') }
+if ($EnableGepaLive) { $compose += @('--profile', 'gepa-live') }
 
 function Invoke-DockerChecked {
     param([string[]]$DockerArguments)
@@ -46,8 +48,9 @@ try {
     if (-not $CheckOnly) {
         if ($Build) { Invoke-DockerChecked -DockerArguments ($compose + @('build')) }
         Invoke-DockerChecked -DockerArguments ($compose + @('up', '-d', '--no-build', '--wait', '--wait-timeout', '180'))
-        $apps = @('api', 'worker', 'frontend', 'eval-pipeline-offline')
+        $apps = @('api', 'worker', 'frontend', 'eval-pipeline-offline', 'eval-gepa-offline')
         if (-not $OfflineOnly) { $apps += 'eval-pipeline-online' }
+        if ($EnableGepaLive) { $apps += 'eval-gepa-online' }
         $stale = @()
         foreach ($service in $apps) {
             $running = & docker inspect "researchflow-$service-1" --format '{{.Image}}'

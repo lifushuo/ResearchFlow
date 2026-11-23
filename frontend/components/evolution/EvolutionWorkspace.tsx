@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import GEPAJobsPanel from "./GEPAJobsPanel";
 import {
   evolutionAnnotations,
   evolutionBackflow,
@@ -11,6 +12,12 @@ import {
   evolutionError,
   evolutionExperiments,
   evolutionOverview,
+  evolutionPlannerEvidence,
+  evolutionPlannerJudge,
+  evolutionReviewableCases,
+  evolutionReviewableCaseEvidence,
+  type ReviewableEvaluationCase,
+  type PlannerJudgeSuggestion,
   splitLabel,
   stageLabel,
   type BackflowRequest,
@@ -30,15 +37,17 @@ const chip = "rounded-full border border-border px-2 py-0.5 text-xs text-text-se
 const tabs: [string, string][] = [
   ["flow", "闭环流程"],
   ["backflow", "坏例回流"],
+  ["review", "Planner 逐题复核"],
   ["dataset", "开发数据集"],
   ["experiments", "实验记录"],
+  ["gepa", "GEPA 优化实验"],
 ];
 
 const FLOW_STEPS: [string, string, string, string][] = [
   ["① 基线评测", "评测中心 · 真实模型", "在评测中心用 report-benchmark 跑现有版本，得到逐题完成状态与独立 Judge 证据。", "/evaluation"],
-  ["② 坏例复核", "对照标注与轨迹", "坏例排查面板列出失败题；复核人对照必答维度标注与执行轨迹，确认问题在哪个环节。", "/evaluation"],
+  ["② Planner 复核", "对照标注与轨迹", "报告通过或失败的真实已测题均可复核；缺少原始任务证据的案例不能提交。", "/evaluation"],
   ["③ 回流标注", "本页 · 坏例回流", "把 Run ID、必答维度、复核结论存成结构化反馈；归因 Planner 漏项的进入开发集，其余仅存证。", ""],
-  ["④ GEPA 优化", "CLI · 真实模型", "用活跃数据集训练/验证 GEPA 搜索，选出候选 Prompt；留出集独立评分，不通过就停在证据上。", ""],
+  ["④ GEPA 优化", "本页 · 需人工启动", "先运行免费 Demo 验证作业队列；真实优化需授权，在开发集/验证集搜索，留出集只用于候选冻结后的验收。", ""],
   ["⑤ A/B 验收", "CLI · 报告回归", "同一批固定报告题跑原版与候选，校验完成率与引用支持率不回退。", ""],
   ["⑥ 人工发布", "CLI + Agent 设置", "审阅者确认后导出 apply/rollback 配置，人工应用到 Agent 设置；下轮评测复测新版本。", ""],
 ];
@@ -56,8 +65,8 @@ function FlowOverview({ overview, annotations }: { overview: EvolutionOverview |
   return (
     <section className="space-y-4" aria-label="自进化闭环流程">
       <p className="text-sm text-text-muted">
-        自进化回答两个问题：现有 Planner 漏了什么（基线评测 → 坏例回流），改完 Prompt 换一道新题还有效吗（候选评测 → A/B 验收）。
-        评测产物只在本页展示与回流；付费优化与发布始终在 CLI 人工执行。
+        自进化回答两个问题：Planner 实际漏了什么（真实评测 → 原始任务证据 → 人工复核），优化后的 Prompt 在未见案例上是否更好（候选评测 → A/B 验收）。
+        你在评测中心手动启动最终真实模型评测；本页不会自动发起付费调用或发布。
       </p>
       <ol className="grid gap-3 md:grid-cols-2">
         {FLOW_STEPS.map(([title, where, text, href]) => (
@@ -96,6 +105,10 @@ function FlowOverview({ overview, annotations }: { overview: EvolutionOverview |
   );
 }
 
+function aspectListForUI(raw: string): string[] {
+  return Array.from(new Set(raw.split("\n").map((v) => v.trim()).filter(Boolean)));
+}
+
 type BackflowPrefill = {
   query: string;
   depth: string;
@@ -113,6 +126,12 @@ function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill:
   const [group, setGroup] = useState(prefill?.group ?? "");
   const [aspects, setAspects] = useState((prefill?.aspects ?? []).join("\n"));
   const [note, setNote] = useState("");
+  const [plannerTasks, setPlannerTasks] = useState("");
+  const [evidenceInfo, setEvidenceInfo] = useState("");
+  const evidenceRequest = useRef(0);
+  const [missingAspects, setMissingAspects] = useState<string[]>([]);
+  const [traceRef, setTraceRef] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
   const [stage, setStage] = useState<BackflowRequest["stage"]>("planner");
   const [manualQuery, setManualQuery] = useState(prefill?.query ?? "");
   const manualDepth = prefill?.depth ?? "balanced";
@@ -133,23 +152,48 @@ function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill:
   }, []);
 
   function pick(row: EvolutionBadCase | null) {
+    const requestNumber = ++evidenceRequest.current;
     setSelected(row);
     setDone("");
     setError("");
+    setPlannerTasks(""); setMissingAspects([]); setTraceRef(""); setConfirmed(false); setEvidenceInfo("");
     if (!row) return;
     setCaseId(`planner-gap-${row.case_id.slice(0, 24).replace(/[^a-zA-Z0-9._-]/g, "-").toLowerCase()}`);
     const benchmarkGroup = annotations?.aspects[row.case_id] ? row.case_id.replace(/[^a-zA-Z0-9._-]/g, "-").toLowerCase() : "";
     setGroup(benchmarkGroup || "report-benchmark-gap");
     setAspects((row.suggested_aspects ?? []).join("\n"));
+    setTraceRef("");
+    setEvidenceInfo("正在从本次评测归档读取 Planner 原始任务…");
+    // 读取接口校验账号、坏例、运行身份与归档指纹；这里不自动勾选漏项或确认框。
+    void evolutionPlannerEvidence(row.bad_case_id).then((evidence) => {
+      if (requestNumber !== evidenceRequest.current) return;
+      if (evidence.status !== "recorded") {
+        setEvidenceInfo("该运行尚无可验证的 Planner 任务归档。旧评测需重新运行，不能凭空补造。");
+        return;
+      }
+      setPlannerTasks(evidence.tasks.map((t) => t.query).join("\n"));
+      setTraceRef(evidence.evidence_reference ?? "");
+      setEvidenceInfo(`已取得真实任务 ${evidence.tasks.length} 条；仍需逐项人工判断漏项。`);
+    }).catch(() => {
+      if (requestNumber === evidenceRequest.current) {
+        setEvidenceInfo("任务归档读取失败，请检查当前评测 Run 与账号权限。");
+      }
+    });
   }
 
   async function submit() {
     if (busy) return;
     setBusy(true); setError(""); setDone("");
     const aspectList = aspects.split("\n").map((x) => x.trim()).filter(Boolean);
+    const evidence = stage === "planner" ? {
+      planner_tasks: plannerTasks.split("\n").map((v) => v.trim()).filter(Boolean),
+      missing_aspects: missingAspects,
+      evidence_reference: traceRef.trim(),
+      review_confirmed: confirmed,
+    } : {};
     const body: BackflowRequest = manualMode
-      ? { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, manual_query: manualQuery, manual_depth: manualDepth as BackflowRequest["manual_depth"] }
-      : { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, bad_case_id: selected?.bad_case_id };
+      ? { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, manual_query: manualQuery, manual_depth: manualDepth as BackflowRequest["manual_depth"], ...evidence }
+      : { case_id: caseId.trim(), group: group.trim(), aspects: aspectList, review_note: note, stage, bad_case_id: selected?.bad_case_id, ...evidence };
     try {
       const record = await evolutionBackflow(body);
       setDone(stage === "planner"
@@ -167,8 +211,8 @@ function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill:
     <section className="space-y-4" aria-label="坏例回流">
       <p className="text-sm text-text-muted">
         选择评测中心 report-benchmark 的坏例，对照必答维度标注与执行轨迹确认问题环节后回流。
-        归因 Planner 漏项的题目进入训练集；检索或报告环节的问题仅存证，不进入优化数据集。
-        评测轨迹默认只含元数据，Planner 实际任务列表不会被补造。
+        只有提供真实 Planner 任务列表、具体漏项及证据编号，并完成手动复核，才允许进入训练集；检索或报告问题仅存证。
+        系统不会伪造 Planner 任务，最终优化评测仍需你手动执行。
       </p>
       <div className="rounded-lg border border-border p-4 space-y-2">
         <p className="font-semibold">基准坏例（report-benchmark）</p>
@@ -204,7 +248,7 @@ function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill:
         {!manualMode && !selected && <p className="text-sm text-text-muted">先选择一条坏例。</p>}
         <label className="block text-sm">案例 ID<input aria-label="案例 ID" className={input} value={caseId} onChange={(e) => setCaseId(e.target.value)} placeholder="如 planner-gap-01" /></label>
         <label className="block text-sm">分组（同组题目会留在同一 split）<input aria-label="分组" className={input} value={group} onChange={(e) => setGroup(e.target.value)} placeholder="如 model-routing" /></label>
-        <label className="block text-sm">必答维度（每行一条；已按基准标注预填，请对照轨迹确认或修改）<textarea aria-label="必答维度" className={input} rows={4} value={aspects} onChange={(e) => setAspects(e.target.value)} placeholder={"参考解定义\n测试硬件\n时间预算"} /></label>
+        <label className="block text-sm">必答维度（每行一条；已按基准标注预填，请对照轨迹确认或修改）<textarea aria-label="必答维度" className={input} rows={4} value={aspects} onChange={(e) => { const next = e.target.value; setAspects(next); setMissingAspects((prev) => prev.filter((x) => aspectListForUI(next).includes(x))); }} placeholder={"参考解定义\n测试硬件\n时间预算"} /></label>
         {selected && annotations?.aspects[selected.case_id] && (
           <p className="text-xs text-text-muted">标注依据：{annotations.aspects[selected.case_id].rationale}</p>
         )}
@@ -212,12 +256,197 @@ function BackflowPanel({ onChanged, prefill }: { onChanged: () => void; prefill:
           {Object.entries(stageLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
         </select></label>
         <label className="block text-sm">复核结论（必填；引用 Run ID 与轨迹证据）<textarea aria-label="复核结论" className={input} rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder="例如：Run pipe-1--report-benchmark 的任务列表只覆盖解质量与参考解，未安排硬件与时间预算的检索。" /></label>
+        {stage === "planner" && (
+          <fieldset className="rounded-lg border border-border p-3 space-y-3">
+            <legend className="font-semibold text-sm">Planner 漏项证据（必填）</legend>
+            <p className="text-xs text-text-muted">在评测中心打开原 Run 的 Planner agent_log，复制真实 tasks；只勾选确实没有对应检索任务的必答维度。这里存储的是人工复核证据，并非系统自动验证的 Trace。</p>
+            {evidenceInfo && <p role="status" className="text-xs text-text-muted">{evidenceInfo}</p>}
+            <label className="block text-sm">实际 Planner 任务（每行一个，原样复制）
+              <textarea aria-label="实际 Planner 任务" className={input} rows={5} value={plannerTasks} readOnly={traceRef.startsWith("auto:")} onChange={(e) => setPlannerTasks(e.target.value)} placeholder={"检索方法 A 的测试实例和规模\n核对方法 B 的参考解定义"} />
+            </label>
+            <div className="space-y-1" role="group" aria-label="未覆盖的必答维度">
+              <p className="text-sm">未被上述任务覆盖的维度（至少一项）</p>
+              {aspectListForUI(aspects).map((aspect) => (
+                <label key={aspect} className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" aria-label={`漏项：${aspect}`} checked={missingAspects.includes(aspect)} onChange={(e) => setMissingAspects((v) => e.target.checked ? [...v, aspect] : v.filter((x) => x !== aspect))} />
+                  {aspect}
+                </label>
+              ))}
+            </div>
+            <label className="block text-sm">Planner Trace 证据编号（Run ID / 事件号 / 文件路径）
+              <input aria-label="Planner Trace 证据编号" className={input} value={traceRef} onChange={(e) => setTraceRef(e.target.value)} placeholder="如 pipe-123/planner.agent_log#7；坏例必须包含其 Run ID" />
+            </label>
+            <label className="flex items-start gap-2 text-sm">
+              <input type="checkbox" aria-label="已核对 Planner 任务证据" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
+              <span>已逐项核对真实 Planner 任务与必答维度，确认不是检索或报告阶段漏项。</span>
+            </label>
+            <Link href="/evaluation" className="text-xs underline">前往评测中心核对任务 Trace →</Link>
+          </fieldset>
+        )}
         <div className="flex flex-wrap gap-2">
-          <button className={button} disabled={busy || (!manualMode && !selected)} onClick={() => void submit()}>提交回流</button>
+          <button className={button} disabled={busy || (!manualMode && !selected) || (stage === "planner" && (!confirmed || !traceRef.trim() || !plannerTasks.trim() || missingAspects.length === 0))} onClick={() => void submit()}>提交回流</button>
         </div>
         {error && <p role="alert" className="text-sm">{error}</p>}
         {done && <p role="status" className="text-sm">{done}</p>}
       </div>
+    </section>
+  );
+}
+
+function PlannerCaseReviewPanel({ onChanged }: { onChanged: () => void }) {
+  const [cases, setCases] = useState<ReviewableEvaluationCase[]>([]);
+  const [selected, setSelected] = useState<ReviewableEvaluationCase | null>(null);
+  const [evidence, setEvidence] = useState<Awaited<ReturnType<typeof evolutionReviewableCaseEvidence>> | null>(null);
+  const [missing, setMissing] = useState<string[]>([]);
+  const [judgeConsent, setJudgeConsent] = useState(false);
+  const [judgeBusy, setJudgeBusy] = useState(false);
+  const [judgeSuggestion, setJudgeSuggestion] = useState<PlannerJudgeSuggestion | null>(null);
+  const [judgeError, setJudgeError] = useState("");
+  const [note, setNote] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [trainGroups, setTrainGroups] = useState<string[]>([]);
+  const [trainGroup, setTrainGroup] = useState("");
+  const requestSeq = useRef(0);
+
+  useEffect(() => {
+    let active = true;
+    void evolutionReviewableCases().then((r) => { if (active) setCases(r.cases); })
+      .catch((e) => { if (active) setError(evolutionError(e)); })
+      .finally(() => { if (active) setLoaded(true); });
+    void evolutionDataset().then((data) => {
+      if (active) setTrainGroups(Array.from(new Set((data.dataset?.cases ?? [])
+        .filter((c) => c.split === "train" && !c.source_bad_case_id)
+        .map((c) => c.group))).sort());
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  function pick(row: ReviewableEvaluationCase) {
+    const current = ++requestSeq.current;
+    setSelected(row); setEvidence(null); setMissing([]); setTrainGroup(""); setNote(""); setConfirmed(false);
+    setJudgeConsent(false); setJudgeSuggestion(null); setJudgeError(""); setJudgeBusy(false);
+    setError(""); setDone("");
+    void evolutionReviewableCaseEvidence(row.run_id, row.case_id)
+      .then((ev) => { if (current === requestSeq.current) setEvidence(ev); })
+      .catch((e) => { if (current === requestSeq.current) setError(evolutionError(e)); });
+  }
+
+  async function analyzeWithJudge() {
+    if (!selected || evidence?.status !== "recorded" || !evidence.evidence_reference || !judgeConsent || judgeBusy) return;
+    const current = requestSeq.current;
+    setJudgeBusy(true); setJudgeError(""); setJudgeSuggestion(null);
+    try {
+      const result = await evolutionPlannerJudge(selected.run_id, selected.case_id, evidence.evidence_reference);
+      if (current === requestSeq.current) setJudgeSuggestion(result);
+    } catch (e) {
+      if (current === requestSeq.current) setJudgeError(evolutionError(e));
+    } finally {
+      if (current === requestSeq.current) setJudgeBusy(false);
+    }
+  }
+
+  async function submit() {
+    if (!selected || evidence?.status !== "recorded" || !evidence.evidence_reference || !confirmed || note.trim().length < 2 || (missing.length > 0 && !trainGroup) || busy) return;
+    setBusy(true); setError(""); setDone("");
+    const stage = missing.length ? "planner" : "planner_complete";
+    try {
+      await evolutionBackflow({
+        case_id: `planner-review-${selected.case_id.slice(0, 28).replace(/[^a-zA-Z0-9._-]/g, "-")}-${selected.run_id.slice(5, 13)}`,
+        group: missing.length ? trainGroup : "planner-complete-reviews",
+        aspects: selected.required_aspects,
+        review_note: note.trim(), stage,
+        evaluation_run_id: selected.run_id,
+        evaluation_case_id: selected.case_id,
+        planner_tasks: evidence.tasks.map((task) => task.query),
+        missing_aspects: missing,
+        evidence_reference: evidence.evidence_reference,
+        review_confirmed: true,
+      });
+      setDone(missing.length ? "已确认规划漏项，进入开发集（请检查数据集分组约束）。" : "已标注规划完整，仅存审核记录，不进入 GEPA 开发集。");
+      onChanged();
+    } catch (e) { setError(evolutionError(e)); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <section className="space-y-4" aria-label="Planner 逐题复核">
+      <p className="text-sm text-text-muted">报告通过也可以检查 Planner 规划是否完整。只展示当前账号的真实已测案例，只有确认遗漏才进入开发集。不会启动模型或改变报告评分。</p>
+      <div className="rounded-lg border border-border p-4 space-y-2">
+        <p className="font-semibold">最近的真实报告评测案例</p>
+        {!loaded && <p className="text-sm text-text-muted">正在读取案例…</p>}
+        {loaded && cases.length === 0 && <p className="text-sm">没有可复核的已测案例。</p>}
+        {cases.map((row) => (
+          <button key={`${row.run_id}:${row.case_id}`} className={`${button} block w-full text-left`} type="button" onClick={() => pick(row)}>
+            <span className="font-semibold">{row.case_id}</span> · {row.result_status === "passed" ? "报告通过" : row.result_status}
+            <span className="block text-xs text-text-muted">Run {row.run_id}</span>
+          </button>
+        ))}
+      </div>
+      {selected && (
+        <div className="rounded-lg border border-border p-4 space-y-3">
+          <p className="font-semibold">当前复核：{selected.case_id}</p>
+          <p className="text-sm">{selected.query}</p>
+          {!evidence && <p role="status" className="text-sm">正在读取已归档任务…</p>}
+          {evidence?.status === "unavailable" && <p role="alert" className="text-sm">无可验证的 Planner 任务归档；不能提交复核。</p>}
+          {evidence?.status === "recorded" && (
+            <>
+              <p className="text-sm">已取证 {evidence.tasks.length} 条任务；请核对哪些必答维度没有对应的检索任务。</p>
+              <ol className="list-decimal pl-5 space-y-1 text-sm">{evidence.tasks.map((task) => <li key={task.id}>{task.query}</li>)}</ol>
+              <div className="rounded-lg border border-border p-3 space-y-2" aria-label="Planner Judge 辅助建议">
+                <p className="font-semibold text-sm">独立 Judge 辅助分析（可选）</p>
+                <p className="text-xs text-text-muted">只分析这次已归档的原始任务，不重新运行 Planner。一次点击可能产生真实模型费用。Judge 的建议不会自动勾选漏项或写入训练集。</p>
+                <label className="flex items-start gap-2 text-sm">
+                  <input type="checkbox" aria-label="同意 Judge API 费用" checked={judgeConsent} onChange={(e) => setJudgeConsent(e.target.checked)} />
+                  我确认本次独立 Judge 调用可能产生 API 费用。
+                </label>
+                <button type="button" className={button} disabled={!judgeConsent || judgeBusy || busy || !!judgeSuggestion} onClick={() => void analyzeWithJudge()}>
+                  {judgeBusy ? "Judge 分析中…" : "一键分析疑似漏项"}
+                </button>
+                {judgeError && <p role="alert" className="text-sm">{judgeError}</p>}
+                {judgeSuggestion && (
+                  <div className="space-y-2" role="region" aria-label="Judge 逐维度建议">
+                    <p className="text-sm">模型建议覆盖率 {(judgeSuggestion.coverage * 100).toFixed(1)}%；Judge：{judgeSuggestion.served_judge ?? judgeSuggestion.judge_route}。这是辅助意见，请自行逐项确认。</p>
+                    {judgeSuggestion.aspects.map((item) => (
+                      <div key={item.aspect_index} className="rounded-md border border-border p-2 text-sm">
+                        <p className="font-semibold">{item.covered ? "建议已覆盖" : "建议疑似漏项"}：{item.aspect}</p>
+                        <p>对应任务：{item.task_ids.length ? item.task_ids.join("、") : "无"}</p>
+                        <p className="text-text-muted">理由：{item.reason}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <fieldset className="rounded-lg border border-border p-3 space-y-2">
+                <legend className="text-sm font-semibold">逐项确认未覆盖维度（全部未勾选表示规划完整）</legend>
+                {selected.required_aspects.map((aspect) => (
+                  <label key={aspect} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={missing.includes(aspect)} onChange={(e) => setMissing((prev) => e.target.checked ? [...prev, aspect] : prev.filter((x) => x !== aspect))} />
+                    {aspect}
+                  </label>
+                ))}
+              </fieldset>
+              {missing.length > 0 && (
+                <label className="block text-sm">选择已有开发集主题组（防止验证/留出集泄漏）
+                  <select className={input} aria-label="开发集主题组" value={trainGroup} onChange={(e) => setTrainGroup(e.target.value)}>
+                    <option value="">请选择与研究主题相同的开发集组</option>
+                    {trainGroups.map((group) => <option key={group} value={group}>{group}</option>)}
+                  </select>
+                </label>
+              )}
+              <label className="block text-sm">人工复核理由<textarea className={input} aria-label="逐题复核理由" rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder="说明各遗漏维度与任务证据的关系；如果规划完整，请解释判断依据。" /></label>
+              <label className="flex items-start gap-2 text-sm"><input type="checkbox" aria-label="确认逐项复核" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />我已对照原始任务逐项复核。{missing.length ? "确认存在 Planner 漏项" : "确认 Planner 规划完整"}。</label>
+              <button type="button" className={button} disabled={busy || !confirmed || note.trim().length < 2 || (missing.length > 0 && !trainGroup)} onClick={() => void submit()}>{missing.length ? "确认漏项并回流开发集" : "记录规划完整（不回流训练）"}</button>
+            </>
+          )}
+          {error && <p role="alert" className="text-sm">{error}</p>}
+          {done && <p role="status" className="text-sm">{done}</p>}
+        </div>
+      )}
+      {!selected && error && <p role="alert" className="text-sm">{error}</p>}
     </section>
   );
 }
@@ -387,16 +616,13 @@ function ExperimentsPanel({ rows, loaded }: { rows: EvolutionExperimentRow[]; lo
 function CommandsPanel() {
   const commands: [string, string][] = [
     ["导出活跃数据集（与本页同源）", "python -m evals.agent_eval_ext.planner_evolution dataset --cases-dir <评测卷>\\planner-evolution\\cases --out .\\planner-active.json"],
-    ["链路验证（免密钥，零模型调用）", "python -m evals.agent_eval_ext.planner_evolution optimize --demo --dataset .\\planner-active.json --out-dir <评测卷>\\planner-evolution\\experiments\\planner-demo-01"],
-    ["GEPA 优化（真实模型，可能产生费用）", "python -m evals.agent_eval_ext.planner_evolution optimize --live --dataset .\\planner-active.json --out-dir <评测卷>\\planner-evolution\\experiments\\planner-01 --max-evals 80 --proposals 4"],
-    ["报告 A/B 回归（真实模型）", "python -m evals.agent_eval_ext.planner_evolution report --live --experiment <评测卷>\\planner-evolution\\experiments\\planner-01\\experiment.json --out-dir <评测卷>\\planner-evolution\\experiments\\planner-01-report"],
-    ["导出发布与回滚配置（人工审阅）", "python -m evals.agent_eval_ext.planner_evolution release --experiment <评测卷>\\planner-evolution\\experiments\\planner-01\\experiment.json --report <评测卷>\\planner-evolution\\experiments\\planner-01-report\\report-ab.json --out-dir <评测卷>\\planner-evolution\\experiments\\planner-01-release --approved-by '审阅人'"],
+    ["链路验证（免密钥，零模型调用）", "python -m evals.agent_eval_ext.planner_evolution optimize --demo --out-dir <评测卷>\\planner-evolution\\experiments\\planner-demo-01"],
   ];
   return (
     <section className="space-y-3" aria-label="运行命令">
       <p className="text-sm text-text-muted">
         命令在 backend 目录执行，Python 3.14 环境。&lt;评测卷&gt; 是服务端 RF_EVAL_JOB_ROOT 配置的评测目录；把 --out-dir 指到它的 planner-evolution/experiments/ 下，本页即可读取证据。
-        优化与报告 A/B 调用真实模型，费用发生在命令行；本页不会自动发起付费调用，也不会自动发布。
+        当前 v3 搜索请在“GEPA 优化实验”分区提交；任务会冻结配置并建立请求账本，真实启动仍需你确认费用。以下仅保留数据导出和旧版免费链路命令。
       </p>
       <ul className="space-y-2">
         {commands.map(([label, command]) => (
@@ -460,6 +686,7 @@ export default function EvolutionWorkspace() {
         ))}
       </nav>
       {tab === "flow" && <FlowOverview overview={overview} annotations={annotations} />}
+      {tab === "review" && <PlannerCaseReviewPanel onChanged={reloadAll} />}
       {tab === "backflow" && <BackflowPanel key={prefill?.caseId ?? "blank"} onChanged={reloadAll} prefill={prefill} />}
       {tab === "dataset" && (
         <DatasetPanel
@@ -471,6 +698,7 @@ export default function EvolutionWorkspace() {
           onReflow={(value) => { setPrefill(value); setTab("backflow"); }}
         />
       )}
+      {tab === "gepa" && <GEPAJobsPanel />}
       {tab === "experiments" && (
         <div className="space-y-8">
           <ExperimentsPanel rows={experiments} loaded={experimentsLoaded} />

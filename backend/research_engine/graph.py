@@ -49,6 +49,7 @@ from research_engine.schemas import (
     Source,
 )
 from research_engine.state import AgentState
+from research_engine.token_usage import PaidRequestUncertain
 from research_engine.tools import EXECUTOR_TOOLS
 
 logger = structlog.get_logger()
@@ -102,6 +103,9 @@ _FORCED_SUBMIT_SOURCES = 8
 # 记录 _structured 捕获的提供方错误。函数仍返回解析结果形状并保守失败（docs/11 §1），
 # 调用方可读取真实原因，避免将配额耗尽误报为规划器未能生成有效任务列表。
 _last_api_error: ContextVar[str | None] = ContextVar("last_api_error", default=None)
+# 记录结构化输出解析失败的脱敏摘要（schema 校验错误类型与字段路径）。
+# 没有它，"could not produce a valid task list" 会把模型输出格式问题掩盖成未知故障。
+_last_parse_error: ContextVar[str | None] = ContextVar("last_parse_error", default=None)
 
 
 def _looks_like_quota(msg: str) -> bool:
@@ -145,6 +149,7 @@ async def _structured(role: str, messages: list, schema):
 
 async def _structured_impl(role: str, messages: list, schema):
     _last_api_error.set(None)
+    _last_parse_error.set(None)
     model = get_llm(role)
     if get_run_config().llm_mode == "fake":
         resp = await traced_ainvoke(model, messages, role=role)
@@ -155,12 +160,18 @@ async def _structured_impl(role: str, messages: list, schema):
                 f"schema.{role}", kind="schema_validation", metadata={"strategy": "fake_json"}
             ):
                 parsed = schema.model_validate_json(resp.content)
-        except Exception:
+        except Exception as exc:
             parsed = None
+            _last_parse_error.set(f"fake_json: {type(exc).__name__}: {str(exc)[:240]}")
         return parsed, cost, i, o
 
     route = get_run_config().model_for(role)
 
+    # 注意：langchain-openai 1.6.6 的 with_structured_output(method="function_calling")
+    # 默认就绑定 tool_choice=<schema 函数名>（base.py:2783），即已强制模型调用该函数。
+    # 实验 gepa-ba26c622/e1448e62 的空响应发生在该强制已生效的前提下——是 DeepSeek
+    # 服务端行为，不是「模型自主跳过工具调用」，因此这里不再注入 tool_choice 覆盖
+    # 默认的函数级强制（注入 "required" 反而会把函数级强制放宽为任意工具）。
     if route.startswith("custom:deepseek"):
         structured = model.with_structured_output(
             schema,
@@ -171,6 +182,8 @@ async def _structured_impl(role: str, messages: list, schema):
         structured = model.with_structured_output(schema, include_raw=True)
     try:
         result = await traced_ainvoke(structured, messages, role=role)
+    except PaidRequestUncertain:
+        raise
     except Exception as e:  # noqa: BLE001
         # with_structured_output 在字段不合规则或提供方拒绝请求时可能直接抛异常，
         # 而不仅设置 parsing_error。统一按无法解析处理，让节点保守失败（docs/11 §1），
@@ -181,6 +194,13 @@ async def _structured_impl(role: str, messages: list, schema):
     cost = estimate_cost(raw, role) if raw is not None else 0.0
     i, o = token_counts(raw) if raw is not None else (0, 0)
     parsed = None if result.get("parsing_error") else result.get("parsed")
+    parse_detail = ""
+    if result.get("parsing_error"):
+        # 解析失败摘要：类型 + 字段路径 + 失败摘要，脱敏截断；不保存完整模型响应。
+        raw_error = str(result.get("parsing_error") or "")
+        parse_detail = (
+            f"{type(result.get('parsing_error')).__name__}: {' '.join(raw_error.split())[:240]}"
+        )
     if parsed is None and raw is not None and getattr(raw, "content", None):
         content = raw.content
         if isinstance(content, str) and content.strip():
@@ -193,7 +213,8 @@ async def _structured_impl(role: str, messages: list, schema):
                     f"schema.{role}", kind="schema_validation", metadata={"strategy": "raw_json"}
                 ):
                     parsed = schema.model_validate_json(cleaned)
-            except Exception:
+            except Exception as exc:
+                parse_detail = f"raw_json: {type(exc).__name__}: {' '.join(str(exc).split())[:240]}"
                 match = re.search(r"\{.*\}", cleaned, re.DOTALL)
                 if match:
                     try:
@@ -203,8 +224,118 @@ async def _structured_impl(role: str, messages: list, schema):
                             metadata={"strategy": "json_object"},
                         ):
                             parsed = schema.model_validate_json(match.group(0))
-                    except Exception:
-                        pass
+                    except Exception as exc2:
+                        parse_detail = f"json_object: {type(exc2).__name__}: {' '.join(str(exc2).split())[:240]}"
+    if parsed is None:
+        # 空文本恢复：function_calling 模式下模型可能只返回 tool_call（content 为空），
+        # 先尝试从 tool_calls 参数直接通过 schema 校验；仍失败时记录响应形态——
+        # reasoning-only 完成（有思维链、无 tool call）是 hybrid 推理模型已知的间歇行为，
+        # 形态记录让下一次故障能区分「模型没答」与「答了但解析失败」。
+        raw_tool_calls = getattr(raw, "tool_calls", None) if raw is not None else None
+        if raw_tool_calls:
+            for tool_call in raw_tool_calls:
+                args = (
+                    tool_call.get("args")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "args", None)
+                )
+                try:
+                    with trace_span(
+                        f"schema.{role}",
+                        kind="schema_validation",
+                        metadata={"strategy": "tool_call_args"},
+                    ):
+                        parsed = schema.model_validate(args)
+                    parse_detail = ""
+                    break
+                except Exception as exc:
+                    parse_detail = (
+                        f"tool_call_args: {type(exc).__name__}: {' '.join(str(exc).split())[:240]}"
+                    )
+        if parsed is None and not parse_detail:
+            # invalid_tool_calls 是最后一个盲区：DeepSeek 返回畸形 tool_call
+            # （参数截断/非法 JSON）时，langchain 不抛异常也不进 tool_calls，
+            # 解析器看到的是 None——与真正的空消息无法区分，除非在此显式记录。
+            invalid_tool_calls = (
+                getattr(raw, "invalid_tool_calls", None) if raw is not None else None
+            )
+            reasoning_present = False
+            has_content = False
+            if raw is not None:
+                reasoning_present = bool(
+                    (getattr(raw, "additional_kwargs", None) or {}).get("reasoning_content")
+                )
+                has_content = bool(getattr(raw, "content", None))
+            invalid_summary = "absent"
+            if invalid_tool_calls:
+                first = invalid_tool_calls[0]
+                first_args = first.get("args") if isinstance(first, dict) else None
+                first_error = first.get("error") if isinstance(first, dict) else None
+                invalid_summary = (
+                    f"present(count={len(invalid_tool_calls)}, "
+                    f"args_len={len(first_args) if isinstance(first_args, str) else 0}, "
+                    f"err={str(first_error)[:120]})"
+                )
+            parse_detail = (
+                f"empty_response: content={'present' if has_content else 'empty'}; "
+                f"tool_calls={'present' if raw_tool_calls else 'absent'}; "
+                f"invalid_tool_calls={invalid_summary}; "
+                f"reasoning_content={'present' if reasoning_present else 'absent'}"
+            )
+            parse_detail = (
+                f"empty_response: content={'present' if has_content else 'empty'}; "
+                f"tool_calls={'present' if raw_tool_calls else 'absent'}; "
+                f"invalid_tool_calls={invalid_summary}; "
+                f"reasoning_content={'present' if reasoning_present else 'absent'}"
+            )
+        # JSON Output mode 备用路径：绕过 function calling，用 response_format json_object
+        # 重新请求同一模型。仅在 function_calling 返回空（无 content、无 tool_calls）时触发；
+        # 结果仍经同一个 schema 校验，失败不伪造任务。备用路径尝试本身也记录到 parse_detail。
+        if parsed is None and "empty_response" in parse_detail:
+            json_bound = model.bind(response_format={"type": "json_object"})
+            fallback_messages = list(messages) + [
+                SystemMessage(content="Respond in valid JSON format matching the expected schema.")
+            ]
+            result_json = await traced_ainvoke(json_bound, fallback_messages, role=role)
+            cost_f = estimate_cost(result_json, role) if result_json is not None else 0.0
+            i_f, o_f = token_counts(result_json) if result_json is not None else (0, 0)
+            cost += cost_f
+            i += i_f
+            o += o_f
+            content_json = getattr(result_json, "content", "") or ""
+            if isinstance(content_json, str) and content_json.strip():
+                cleaned = content_json.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+                try:
+                    with trace_span(
+                        f"schema.{role}",
+                        kind="schema_validation",
+                        metadata={"strategy": "json_mode_fallback"},
+                    ):
+                        parsed = schema.model_validate_json(cleaned)
+                    parse_detail = "json_mode_fallback: recovered"
+                except Exception as exc:
+                    parse_detail = (
+                        f"json_mode_fallback: {type(exc).__name__}: "
+                        f"{' '.join(str(exc).split())[:240]}"
+                    )
+            else:
+                parse_detail = f"json_mode_fallback: also returned empty content; {parse_detail}"
+    if parsed is None and parse_detail:
+        # 附带服务端响应元数据：finish_reason 与 reasoning token 是区分
+        # 「推理耗尽输出预算」与「模型未调用工具」的关键证据（用户决策需要）。
+        meta = getattr(raw, "response_metadata", None) or {}
+        finish_reason = meta.get("finish_reason") if isinstance(meta, dict) else None
+        usage = getattr(raw, "usage_metadata", None) or {}
+        output_details = usage.get("output_token_details") or {}
+        reasoning_tokens = output_details.get("reasoning")
+        if finish_reason:
+            parse_detail = f"{parse_detail}; finish_reason={finish_reason}"
+        if reasoning_tokens:
+            parse_detail = f"{parse_detail}; reasoning_tokens={reasoning_tokens}"
+        _last_parse_error.set(parse_detail)
     return parsed, cost, i, o
 
 
@@ -262,6 +393,8 @@ async def planner_node(state: AgentState) -> dict:
                 parsed, cost, i, o = await _structured("planner", messages, PlannerOutput)
                 if parsed is None:
                     span.status = "business_error"
+        except PaidRequestUncertain:
+            raise
         except Exception as e:  # noqa: BLE001
             # 纵深防御：即使通常不抛异常的 _structured 意外失败，也应返回提供方错误而非掩盖原因。
             return None, 0.0, 0, 0, str(e)[:400]
@@ -286,7 +419,13 @@ async def planner_node(state: AgentState) -> dict:
                 "error": f"planner: provider error — {api_err}",
                 **_acc(state, cost, i, o),
             }
-        return {"error": "planner: could not produce a valid task list", **_acc(state, cost, i, o)}
+        # 解析失败摘要随错误浮出（类型/字段路径/截断摘要），让 Journal 能记录真实原因。
+        parse_detail = _last_parse_error.get()
+        detail_suffix = f" (parse detail: {parse_detail})" if parse_detail else ""
+        return {
+            "error": f"planner: could not produce a valid task list{detail_suffix}",
+            **_acc(state, cost, i, o),
+        }
 
     tasks = [t.model_dump() for t in parsed.tasks]
     # 用户显式选择的大纲模板优先于模型提案，否则模板选择器形同虚设。

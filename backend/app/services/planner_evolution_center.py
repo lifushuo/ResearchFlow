@@ -3,7 +3,7 @@
 回流记录存放在评测卷 ``job_root()/planner-evolution/`` 下，与闭环数据库同源同权限：
 
 - ``cases/``       复核归因为 Planner 漏项的训练例记录，参与优化数据集组装
-- ``reviews/``     归因为检索或报告环节的复核记录，仅作证据保留，不进数据集
+- ``reviews/``     检索/报告问题以及规划完整的复核记录，仅作证据保留，不进数据集
 - ``experiments/`` 约定的 CLI 实验输出目录（``planner_evolution optimize --out-dir``）
 
 种子数据集与基准标注来自仓库内 ``evals/datasets/planner/``，只读；回流记录只追加，
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ from evals.agent_eval_ext.planner_evolution.experiment import Case, Dataset, nor
 
 PLANNER_DIR = "planner-evolution"
 RECORD_KIND = "planner_backflow_v1"
-STAGES = ("planner", "retrieval", "report")
+STAGES = ("planner", "planner_complete", "retrieval", "report")
 MAX_RECORD_BYTES = 256 * 1024
 MAX_EXPERIMENT_DIRS = 50
 SEED_DATASET = BACKEND / "evals/datasets/planner/planner-reviewed-v1.json"
@@ -43,7 +44,7 @@ class BackflowError(ValueError):
 class BackflowSource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["bad_case", "manual"]
+    type: Literal["bad_case", "manual", "evaluation_case"]
     bad_case_id: str | None = None
     benchmark_case_id: str | None = None
     run_id: str | None = None
@@ -53,13 +54,21 @@ class BackflowSource(BaseModel):
 class BackflowReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    stage: Literal["planner", "retrieval", "report"]
+    stage: Literal["planner", "planner_complete", "retrieval", "report"]
     review_note: str = Field(min_length=2, max_length=2000)
     reviewed_at: str
     source: BackflowSource
     benchmark_aspects: list[str] | None = None
-    # 评测轨迹默认只含元数据；未采集的任务列表不补造，只能显式披露缺失。
-    task_evidence_status: Literal["not_collected", "unavailable"] = "not_collected"
+    # reviewer_supplied 为人工复制的任务，trace_verified 为自动归档且提交时
+    # 已重新核对原文；两者都是显式来源标记，缺失证据只能披露，不能补造。
+    task_evidence_status: Literal[
+        "not_collected", "unavailable", "reviewer_supplied", "trace_verified"
+    ] = "not_collected"
+    planner_tasks: list[str] = Field(default_factory=list)
+    missing_aspects: list[str] = Field(default_factory=list)
+    evidence_reference: str | None = None
+    evidence_sha256: str | None = None
+    review_confirmed: bool = False
 
 
 class BackflowRecord(BaseModel):
@@ -174,6 +183,164 @@ def _check_dupes(
             raise BackflowError("相同问题已有回流记录")
 
 
+def _planner_evidence_for_run(
+    store: EvaluationClosure, owner: str, root: Path, run_id: str, case_id: str
+) -> dict[str, Any]:
+    """已测报告案例（包括 passed）均可取证，但必须同时验证用户、题源和归档。
+
+    四重归属校验：SQLite 逐题记录所有权 → Run 与 Pipeline 一致性 → Pipeline
+    所有权 → 基准题源与归档指纹一致。SHA-256 只证明记录内容自写入后未被
+    改动，不是防恶意篡改磁盘的签名。"""
+    from app.services.evaluation_pipeline_v13 import PIPE_RE, get_pipeline
+
+    result = {"status": "unavailable", "run_id": run_id, "tasks": [], "reason": "证据未归档"}
+    if not run_id.endswith("--report-benchmark"):
+        return result
+    pipeline_id = run_id.removesuffix("--report-benchmark")
+    if not PIPE_RE.fullmatch(pipeline_id):
+        return result
+    # Case 必须实际完成测量；预期题、页面路径或伪造的 Run ID 均无效。
+    detail = store.case_result(owner, run_id, case_id)
+    if (
+        detail["run"]["dataset_id"] != "report-benchmark"
+        or detail["run"]["execution_mode"] != "real"
+    ):
+        return result
+    if detail["run"].get("source_pipeline_id") not in (None, pipeline_id):
+        return result
+    try:
+        pipeline = get_pipeline(root, owner, pipeline_id)
+    except KeyError, ValueError:
+        return result
+    if "report-benchmark" not in pipeline.get("datasets", []):
+        return result
+    path = root / "pipelines" / pipeline_id / "artifacts" / "report-benchmark" / "raw_result.json"
+    if any(
+        part.is_symlink()
+        for part in (path, path.parent, path.parent.parent, path.parent.parent.parent)
+    ):
+        return result
+    if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+        return result
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError, UnicodeError:
+        return result
+    rows = doc.get("results") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        return result
+    for row in rows:
+        if not isinstance(row, dict) or row.get("id") != case_id:
+            continue
+        ev = row.get("planner_evidence")
+        if (
+            not isinstance(ev, dict)
+            or ev.get("schema_version") != 1
+            or ev.get("case_id") != case_id
+        ):
+            return result
+        signature = ev.get("evidence_sha256")
+        unsigned = {k: v for k, v in ev.items() if k != "evidence_sha256"}
+        expected = hashlib.sha256(
+            json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if not isinstance(signature, str) or signature != expected:
+            return result
+        benchmark, _ = sources("report-benchmark", 0)
+        fixture = benchmark.get(case_id)
+        if not fixture or input_hash(fixture) != detail["result"]["input_sha256"]:
+            return result
+        question = fixture.get("case", {}).get("query")
+        if not isinstance(question, str) or hashlib.sha256(question.encode()).hexdigest() != ev.get(
+            "query_sha256"
+        ):
+            return result
+        if not isinstance(ev.get("prompt_sha256"), str) or not re.fullmatch(
+            r"[0-9a-f]{64}", ev["prompt_sha256"]
+        ):
+            return result
+        if not isinstance(ev.get("trace_id"), str) or not re.fullmatch(
+            r"[0-9a-zA-Z_-]{1,64}", ev["trace_id"]
+        ):
+            return result
+        tasks = ev.get("tasks")
+        if not isinstance(tasks, list) or not 1 <= len(tasks) <= 30:
+            return result
+        if any(
+            not isinstance(t, dict)
+            or not isinstance(t.get("query"), str)
+            or not 5 <= len(t["query"]) <= 500
+            or not isinstance(t.get("id"), str)
+            for t in tasks
+        ):
+            return result
+        return {
+            "status": "recorded",
+            "run_id": run_id,
+            "case_id": case_id,
+            "result_status": detail["result"]["status"],
+            "tasks": tasks,
+            "prompt_sha256": ev["prompt_sha256"],
+            "trace_id": ev["trace_id"],
+            "evidence_reference": f"auto:{run_id}:{signature}",
+        }
+    return result
+
+
+def _planner_evidence_for_bad_case(
+    store: EvaluationClosure, owner: str, root: Path, bad_case_id: str
+) -> dict[str, Any]:
+    """原坏例接口保持兼容：坏例身份验证后共享可信归档解析器。"""
+    detail = store.bad_case_detail(owner, bad_case_id)
+    bc = detail["bad_case"]
+    return _planner_evidence_for_run(store, owner, root, bc["last_run_id"], bc["case_id"])
+
+
+def planner_evidence_for_bad_case(
+    store: EvaluationClosure, owner: str, root: Path, bad_case_id: str
+) -> dict[str, Any]:
+    """对外入口：API 与回流提交共用同一取证路径，保证展示与校验看到同一份归档。"""
+    return _planner_evidence_for_bad_case(store, owner, root, bad_case_id)
+
+
+def planner_evidence_for_case(
+    store: EvaluationClosure, owner: str, root: Path, run_id: str, case_id: str
+) -> dict[str, Any]:
+    """普通已测案例（含 passed）的取证入口，与坏例路径共享同一解析器。"""
+    return _planner_evidence_for_run(store, owner, root, run_id, case_id)
+
+
+def reviewable_evaluation_cases(store: EvaluationClosure, owner: str) -> dict[str, Any]:
+    """普通通过题与失败题都可进入人工复核；只列真实、已测、有基准标注的题。"""
+    benchmark, _ = sources("report-benchmark", 0)
+    annotated = load_benchmark_annotations()["aspects"]
+    rows = []
+    for run in store.runs(owner):
+        if run["dataset_id"] != "report-benchmark" or run["execution_mode"] != "real":
+            continue
+        for row in store.case_results(owner, run["run_id"]):
+            if row["case_id"] not in annotated or row["case_id"] not in benchmark:
+                continue
+            if row["input_sha256"] != input_hash(benchmark[row["case_id"]]):
+                continue
+            source = benchmark[row["case_id"]]["case"]
+            rows.append(
+                {
+                    "run_id": run["run_id"],
+                    "case_id": row["case_id"],
+                    "result_status": row["status"],
+                    "query": source["query"],
+                    "depth": source.get("depth", "balanced"),
+                    "required_aspects": annotated[row["case_id"]]["required_aspects"],
+                }
+            )
+            if len(rows) >= 30:
+                return {"cases": rows}
+    return {"cases": rows}
+
+
 def backflow(
     store: EvaluationClosure,
     owner: str,
@@ -185,8 +352,14 @@ def backflow(
     review_note: str,
     stage: str,
     bad_case_id: str | None = None,
+    evaluation_run_id: str | None = None,
+    evaluation_case_id: str | None = None,
     manual_query: str | None = None,
     manual_depth: str = "balanced",
+    planner_tasks: list[str] | None = None,
+    missing_aspects: list[str] | None = None,
+    evidence_reference: str | None = None,
+    review_confirmed: bool = False,
 ) -> dict[str, Any]:
     """把一条复核结论落成结构化回流记录；归因决定进训练集还是仅存证。
 
@@ -208,8 +381,38 @@ def backflow(
         raise BackflowError("必答维度重复")
     if not isinstance(review_note, str) or not 2 <= len(review_note.strip()) <= 2000:
         raise BackflowError("复核结论必填（2–2000 字符）")
-    if (bad_case_id is None) == (manual_query is None):
-        raise BackflowError("必须且只能选择坏例回流或手动回流之一")
+    if sum(x is not None for x in (bad_case_id, manual_query, evaluation_run_id)) != 1:
+        raise BackflowError("必须且只能选择坏例、已测评测案例或手动回流之一")
+    if (evaluation_run_id is None) != (evaluation_case_id is None):
+        raise BackflowError("普通评测案例必须同时提供 Run ID 与 Case ID")
+
+    # 严格准入：报告未完成 ≠ Planner 漏项。只有人工审阅任务清单并明确指出
+    # 哪些必答维度未被任何任务覆盖，才能写入 GEPA 的 train split。
+    planner_tasks = planner_tasks or []
+    missing_aspects = missing_aspects or []
+    if stage in ("planner", "planner_complete"):
+        if not review_confirmed:
+            raise BackflowError("Planner 复核需要人工确认任务证据，不能仅凭报告结果判定")
+        if not isinstance(planner_tasks, list) or not 1 <= len(planner_tasks) <= 30:
+            raise BackflowError("请提供实际 Planner 任务列表（1–30 条）")
+        if any(not isinstance(t, str) or not 5 <= len(t.strip()) <= 500 for t in planner_tasks):
+            raise BackflowError("实际 Planner 任务每条需 5–500 字符")
+        if stage == "planner" and (not isinstance(missing_aspects, list) or not missing_aspects):
+            raise BackflowError("必须指出至少一条未被 Planner 任务覆盖的必答维度")
+        if stage == "planner_complete" and missing_aspects:
+            raise BackflowError("规划完整不能同时标记遗漏维度")
+        labels = {normalized(x): x for x in aspects}
+        if any(not isinstance(x, str) or normalized(x) not in labels for x in missing_aspects):
+            raise BackflowError("漏项维度必须来自当前必答维度列表")
+        if len({normalized(x) for x in missing_aspects}) != len(missing_aspects):
+            raise BackflowError("漏项维度重复")
+        if (
+            not isinstance(evidence_reference, str)
+            or not 4 <= len(evidence_reference.strip()) <= 200
+        ):
+            raise BackflowError("请填写 Planner Trace 或任务列表的可追溯证据编号")
+    elif planner_tasks or missing_aspects or evidence_reference or review_confirmed:
+        raise BackflowError("检索/报告归因不能携带 Planner 漏项确认字段")
 
     seed = load_seed_dataset()
     annotations = load_benchmark_annotations()
@@ -236,6 +439,25 @@ def backflow(
             run_id=bad_case["last_run_id"],
             error_key=bad_case["error_key"],
         )
+    elif evaluation_run_id is not None:
+        if stage not in ("planner", "planner_complete"):
+            raise BackflowError("普通评测案例只允许 Planner 维度复核")
+        assert evaluation_case_id is not None
+        archived = _planner_evidence_for_run(
+            store, owner, root, evaluation_run_id, evaluation_case_id
+        )
+        if archived["status"] != "recorded":
+            raise BackflowError("该评测案例缺少可验证的 Planner 任务证据")
+        fixture, _ = sources("report-benchmark", 0)
+        row = fixture[evaluation_case_id]["case"]
+        query = row["query"]
+        depth = row.get("depth", "balanced")
+        benchmark_aspects = annotations["aspects"][evaluation_case_id]["required_aspects"]
+        source = BackflowSource(
+            type="evaluation_case", benchmark_case_id=evaluation_case_id, run_id=evaluation_run_id
+        )
+        if aspects != benchmark_aspects:
+            raise BackflowError("普通评测案例必须使用冻结的必答维度，不能在复核时改写标注")
     else:
         assert manual_query is not None
         if not 10 <= len(manual_query.strip()) <= 2000:
@@ -245,9 +467,71 @@ def backflow(
         query = manual_query.strip()
         source = BackflowSource(type="manual")
 
-    _check_group_split(seed, group, "train")
+    if stage == "planner":
+        _check_group_split(seed, group, "train")
+        if evaluation_run_id is not None and group not in {
+            case.group for case in seed.cases if case.split == "train"
+        }:
+            raise BackflowError("普通评测漏项必须归入已有开发集主题组，防止绕过冻结验证/留出分组")
     records = _existing_records(root) + read_records(evolution_root(root) / "reviews")[0]
-    _check_dupes(seed, records, case_id=case_id, query=query, bad_case_id=bad_case_id)
+    if stage == "planner_complete":
+        if any(
+            rec.get("review", {}).get("source", {}).get("run_id") == source.run_id
+            and rec.get("review", {}).get("source", {}).get("benchmark_case_id")
+            == source.benchmark_case_id
+            for rec in records
+        ):
+            raise BackflowError("本次评测案例已经人工复核")
+        if any(rec.get("case", {}).get("case_id") == case_id for rec in records):
+            raise BackflowError("案例 ID 已有回流记录")
+    else:
+        _check_dupes(seed, records, case_id=case_id, query=query, bad_case_id=bad_case_id)
+        if evaluation_run_id and any(
+            rec.get("review", {}).get("source", {}).get("run_id") == evaluation_run_id
+            and rec.get("review", {}).get("source", {}).get("benchmark_case_id")
+            == evaluation_case_id
+            for rec in records
+        ):
+            raise BackflowError("本次评测案例已经人工复核")
+
+    # 保持去重优先级：重复坏例先报「已回流」，证据校验在后。
+    # 坏例已有明确 Run ID，证据引用必须指向同一运行；只做关联约束，
+    # 无法自动从 Trace 反证 Planner 内容。
+    if (
+        stage in ("planner", "planner_complete")
+        and bad_case_id is not None
+        and source.run_id not in evidence_reference
+    ):
+        raise BackflowError("Planner Trace 证据编号必须包含该坏例的 Run ID")
+
+    # auto: 引用来自自动归档。提交时重新核对归档状态与原文一致，防止
+    # 审核到提交之间归档被改动后仍按旧内容回流；人工复制路径不走这里。
+    verified_trace = False
+    if (
+        stage in ("planner", "planner_complete")
+        and evidence_reference
+        and evidence_reference.startswith("auto:")
+    ):
+        if bad_case_id is not None:
+            archived = _planner_evidence_for_bad_case(store, owner, root, bad_case_id)
+        elif evaluation_run_id is not None:
+            archived = _planner_evidence_for_run(
+                store, owner, root, evaluation_run_id, evaluation_case_id
+            )
+        else:
+            raise BackflowError("自动取证仅支持真实评测运行")
+        if (
+            archived.get("status") != "recorded"
+            or archived.get("evidence_reference") != evidence_reference
+        ):
+            raise BackflowError("自动 Planner 证据不存在或已变化，请刷新并重新审核")
+        if planner_tasks != [row["query"] for row in archived["tasks"]]:
+            raise BackflowError("自动 Planner 任务内容与归档原文不一致")
+        verified_trace = True
+
+    # 普通评测案例没有人工复制路径：必须走自动归档校验，防止伪造任务列表。
+    if evaluation_run_id is not None and not verified_trace:
+        raise BackflowError("普通评测案例回流必须使用可验证的自动证据")
 
     record = BackflowRecord(
         schema_version=1,
@@ -267,6 +551,31 @@ def backflow(
             reviewed_at=datetime.now(UTC).isoformat(timespec="seconds"),
             source=source,
             benchmark_aspects=benchmark_aspects,
+            task_evidence_status=(
+                "trace_verified"
+                if verified_trace
+                else "reviewer_supplied"
+                if stage == "planner"
+                else "not_collected"
+            ),
+            planner_tasks=[t.strip() for t in planner_tasks],
+            missing_aspects=[labels[normalized(x)] for x in missing_aspects]
+            if stage == "planner"
+            else [],
+            evidence_reference=evidence_reference.strip()
+            if stage in ("planner", "planner_complete")
+            else None,
+            evidence_sha256=input_hash(
+                {
+                    "tasks": [t.strip() for t in planner_tasks],
+                    "missing_aspects": [labels[normalized(x)] for x in missing_aspects],
+                    "evidence_reference": evidence_reference.strip(),
+                    "run_id": source.run_id,
+                }
+            )
+            if stage in ("planner", "planner_complete")
+            else None,
+            review_confirmed=(stage in ("planner", "planner_complete") and review_confirmed),
         ),
     )
     # 归因不是 planner 的复核写入 reviews/，只作证据保留，不进优化数据集。
@@ -297,7 +606,16 @@ def assemble_dataset(seed: Dataset, records: list[dict[str, Any]]) -> dict[str, 
     """种子数据集加上 planner 归因回流记录；冲突在这里统一披露。"""
     backflow_cases: list[Case] = []
     for record in records:
-        if record.get("review", {}).get("stage") != "planner":
+        review = record.get("review", {})
+        # 旧版只有“人工选 planner”的历史记录不自动获得可信训练资格。
+        if (
+            review.get("stage") != "planner"
+            or review.get("task_evidence_status") not in ("reviewer_supplied", "trace_verified")
+            or not review.get("review_confirmed")
+            or not review.get("planner_tasks")
+            or not review.get("missing_aspects")
+            or not review.get("evidence_sha256")
+        ):
             continue
         backflow_cases.append(Case.model_validate(record["case"]))
     error = None

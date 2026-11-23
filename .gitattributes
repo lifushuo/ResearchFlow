@@ -2,3 +2,9 @@
 *.sh text eol=lf
 # 升级夹具是旧版本原始字节证据，禁止 Git 自动转换换行后破坏清单哈希。
 backend/tests/fixtures/upgrade/** -text
+
+# Frozen GEPA protocol files are byte-hashed; preserve their exact line endings.
+backend/evals/holdout_usage_guard.py -text
+internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
+internal/gepa-v3-acceptance-20261123/holdout-gepa-v3-20261123-v1.manifest.json -text whitespace=trailing-space,space-before-tab,cr-at-eol
+internal/gepa-v3-acceptance-20261123/holdout-usage-policy.json -text whitespace=trailing-space,space-before-tab,cr-at-eol

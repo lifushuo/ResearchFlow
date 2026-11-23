@@ -1,7 +1,10 @@
 """只统计响应实际披露的用量；缺失不补零，配置路由不冒充实际模型。"""
 
 import asyncio
+import hashlib
+import json
 import re
+import traceback
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -13,7 +16,29 @@ from research_engine.runconfig import get_run_config
 from research_engine.trace_content import configured_secrets, content_snapshot
 
 _SESSION = ContextVar("model_usage_session", default=None)
+# Optional paid-call gate. Default None preserves all existing behavior. When a
+# host installs a gate, EVERY application-level model request charges one slot
+# here — including Planner retries and the JSON fallback inside _structured.
+_PAID_GATE: ContextVar = ContextVar("paid_call_gate", default=None)
 _LOG = structlog.get_logger()
+
+
+class PaidRequestUncertain(RuntimeError):
+    """A classified request failed after dispatch; never retry automatically."""
+
+    def __init__(self, slot_id, role, cause_type):
+        self.slot_id, self.role, self.cause_type = slot_id, role, cause_type
+        super().__init__(f"{role} request {slot_id} has uncertain outcome ({cause_type})")
+
+
+@contextmanager
+def gate_scope(gate):
+    """Install a per-request paid-call gate for the enclosed awaited calls."""
+    token = _PAID_GATE.set(gate)
+    try:
+        yield
+    finally:
+        _PAID_GATE.reset(token)
 
 
 def count(value):
@@ -59,12 +84,45 @@ async def invoke(model, messages, *, role, configured_route=None):
     """一次应用层调用对应一条持久事件；不估算 SDK 内部重试或未返回的用量。"""
     response, state = None, "failed"
     config = get_run_config()
+    gate = _PAID_GATE.get()
+    reservation = None
+    if gate is not None and config.llm_mode == "real":
+        fingerprint = hashlib.sha256(
+            json.dumps(str(messages), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        reservation = gate.reserve(role, f"request:{role}", fingerprint)
+        reservation.mark_sent()
     try:
         response = await model.ainvoke(messages)
         state = "completed"
+        if reservation is not None:
+            reservation.mark_completed()
         return response
     except asyncio.CancelledError:
         state = "cancelled"
+        if reservation is not None:
+            reservation.mark_unknown(reason="request cancelled")
+        raise
+    except Exception as exc:
+        if reservation is not None:
+            chain = []
+            current = exc
+            while current is not None and len(chain) < 6:
+                chain.append(type(current).__name__)
+                current = current.__cause__ or current.__context__
+            reservation.mark_unknown(
+                reason=f"{type(exc).__name__}: {str(exc)[:200]}",
+                cause_types=chain,
+                call_stack=[
+                    {
+                        "file": frame.filename.replace("\\", "/").split("/")[-1],
+                        "function": frame.name,
+                        "line": frame.lineno,
+                    }
+                    for frame in traceback.extract_tb(exc.__traceback__)[-8:]
+                ],
+            )
+            raise PaidRequestUncertain(reservation.slot_id, role, type(exc).__name__) from exc
         raise
     finally:
         session = _SESSION.get()

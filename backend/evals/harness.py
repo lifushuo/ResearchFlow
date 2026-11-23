@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -45,9 +46,11 @@ from evals.agent_eval_ext.judge_runtime import (
 )
 from evals.judge_config import judge_client_config, judge_provider_keys
 from evals.query_selection import select_queries
+from evals.report_ab_dataset import fixed_report_queries
 from research_engine.eval_trace import eval_trace_run, trace_span, traced_ainvoke
 from research_engine.graph import build_graph
 from research_engine.local import load_env_file, run_config_from_env
+from research_engine.prompt_composition import recording_provenance
 from research_engine.prompts import PLANNER_PROMPT_V2
 from research_engine.runconfig import (
     RunConfig,
@@ -426,6 +429,44 @@ def candidate_section(overrides: dict[str, str], rows: list[dict]) -> dict:
     }
 
 
+def _planner_evidence(
+    state: dict,
+    *,
+    query: dict,
+    prompt_records: dict,
+    runtime_trace,
+) -> dict | None:
+    """原始 Planner 输出的受限投影。只捕获真实执行后的任务，不推断漏项。"""
+    tasks = state.get("tasks")
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 30:
+        return None
+    extracted = []
+    for index, task in enumerate(tasks, 1):
+        if not isinstance(task, dict) or not isinstance(task.get("query"), str):
+            return None
+        value = task["query"].strip()
+        if not 5 <= len(value) <= 500:
+            return None
+        extracted.append({"id": str(task.get("id", index))[:40], "query": value})
+    recorded = prompt_records.get("planner.main", {})
+    actual_prompt = recorded.get("effective_prompt")
+    evidence = {
+        "schema_version": 1,
+        "case_id": query["id"],
+        "query_sha256": hashlib.sha256(query["query"].encode("utf-8")).hexdigest(),
+        "tasks": extracted,
+        "prompt_sha256": (
+            hashlib.sha256(actual_prompt.encode("utf-8")).hexdigest()
+            if isinstance(actual_prompt, str)
+            else None
+        ),
+        "trace_id": getattr(runtime_trace, "trace_id", None),
+    }
+    serialized = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    evidence["evidence_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return evidence
+
+
 def _trace_artifacts(writer, *, requested: bool, artifact_root: Path | None = None) -> dict:
     if not requested:
         return {}
@@ -578,6 +619,7 @@ async def run_one(
     )
 
     reused = None
+    prompt_records: dict = {}
     if store is not None and store.source_dir is not None:
         # A fingerprint mismatch refuses the whole run: neither a paid research graph nor
         # a paid judge call may silently reinterpret saved evidence.
@@ -622,21 +664,23 @@ async def run_one(
             # The candidate is live for the pipeline alone. Reading the state back composes
             # no prompt, so it runs after the reset; so does everything below, the judge.
             with _pipeline_scope(prompt_overrides):
-                with eval_trace_run(
-                    case_id=query["id"],
-                    run_id=trace_run_id or uuid.uuid4().hex,
-                    thread_id=thread_id,
-                    directory=trace_directory,
-                    enabled=trace_requested,
-                    capture_content=trace_content or os.environ.get("RF_EVAL_CONTENT_TRACE") == "1",
-                    redaction_secrets=environment_secrets(),
-                ) as runtime_trace:
-                    if ctx is not None:
-                        invoke_result = await long_run.with_deadline(
-                            graph.ainvoke(initial, config), budget=ctx.budget, stage="research"
-                        )
-                    else:
-                        invoke_result = await graph.ainvoke(initial, config)
+                with recording_provenance(prompt_records):
+                    with eval_trace_run(
+                        case_id=query["id"],
+                        run_id=trace_run_id or uuid.uuid4().hex,
+                        thread_id=thread_id,
+                        directory=trace_directory,
+                        enabled=trace_requested,
+                        capture_content=trace_content
+                        or os.environ.get("RF_EVAL_CONTENT_TRACE") == "1",
+                        redaction_secrets=environment_secrets(),
+                    ) as runtime_trace:
+                        if ctx is not None:
+                            invoke_result = await long_run.with_deadline(
+                                graph.ainvoke(initial, config), budget=ctx.budget, stage="research"
+                            )
+                        else:
+                            invoke_result = await graph.ainvoke(initial, config)
             state = (await graph.aget_state(config)).values
         except (long_run.StageDeadlineExceeded, long_run.CooperativeStop) as exc:
             _save(ctx, store, "save_progress", status=long_run.RESEARCH_FAILED, reason=str(exc))
@@ -663,6 +707,13 @@ async def run_one(
             return row
         interrupt = _interrupt_payload(invoke_result)
 
+    planner_evidence = (
+        reused.get("planner_evidence")
+        if reused is not None
+        else _planner_evidence(
+            state, query=query, prompt_records=prompt_records, runtime_trace=runtime_trace
+        )
+    )
     latency = (
         round(time.time() - started, 2) if reused is None else float(reused.get("latency_s", 0.0))
     )
@@ -678,6 +729,7 @@ async def run_one(
         draft_doc = {
             "state": research_state,
             "draft_report": report,
+            "planner_evidence": planner_evidence,
             "sources": _jsonable(sources),
             "evidence": _jsonable(state.get("evidence") or []),
             "citations": _jsonable(citations),
@@ -718,6 +770,7 @@ async def run_one(
     result = {
         "id": query["id"],
         "domain": query.get("domain"),
+        "planner_evidence": planner_evidence,
         "completed": completed,
         "error": error,
         "latency_s": latency,
@@ -1501,18 +1554,31 @@ async def _main() -> None:
         default=None,
         help="reuse a validated draft with a new output budget; rescore ALL judge batches",
     )
+    parser.add_argument(
+        "--report-queries",
+        type=Path,
+        default=None,
+        help="audited fixed report set (9-case GEPA A/B); disallowed in memory mode",
+    )
     args = parser.parse_args()
     if args.case_id is not None and args.mode != "report":
         parser.error("--case-id supports --mode report only; nothing was run")
     if args.rejudge_from is not None and args.mode != "report":
         parser.error("--rejudge-from supports --mode report only")
-    queries_file = EVALS_DIR / ("memory_queries.json" if args.mode == "memory" else "queries.json")
+    if args.report_queries is not None and args.mode != "report":
+        parser.error("--report-queries supports --mode report only")
+    queries_file = (
+        args.report_queries
+        if args.report_queries is not None
+        else EVALS_DIR / ("memory_queries.json" if args.mode == "memory" else "queries.json")
+    )
     try:
-        queries = select_queries(
-            json.loads(queries_file.read_text(encoding="utf-8-sig"))["queries"],
-            case_id=args.case_id,
-            limit=args.limit,
+        source_rows = (
+            fixed_report_queries(queries_file)
+            if args.report_queries is not None
+            else json.loads(queries_file.read_text(encoding="utf-8-sig"))["queries"]
         )
+        queries = select_queries(source_rows, case_id=args.case_id, limit=args.limit)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(f"{exc}; no queries were run")
     tracing = args.trace or args.trace_content or os.environ.get("RF_EVAL_TRACE") == "1"
@@ -1674,7 +1740,11 @@ async def _main() -> None:
         "method": {
             "metrics_version": metrics.METRICS_VERSION,
             "retriever": _retriever_in_use() if args.mode == "report" else "none (static memory)",
-            "query_set": f"evals/{'memory_' if args.mode == 'memory' else ''}queries.json",
+            "query_set": (
+                "evals/queries-planner-gepa-ab-v1.json"
+                if args.report_queries is not None
+                else f"evals/{'memory_' if args.mode == 'memory' else ''}queries.json"
+            ),
             # How the pipeline was driven — read from the environment (research_engine/local.py),
             # so a result that omitted them could not be reproduced from its own file. The
             # release run sets `max_parallel_tasks` to 1 so a provider sees sequential calls,

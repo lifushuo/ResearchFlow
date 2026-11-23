@@ -935,15 +935,44 @@ $PlannerPython = '..\data\.venv-planner-evolution\Scripts\python.exe'
 反思失败时仍可查看此前已保存的观测；日志写入失败会停止后续调用。日志用于排查和核对花费来源，
 不表示可以自动恢复 GEPA 的内部搜索状态，也不承诺崩溃窗口内零重复计费。
 反思或日志保存失败后会锁定停止状态，避免 GEPA 捕获异常后的回退路径再次请求模型；供应商 SDK
-原有重试机制保持不变，不能把应用层停止保护理解为所有 HTTP 请求都绝不重试。
+原有重试机制在历史非预算CLI中保持不变；严格预算上下文会关闭OpenAI兼容客户端的同步/异步SDK重试，Planner显式重试和JSON回退逐请求占用新槽位。未知调用阻断后续请求，不能用评测次数代替实际请求账本。
 
 真实留出门禁要求每个维度都有对应任务编号或明确的空列表，发布时从这些证据重算覆盖率。
 未披露实际 Judge 身份时可以保留观测，但不得通过发布门禁。报告门禁严格校验布尔状态、报告与逐 Claim
 判定，重建两臂的实际 Judge 身份并排除与研究或反思模型重合的情况；汇总字段不能代替逐条证据。
 
 该功能通过 CLI 生成发布和回滚配置，仍需人工在现有 Agent 设置中应用。前端「自进化」页面（`/evolution`，与评测中心同为
-仅服务端能力）描述闭环流程并提供坏例回流入口；付费优化、报告 A/B 与发布仍只能由 CLI 发起，页面不提供自动运行或
-自动批准。运行级 Prompt 快照复用已有实现。离线演示与故障注入验证流程正确性，不代表已证明真实模型质量提升。
+仅服务端能力）提供坏例回流及GEPA v3搜索入口。网页真实搜索需要管理员开启、用户允许名单和费用确认；入队冻结模型路由、Baseline、规则hash、Judge参数与min_gain=0.05，保存任务级budget.json。Worker强制严格请求预算，正常搜索不运行Holdout或自动发布。报告A/B、留出终验与发布不随搜索自动启动。离线验收不代表已证明真实模型质量提升。
+
+### 网页 GEPA v3 无留出搜索
+
+新入队任务冻结各角色的单次等待上限：Planner/Reflection 为 90 秒，Judge 为 240 秒；服务端可通过 `RF_GEPA_JUDGE_TIMEOUT_SECONDS` 配置 Judge（1–600 秒）。Worker 将冻结值传给 CLI 的 `--timeout` / `--judge-timeout`，Journal 和结果保留实际值。历史任务缺少该快照时仍使用原来的 90 秒，不会在部署后静默改变。独立 CLI 未传 `--judge-timeout` 时沿用 `--timeout`。等待时间不增加请求或 Token 配额；本地 Judge 截止时间触发后记为 `JudgeDeadlineExceeded`，保留 UNKNOWN 槽位并终止，不自动重发或清账。前端审计展示冻结值，历史缺失保持未记录。
+
+从“评测中心 → Planner自进化 → GEPA优化实验”选择免费Fake验收或真实模式。默认v3、烟雾数据集、8次评测、1次提议、seed=42；完整Train/Validation预设为64次、4次提议。服务器复用已有模型配置，独立Judge须与Planner/Reflection不同。页面不保存或返回模型密钥。
+
+搜索快照只含Train/Validation，Dataset契约允许显式无Holdout输入；CLI必须带`--no-holdout`，默认含留出验收的历史CLI仍要求真实Holdout。没有合成或占位Holdout参与评分。冻结独立留出集继续由用途guard保护，不能借搜索重复曝光。
+
+8次预设的请求上限为Planner32/Judge8/Reflection1，共41；64次预设为256/64/4，共324。API写入`budget.json`、`frozen-config.json`、`baseline.json`、`dataset.json`；Worker使用同一GEPA CLI并传入`--strict-budget --budget-config --frozen-config --no-holdout`。评测上限、提议上限与请求上限是不同限制，搜索可能正常提前结束；请求额度不等于货币预算。
+
+终态`pending_final`表示搜索完成、有候选待终验；`no_candidate`表示正常完成但无可接受改进（包括覆盖率退化）；`failed`表示执行或预算异常；`cancelled`表示取消。无留出时门禁为null，不能显示成发布通过或执行失败。最终保留Baseline时验证评分可能复用缓存，不能把未测的新Prompt验证收益补为0。
+
+Journal/API投影返回Coverage、Specificity、Plan Quality、Redundancy及v3 Quality，页面展示候选SHA/Diff、冻结路由、Reflection次数、请求已用/剩余/UNKNOWN及已报告的Token。旧数据缺失子分和Reflection用量保持null。原始Journal和历史实验不重写，反思正文/完整内部Pareto选择不补造。
+
+免费端到端验收使用`test_gepa_web_v3_e2e.py`启动实际CLI子进程和GEPA库，Fake Planner/Judge/Reflection仍经过同一PaidCallBudget。`test_gepa_strict_sdk.py`以MockTransport验证SDK重试关闭、额度耗尽前拒绝额外请求；不连接真实提供商。前端`GEPAWebV3Acceptance.test.tsx`在设置`GEPA_ACCEPTANCE_ARTIFACT`时消费这轮后端API实际产物进行展示验收。
+
+Docker部署需要更新api、frontend及两个GEPA Worker镜像，它们不绑定挂载源码。启动在线Worker前应确认没有未经本轮授权的付费排队任务。历史缺少严格预算快照的live任务会被拒绝执行，不能自动重发。
+
+### 独立 Planner 留出终验
+
+在 GEPA 搜索完成并接受候选后，展开该实验结果，点击“准备独立 Planner 终验”。默认先运行免费 Fake 流程验收：使用专用九题模拟案例，不读取正式 Holdout，不证明候选质量。结果以关联父实验的独立任务保存在原 GEPA 历史、Journal、请求账本与审计面板中；不会修改原实验或生产 Prompt。
+
+真实终验需另行设置 `RF_GEPA_FINAL_LIVE_ENABLED=1`，同时满足原 GEPA 管理员开启与 owner 允许名单，并在页面单独确认费用。API预览只读冻结候选与协议侧车元数据，不载入正式题目。正式九题及冻结策略在 API/在线 Worker 中以只读单文件挂载提供，离线 Worker 不挂载它们。执行器复用 `LiveRuntime` 与冻结 v3 `gate_v3`，固定九题两臂18次评测；PaidCallBudget 上限 Planner72 / Judge18 / Reflection0，总计90个真实请求，SDK自动重试关闭，UNKNOWN阻断继续调用。
+
+终验入队即为该正式留出指纹创建全局、不可自动释放的一次性曝光预约；取消、崩溃和未知结果不会清除预约，也不会自动重跑。请求ID幂等重发只返回原任务。不得用同一留出反复选择候选。该协议题目历史曾用于报告评测，现仅保留 `planner_final_ab` 用途，不能再用于完整报告A/B。只有真实终验任务的Worker在费用授权与冻结快照复核后调用用途守卫、校验指纹并读取题目。测试和Fake模式都不执行该读取。
+
+Planner终验的 `succeeded` 表示本任务的质量门禁通过；`quality_rejected` 表示有完整测量但质量门禁未通过；`failed`/`cancelled`均不能当作质量退化。`release_ready=false`：完整报告A/B及人工发布不由终验任务执行，现有旧 `report/release` CLI不能直接消费新的v3无留出搜索与终验任务，勿据此绕过发布审核。
+
+队列执行入口为 `python -m evals.agent_eval_ext.planner_final_ab --job-dir <任务目录> --out-dir <对应实验目录> --strict-budget --budget-config <任务目录>/budget.json --fake`；真实模式使用 `--live`，还必须具备合法付费入队记录和曝光预约。不要手工改写任务或原实验。免费回归：`python -m pytest tests/task/test_planner_final_web.py tests/task/test_planner_final_admission.py`。
 
 ### 评测中心接入与坏例回流
 

@@ -1,0 +1,184 @@
+{
+ "schema_version": 1,
+ "dataset_id": "planner-holdout-gepa-v3-20261123-v1",
+ "purpose": "independent_final_acceptance_planner_quality_only",
+ "status": "FROZEN_NO_SCORING_THIS_ROUND",
+ "source": "backend/evals/queries-planner-gepa-ab-v1.json (real ResearchFlow report benchmark)",
+ "aspect_annotation_source": "backend/evals/datasets/planner/benchmark-aspects-v1.json (human-maintained)",
+ "assignment_note": "Never used as Planner train/validation/holdout case in any GEPA experiment; journals contain only the 31-case planner dataset. Historically used for report-quality evals and pinned as report_dataset_sha256=959e8b... in 4 earlier experiments; that pinning carries NO Planner/Judge trace. Formal v3 search MUST NOT reuse these 9 for report A/B, else the holdout is dual-use and must be regenerated.",
+ "dedup": {
+  "threshold": 0.55,
+  "method": "max(char SequenceMatcher ratio, token Jaccard) on normalized text",
+  "pools_compared": [
+   "planner-reviewed-v1 dev/val/holdout (31)",
+   "scholarly verified (3)",
+   "scholarly pending (3)",
+   "report queries.json (10)",
+   "production DB runs (2 unique)"
+  ],
+  "exact_hits": 0,
+  "near_hits": 0,
+  "per_case": [
+   {
+    "case_id": "postgres-vs-mysql",
+    "max_similarity_excluding_self_source": 0.3744,
+    "hits": []
+   },
+   {
+    "case_id": "solid-state-batteries",
+    "max_similarity_excluding_self_source": 0.4322,
+    "hits": []
+   },
+   {
+    "case_id": "ozempic-mechanism",
+    "max_similarity_excluding_self_source": 0.3907,
+    "hits": []
+   },
+   {
+    "case_id": "carbon-capture-cost",
+    "max_similarity_excluding_self_source": 0.4251,
+    "hits": []
+   },
+   {
+    "case_id": "rust-adoption",
+    "max_similarity_excluding_self_source": 0.3953,
+    "hits": []
+   },
+   {
+    "case_id": "remote-work-productivity",
+    "max_similarity_excluding_self_source": 0.4167,
+    "hits": []
+   },
+   {
+    "case_id": "quantum-error-correction",
+    "max_similarity_excluding_self_source": 0.3982,
+    "hits": []
+   },
+   {
+    "case_id": "eu-ai-act",
+    "max_similarity_excluding_self_source": 0.4167,
+    "hits": []
+   },
+   {
+    "case_id": "mediterranean-diet",
+    "max_similarity_excluding_self_source": 0.402,
+    "hits": []
+   }
+  ]
+ },
+ "case_count": 9,
+ "cases": [
+  {
+   "case_id": "postgres-vs-mysql",
+   "query": "For a new transactional web application, what are the practical trade-offs between PostgreSQL and MySQL in 2025?",
+   "domain": "software",
+   "depth": "fast",
+   "required_aspects": [
+    "transaction semantics differences",
+    "operational and replication characteristics",
+    "ecosystem and tooling fit",
+    "recent performance comparisons"
+   ],
+   "aspect_rationale": "事务语义、运维与复制、生态适配与近期性能对比是 2025 年选型对比的可检索维度。"
+  },
+  {
+   "case_id": "solid-state-batteries",
+   "query": "What is the current state of solid-state battery commercialization and the main remaining engineering obstacles?",
+   "domain": "energy",
+   "depth": "comprehensive",
+   "required_aspects": [
+    "commercialization milestones",
+    "energy density and cycle life data",
+    "manufacturing scale-up obstacles",
+    "safety characteristics"
+   ],
+   "aspect_rationale": "商业化现状与主要障碍需拆成量产里程碑、性能数据、制造放大与安全性。"
+  },
+  {
+   "case_id": "ozempic-mechanism",
+   "query": "How do GLP-1 receptor agonists like semaglutide work, and what are the documented risks and open questions?",
+   "domain": "health",
+   "depth": "balanced",
+   "required_aspects": [
+    "mechanism of action",
+    "documented adverse effects",
+    "open research questions"
+   ],
+   "aspect_rationale": "作用机制、已记录风险与开放问题对应问题的三个分句。"
+  },
+  {
+   "case_id": "carbon-capture-cost",
+   "query": "How cost-effective is direct air capture of CO2 today compared with other carbon-removal methods?",
+   "domain": "climate",
+   "depth": "balanced",
+   "required_aspects": [
+    "direct air capture cost per tonne",
+    "alternative removal methods costs",
+    "energy requirements",
+    "cost accounting boundary"
+   ],
+   "aspect_rationale": "成本有效性比较必须固定每吨成本、替代方法成本、能耗与核算边界。"
+  },
+  {
+   "case_id": "rust-adoption",
+   "query": "Why are systems teams adopting Rust, and where does it still fall short versus C++?",
+   "domain": "software",
+   "depth": "fast",
+   "required_aspects": [
+    "adoption motivations",
+    "documented shortcomings versus C++",
+    "migration and interoperability friction"
+   ],
+   "aspect_rationale": "采用动机、相对 C++ 的不足与迁移摩擦对应问题的两个分句。"
+  },
+  {
+   "case_id": "remote-work-productivity",
+   "query": "What does the research say about the effect of remote work on productivity since 2020?",
+   "domain": "economics",
+   "depth": "balanced",
+   "required_aspects": [
+    "study designs and samples",
+    "measured productivity outcomes",
+    "conflicting findings"
+   ],
+   "aspect_rationale": "证据强度梳理需要研究设计与样本、产出测量结果与分歧解释。"
+  },
+  {
+   "case_id": "quantum-error-correction",
+   "query": "What recent progress has been made on quantum error correction, and how far are we from fault-tolerant machines?",
+   "domain": "physics",
+   "depth": "comprehensive",
+   "required_aspects": [
+    "recent correction demonstrations",
+    "physical-to-logical qubit overhead",
+    "remaining engineering obstacles"
+   ],
+   "aspect_rationale": "进展与容错距离对应近期演示、量子比特开销与剩余工程障碍。"
+  },
+  {
+   "case_id": "eu-ai-act",
+   "query": "What obligations does the EU AI Act place on providers of general-purpose AI models?",
+   "domain": "policy",
+   "depth": "balanced",
+   "required_aspects": [
+    "specific provider obligations",
+    "applicability timeline",
+    "enforcement and penalties"
+   ],
+   "aspect_rationale": "义务清单、适用时间线与执法处罚构成法规问题的可检索维度。"
+  },
+  {
+   "case_id": "mediterranean-diet",
+   "query": "What is the strength of evidence that the Mediterranean diet reduces cardiovascular risk?",
+   "domain": "health",
+   "depth": "fast",
+   "required_aspects": [
+    "study design types",
+    "effect sizes with uncertainty",
+    "evidence limitations"
+   ],
+   "aspect_rationale": "证据强度需按研究设计、带不确定度的效应量与局限性分层。"
+  }
+ ],
+ "content_sha256": "2a9d296b1628595a04a6e1c2c3736bedf02ca1cfb918ba973888ee29d95e8b3d"
+}

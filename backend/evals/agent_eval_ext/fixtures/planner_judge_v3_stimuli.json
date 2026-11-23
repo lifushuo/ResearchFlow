@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "purpose": "planner_judge_v3_calibration_stimuli",
+  "warning": "Stimuli are development-set inputs authored for calibration. Expected outcomes are derived from construction (which tasks exist), never from holdout results. This file is not a label source.",
+  "repeats_on_complete": 3,
+  "cases": [
+    {
+      "case_id": "cal-rag-vs-lc",
+      "query": "对比检索增强生成与长上下文直接输入两种方案在多跳问答上的证据召回率与 token 成本。",
+      "required_aspects": [
+        "检索增强路径在多跳问答子集上的证据召回率",
+        "长上下文路径的输入 token 成本与延迟表现"
+      ],
+      "variants": {
+        "complete": {
+          "task_queries": [
+            "统计检索增强路径在 HotpotQA 多跳子集上的证据召回率，并给出 top-k 命中分布对比",
+            "测量长上下文路径在同一题目集上的输入 token 数、端到端延迟与按单价折算的成本"
+          ],
+          "expected": {
+            "coverage": 1.0,
+            "specificity_mean_min": 1.0,
+            "plan_quality_mean_min": 1.0
+          }
+        },
+        "missing": {
+          "task_queries": [
+            "统计检索增强路径在 HotpotQA 多跳子集上的证据召回率，并给出 top-k 命中分布对比"
+          ],
+          "expected": {
+            "uncovered_aspects": [2],
+            "coverage_max": 0.5
+          }
+        },
+        "vague": {
+          "task_queries": [
+            "了解多跳问答的相关背景资料",
+            "研究不同方案成本与效果的一般信息"
+          ],
+          "expected": {
+            "specificity_mean_max": 0.5,
+            "coverage_unconstrained": true
+          }
+        }
+      }
+    },
+    {
+      "case_id": "cal-planner-evolution",
+      "query": "评估 Planner Prompt 自进化流程在发布前的安全保障是否可验证。",
+      "required_aspects": [
+        "评分规则冻结与规则哈希审计",
+        "留出集一次性暴露的控制机制",
+        "失败测量的 fail-closed 处理"
+      ],
+      "variants": {
+        "complete": {
+          "task_queries": [
+            "核对评分规则文档的哈希冻结机制，并验证实验记录中的规则哈希比对流程",
+            "验证留出集指纹的一次性消费控制：同一指纹是否允许重复进入留出集测量",
+            "检查 Judge 不可用或评分缺失时门禁是否拒绝放行而不按 0 分计"
+          ],
+          "expected": {
+            "coverage": 1.0,
+            "specificity_mean_min": 1.0,
+            "plan_quality_mean_min": 1.0
+          }
+        },
+        "missing": {
+          "task_queries": [
+            "核对评分规则文档的哈希冻结机制，并验证实验记录中的规则哈希比对流程",
+            "验证留出集指纹的一次性消费控制：同一指纹是否允许重复进入留出集测量"
+          ],
+          "expected": {
+            "uncovered_aspects": [3],
+            "coverage_max": 0.6667
+          }
+        },
+        "vague": {
+          "task_queries": [
+            "研究提示词优化的一般流程",
+            "了解评测安全的相关做法",
+            "查找发布检查的背景资料"
+          ],
+          "expected": {
+            "specificity_mean_max": 0.5,
+            "coverage_unconstrained": true
+          }
+        }
+      }
+    },
+    {
+      "case_id": "cal-benchmark-report",
+      "query": "比较两种 Prompt 在报告基准上的引用支持率与长度差异。",
+      "required_aspects": [
+        "引用支持率的可复现测量方法",
+        "报告长度与结构差异的统计口径"
+      ],
+      "variants": {
+        "complete": {
+          "task_queries": [
+            "在固定报告基准上复算两版 Prompt 的引用支持率，给出逐题支持率与未判定口径",
+            "统计两版 Prompt 产出报告的段落数与字数分布，明确长度差异的统计检验方法"
+          ],
+          "expected": {
+            "coverage": 1.0,
+            "specificity_mean_min": 1.0,
+            "plan_quality_mean_min": 1.0
+          }
+        },
+        "missing": {
+          "task_queries": [
+            "在固定报告基准上复算两版 Prompt 的引用支持率，给出逐题支持率与未判定口径"
+          ],
+          "expected": {
+            "uncovered_aspects": [2],
+            "coverage_max": 0.5
+          }
+        },
+        "vague": {
+          "task_queries": [
+            "看看报告质量评估的资料",
+            "了解报告长度统计的一般情况"
+          ],
+          "expected": {
+            "specificity_mean_max": 0.5,
+            "coverage_unconstrained": true
+          }
+        }
+      }
+    }
+  ]
+}

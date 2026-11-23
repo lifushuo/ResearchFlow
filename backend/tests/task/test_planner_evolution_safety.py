@@ -176,7 +176,7 @@ def test_reflection_failure_preserves_completed_observations(monkeypatch, tmp_pa
     reflections = []
 
     class FailingRuntime:
-        def __init__(self, *_):
+        def __init__(self, *_, **__):
             pass
 
         def checked_text(self, text):
@@ -218,7 +218,12 @@ def test_reflection_failure_preserves_completed_observations(monkeypatch, tmp_pa
     assert len(observations) == len(calls) > 0
     assert len(reflections) == 1
     assert events[-1]["kind"] == "interrupted"
-    assert events[-1]["payload"] == {"error_type": "ValueError"}
+    assert events[-1]["payload"] == {
+        "error_type": "ValueError",
+        "role": None,
+        "slot_id": None,
+        "cause_type": None,
+    }
     assert not (out / "experiment.json").exists()
 
 

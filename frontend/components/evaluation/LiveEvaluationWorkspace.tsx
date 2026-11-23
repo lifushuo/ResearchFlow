@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { fetchPipeline, fetchPipelines, type DatasetId, type Pipeline } from "@/lib/evaluation-pipeline-v13";
 import { getDiagnostics, type Diagnostic } from "@/lib/evaluation-diagnostics";
 import { closureGet, closurePost, closureState, closureError, type ClosureRun, type Comparison, type Gate } from "@/lib/evaluation-closure";
@@ -141,7 +142,7 @@ export default function LiveEvaluationWorkspace() {
   const visibleJobs = current && current.pipeline_id === pipe ? [current, ...jobs.filter((j) => j.pipeline_id !== pipe)] : jobs;
   const rows = (evidence?.cases ?? []).filter((r) => r.case_id.toLowerCase().includes(search.toLowerCase()) && (!status || r.status === status));
   return <div className="space-y-5">
-    <header className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="font-serif text-3xl font-bold">评测中心</h1><p className="mt-2 text-sm text-text-muted">发起运行 → 逐题测量 → 轨迹分析 → 坏例排查 → 新运行复测 → 质量门禁</p></div><button className={button} onClick={configure}>新建 / 重新配置评测</button></header>
+    <header className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="font-serif text-3xl font-bold">评测中心</h1><p className="mt-2 text-sm text-text-muted">发起运行 → 逐题测量 → 轨迹分析 → 坏例排查 → 新运行复测 → 质量门禁</p></div><div className="flex flex-wrap gap-2"><Link className={button} href="/evolution">进入 Planner 自进化（人工复核）</Link><button className={button} onClick={configure}>新建 / 重新配置评测</button></div></header>
     <div className="rounded-xl border border-border bg-bg-elevated p-4 space-y-3">
       <div className="flex flex-wrap gap-3"><label className="min-w-0 flex-1 text-sm">本次评测运行<select aria-label="本次评测运行" className={select} value={pipe} onChange={(e) => { const row = visibleJobs.find((j) => j.pipeline_id === e.target.value); if (row) choose(row); }}><option value="">请选择运行</option>{visibleJobs.map((j) => <option key={j.pipeline_id} value={j.pipeline_id}>{j.created_at} · {states[j.state] ?? j.state} · {j.pipeline_id}</option>)}</select></label><label className="min-w-0 text-sm">本次评测集<select aria-label="本次评测集" className={select} value={dataset} onChange={(e) => { setDataset(e.target.value as DatasetId); setDiagnostic(null); setDiagnosticError(""); setSearch(""); setStatus(""); setTraceCase(""); }}><option value="">请选择评测集</option>{current?.datasets.map((id) => <option key={id} value={id}>{getDatasetLabel(id)}</option>)}</select></label></div>
       <div className="flex flex-wrap items-center gap-3 text-xs"><button className={button} onClick={() => { setError(""); setRevision((x) => x + 1); }}>刷新本次结果</button><span>{current ? states[current.state] ?? current.state : "尚无运行"}</span>{pipe && <span className="font-mono break-all">{pipe}</span>}</div>
